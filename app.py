@@ -11714,29 +11714,27 @@ def render_operations_document_uploader(
             by=["uploaded_at", "document_id"], ascending=[False, False]
         )
         st.caption("Showing the latest 20 uploads for the selected category.")
-        header_cols = st.columns([0.55, 0.25, 0.2])
-        header_cols[0].markdown("**Document**")
-        header_cols[1].markdown("**Uploaded**")
-        header_cols[2].markdown("**Download**")
         latest_docs = scoped_docs.head(20)
+        table_rows = []
         for _, row in latest_docs.iterrows():
             path = resolve_upload_path(row.get("file_path"))
             label = clean_text(row.get("original_name")) or "(document)"
             doc_type = clean_text(row.get("doc_type")) or "Document"
             uploaded_at = pd.to_datetime(row.get("uploaded_at"), errors="coerce")
             uploaded_label = uploaded_at.strftime("%d-%m-%Y") if pd.notna(uploaded_at) else "—"
-            row_cols = st.columns([0.55, 0.25, 0.2])
-            row_cols[0].write(f"{doc_type}: {label}")
-            row_cols[1].write(uploaded_label)
-            if path and path.exists():
-                row_cols[2].download_button(
-                    "Download",
-                    data=path.read_bytes(),
-                    file_name=path.name,
-                    key=f"{key_prefix}_download_{int(row['document_id'])}",
-                )
-            else:
-                row_cols[2].caption("Missing")
+            view_icon = "📎" if path and path.exists() else ""
+            table_rows.append(
+                {
+                    "Document": f"{doc_type}: {label}",
+                    "Uploaded": uploaded_label,
+                    "View upload file": view_icon,
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(table_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         st.markdown("#### Edit or delete an uploaded document")
         search_query = st.text_input(
