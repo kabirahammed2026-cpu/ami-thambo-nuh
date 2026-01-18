@@ -5328,9 +5328,10 @@ def apply_theme_css() -> None:
         }}
         .ps-mobile-nav {{
             display: none;
-            position: sticky;
-            top: 0.75rem;
-            z-index: 1000;
+            position: fixed;
+            top: 6rem;
+            left: 1rem;
+            z-index: 1200;
         }}
         .ps-mobile-nav button {{
             padding: 0.2rem 0.6rem;
@@ -5340,17 +5341,14 @@ def apply_theme_css() -> None:
         }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
-                display: block !important;
-            }}
-        }}
-        @media (max-width: 768px) {{
-            .ps-mobile-nav {{
-                display: block;
+                display: none !important;
             }}
             section.main,
-            [data-testid="stAppViewContainer"] {{
-                margin-left: var(--ps-sidebar-width);
-                padding-top: 4.75rem;
+            [data-testid="stAppViewContainer"] > .main {{
+                margin-left: 0;
+            }}
+            .ps-mobile-nav {{
+                display: block;
             }}
         }}
         [data-testid="stTextInput"] input,
@@ -6781,10 +6779,29 @@ def login_box(conn, *, render_id=None):
         except OSError:
             cover_css = ""
     if not cover_css:
+        fallback_svg = (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800'>"
+            "<defs>"
+            "<linearGradient id='bg' x1='0' x2='1' y1='0' y2='1'>"
+            "<stop offset='0' stop-color='#0f172a'/>"
+            "<stop offset='1' stop-color='#1e3a8a'/>"
+            "</linearGradient>"
+            "<linearGradient id='accent' x1='0' x2='1' y1='1' y2='0'>"
+            "<stop offset='0' stop-color='#38bdf8' stop-opacity='0.15'/>"
+            "<stop offset='1' stop-color='#f8fafc' stop-opacity='0.05'/>"
+            "</linearGradient>"
+            "</defs>"
+            "<rect width='1200' height='800' fill='url(#bg)'/>"
+            "<circle cx='980' cy='120' r='260' fill='url(#accent)'/>"
+            "<circle cx='220' cy='640' r='280' fill='url(#accent)'/>"
+            "</svg>"
+        )
+        fallback_data_uri = fallback_svg.replace("#", "%23").replace(" ", "%20")
         cover_css = (
-            "background-image: radial-gradient(circle at top, rgba(15, 23, 42, 0.55), "
-            "rgba(15, 23, 42, 0.95)), "
-            "linear-gradient(120deg, rgba(30, 64, 175, 0.6), rgba(15, 23, 42, 0.95));"
+            "background-image: url('data:image/svg+xml;utf8,"
+            f"{fallback_data_uri}'), "
+            "radial-gradient(circle at top, rgba(15, 23, 42, 0.55), "
+            "rgba(15, 23, 42, 0.95));"
         )
     app_bg = "#ffffff"
     panel_bg = "#ffffff"
