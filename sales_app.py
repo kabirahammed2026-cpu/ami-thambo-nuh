@@ -2615,30 +2615,14 @@ def ribbon_navigation(user: Dict, pages: dict[str, str]) -> None:
 
 
 def quick_nav_menu(user: Dict, pages: dict[str, str]) -> None:
-    if "show_ribbon_nav" not in st.session_state:
-        st.session_state["show_ribbon_nav"] = True
-    show_ribbon = st.session_state.get("show_ribbon_nav", True)
     if hasattr(st, "popover"):
         with st.popover("☰ Menu"):
-            st.toggle(
-                "Show ribbon menu",
-                value=show_ribbon,
-                key="show_ribbon_nav_toggle",
-            )
             st.markdown("### Navigation")
             ribbon_navigation(user, pages)
     else:
         with st.expander("☰ Menu", expanded=False):
-            st.toggle(
-                "Show ribbon menu",
-                value=show_ribbon,
-                key="show_ribbon_nav_toggle",
-            )
             st.markdown("### Navigation")
             ribbon_navigation(user, pages)
-    st.session_state["show_ribbon_nav"] = st.session_state.get(
-        "show_ribbon_nav_toggle", show_ribbon
-    )
 
 
 def show_pdf_link(relative_path: Optional[str], label: str) -> None:
@@ -6087,14 +6071,12 @@ def main() -> None:
 
     sidebar(user, pages)
 
-    st.session_state.setdefault("show_ribbon_nav", True)
     nav_col, content_col = st.columns([1, 5], gap="large")
     with nav_col:
-        if st.session_state.get("show_ribbon_nav", True):
-            st.markdown('<div class="ps-ribbon-nav">', unsafe_allow_html=True)
-            st.markdown("### Navigation")
-            ribbon_navigation(user, pages)
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('<div class="ps-ribbon-nav">', unsafe_allow_html=True)
+        st.markdown("### Navigation")
+        ribbon_navigation(user, pages)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     page = st.session_state.get("active_page", pages[labels[0]])
     with content_col:
