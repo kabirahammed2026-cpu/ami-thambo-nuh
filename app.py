@@ -1684,6 +1684,35 @@ def accessible_customer_ids(conn) -> Optional[set[int]]:
     return ids
 
 
+def _resolve_manual_customer_id(
+    conn: sqlite3.Connection, customer_name: Optional[str]
+) -> Optional[int]:
+    cleaned_name = clean_text(customer_name)
+    if not cleaned_name:
+        return None
+    match = df_query(
+        conn,
+        """
+        SELECT customer_id
+        FROM customers
+        WHERE lower(COALESCE(name, '')) = lower(?)
+           OR lower(COALESCE(company_name, '')) = lower(?)
+        ORDER BY customer_id DESC
+        LIMIT 1
+        """,
+        (cleaned_name, cleaned_name),
+    )
+    if not match.empty:
+        return int(match.iloc[0]["customer_id"])
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO customers (name, created_by, dup_flag) VALUES (?, ?, 0)",
+        (cleaned_name, current_user_id()),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
 def filter_delivery_orders_for_view(
     do_df: pd.DataFrame,
     allowed_customers: Optional[set[int]],
@@ -5312,7 +5341,7 @@ def apply_theme_css() -> None:
         "metric_bg": "#ffffff",
         "metric_border": "rgba(49, 51, 63, 0.08)",
         "table_header_bg": "#ffffff",
-        "table_row_alt_bg": "#ffffff",
+        "table_row_alt_bg": "#f8fafc",
     }
     st.markdown(
         f"""
@@ -5348,6 +5377,7 @@ def apply_theme_css() -> None:
         section.main {{
             background-color: var(--ps-bg);
             color: var(--ps-text);
+            color-scheme: light !important;
         }}
         [data-testid="stAppViewContainer"],
         [data-testid="stSidebar"] {{
@@ -5381,11 +5411,11 @@ def apply_theme_css() -> None:
             white-space: pre-wrap;
         }}
         .ps-mobile-nav {{
-            display: none;
+            display: block;
             position: fixed;
-            top: 6rem;
+            top: 1.25rem;
             left: 1rem;
-            z-index: 1200;
+            z-index: 2200;
         }}
         .ps-mobile-nav button {{
             padding: 0.2rem 0.6rem;
@@ -5400,9 +5430,6 @@ def apply_theme_css() -> None:
             section.main,
             [data-testid="stAppViewContainer"] > .main {{
                 margin-left: 0;
-            }}
-            .ps-mobile-nav {{
-                display: block;
             }}
         }}
         [data-testid="stTextInput"] input,
@@ -5667,9 +5694,22 @@ def apply_theme_css() -> None:
         [data-testid="stDataEditor"] [role="row"],
         [data-testid="stDataEditor"] [role="row"] > div,
         [data-testid="stDataEditor"] [role="cell"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-panel-border) !important;
+        }}
+        [data-testid="stDataEditor"] [data-baseweb="table"] [role="row"],
+        [data-testid="stDataEditor"] [data-baseweb="table"] [role="row"] > div,
+        [data-testid="stDataEditor"] [data-baseweb="table"] [role="gridcell"] {{
+            background: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+        }}
+        [data-baseweb="table"] [role="rowgroup"],
+        [data-baseweb="table"] [role="row"],
+        [data-baseweb="table"] [role="gridcell"],
+        [data-baseweb="table"] [role="columnheader"] {{
+            background: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
         }}
         .stDataFrame [role="columnheader"],
         .stDataFrame [role="gridcell"],
@@ -5677,7 +5717,7 @@ def apply_theme_css() -> None:
         .stDataFrame [data-baseweb="table"],
         .stDataFrame [data-baseweb="table"] th,
         .stDataFrame [data-baseweb="table"] td {{
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-panel-border) !important;
         }}
@@ -5687,7 +5727,7 @@ def apply_theme_css() -> None:
         [data-testid="stDataEditor"] [data-baseweb="table"] tbody,
         [data-testid="stDataFrame"] [data-baseweb="table"] thead,
         [data-testid="stDataEditor"] [data-baseweb="table"] thead {{
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
         }}
         [data-testid="stDataEditor"] input,
@@ -5697,12 +5737,12 @@ def apply_theme_css() -> None:
             border-color: var(--ps-input-border) !important;
         }}
         [data-baseweb="table"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
         }}
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-panel-border) !important;
         }}
@@ -5736,7 +5776,7 @@ def apply_theme_css() -> None:
         [data-testid="stTable"] td {{
             border-color: var(--ps-panel-border) !important;
             color: var(--ps-text) !important;
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
         }}
         [data-testid="stTable"] th {{
             background-color: var(--ps-table-header-bg) !important;
@@ -5745,13 +5785,13 @@ def apply_theme_css() -> None:
             background-color: var(--ps-table-row-alt-bg) !important;
         }}
         [data-testid="stMarkdownContainer"] table {{
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stMarkdownContainer"] th,
         [data-testid="stMarkdownContainer"] td {{
-            background-color: var(--ps-panel-bg) !important;
+            background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-panel-border) !important;
         }}
@@ -6925,6 +6965,7 @@ def init_ui():
         .ps-notification-popover {
             display: flex;
             justify-content: flex-end;
+            margin-top: -0.5rem;
         }
         .ps-notification-popover button:hover {
             background: var(--ps-button-hover) !important;
@@ -7524,18 +7565,21 @@ def dashboard(conn):
     )
     current_announcement = announcement.iloc[0] if not announcement.empty else None
 
-    st.markdown("#### Admin announcement for all staff")
-    if current_announcement is None:
-        st.caption("No announcement is currently set.")
-    else:
-        st.info(
-            f"**{current_announcement['note']}**\n\n"
-            f"Posted by {current_announcement['author']} on "
-            f"{fmt_dates(announcement, ['created_at']).iloc[0]['created_at']}",
-            icon="📢",
-        )
+    def _render_dashboard_announcement(*, allow_edit: bool) -> None:
+        st.markdown("#### Admin announcement for all staff")
+        if current_announcement is None:
+            st.caption("No announcement is currently set.")
+        else:
+            st.info(
+                f"**{current_announcement['note']}**\n\n"
+                f"Posted by {current_announcement['author']} on "
+                f"{fmt_dates(announcement, ['created_at']).iloc[0]['created_at']}",
+                icon="📢",
+            )
 
-    if is_admin:
+        if not allow_edit:
+            return
+
         if st.session_state.pop("dashboard_remark_reset", False):
             st.session_state["dashboard_remark_text"] = ""
         st.session_state.setdefault(
@@ -7580,6 +7624,9 @@ def dashboard(conn):
     if "show_today_expired" not in st.session_state:
         st.session_state.show_today_expired = False
 
+    if not is_admin:
+        _render_dashboard_announcement(allow_edit=False)
+
     if is_admin:
         col1, col2, col3, col4 = st.columns(4)
         complete_count = int(
@@ -7616,6 +7663,8 @@ def dashboard(conn):
         sales_cols[0].metric("Daily sales", format_sales_amount(sales_metrics["daily"]))
         sales_cols[1].metric("Weekly sales", format_sales_amount(sales_metrics["weekly"]))
         sales_cols[2].metric("Monthly sales", format_sales_amount(sales_metrics["monthly"]))
+
+        _render_dashboard_announcement(allow_edit=True)
 
         st.markdown("#### Daily report coverage")
         report_date_value = st.date_input(
@@ -13100,7 +13149,6 @@ def operations_page(conn):
         FROM customers
         {where_clause}
         ORDER BY LOWER(COALESCE(name, '')), customer_id
-        LIMIT 20
         """,
         tuple(params),
     )
@@ -13148,7 +13196,9 @@ def operations_page(conn):
                     selected_customer_label = f"{name} ({company})"
                 else:
                     selected_customer_label = name or company
-        st.caption("Showing up to 20 customers. Use search to find others.")
+        st.caption(
+            "Showing all matching customers. Use search to narrow the list if needed."
+        )
 
     render_operations_document_uploader(
         conn,
@@ -14750,10 +14800,14 @@ def _render_service_section(conn, *, show_heading: bool = True):
         default_customer = do_customer_map.get(selected_do)
         state_key = "service_customer_link"
         last_do_key = "service_customer_last_do"
+        manual_toggle_key = f"{state_key}_manual_toggle"
+        manual_name_key = f"{state_key}_manual_name"
         linked_customer = default_customer
         if default_customer is not None:
             st.session_state[last_do_key] = selected_do
             st.session_state[state_key] = default_customer
+            st.session_state[manual_toggle_key] = False
+            st.session_state[manual_name_key] = ""
             customer_label = (
                 customer_labels.get(default_customer)
                 or customer_label_map.get(default_customer)
@@ -14767,12 +14821,23 @@ def _render_service_section(conn, *, show_heading: bool = True):
             if st.session_state.get(last_do_key) != selected_do:
                 st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
-            linked_customer = st.selectbox(
-                "Customer *",
-                options=choices,
-                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-                key=state_key,
+            use_manual_customer = st.checkbox(
+                "Enter customer manually",
+                key=manual_toggle_key,
             )
+            if use_manual_customer:
+                manual_name = st.text_input(
+                    "Customer name",
+                    key=manual_name_key,
+                )
+                linked_customer = None
+            else:
+                linked_customer = st.selectbox(
+                    "Customer *",
+                    options=choices,
+                    format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+                    key=state_key,
+                )
         status_value = status_input_widget("service_new", DEFAULT_SERVICE_STATUS)
         status_choice = get_status_choice("service_new")
         today = datetime.now().date()
@@ -14877,6 +14942,10 @@ def _render_service_section(conn, *, show_heading: bool = True):
         selected_customer = (
             linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
         )
+        use_manual_customer = bool(st.session_state.get(manual_toggle_key))
+        manual_name = st.session_state.get(manual_name_key)
+        if use_manual_customer:
+            selected_customer = _resolve_manual_customer_id(conn, manual_name)
         selected_customer = int(selected_customer) if selected_customer is not None else None
         cur = conn.cursor()
         (
@@ -16705,9 +16774,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 key="quotation_follow_up_choice",
             )
             custom_follow_up = follow_up_choice == "Custom date"
-            if custom_follow_up and not st.session_state.get(
-                "quotation_follow_up_date_toggle"
-            ):
+            if custom_follow_up:
                 st.session_state["quotation_follow_up_date_toggle"] = True
             enable_follow_date = st.checkbox(
                 "Set follow-up date",
@@ -16716,6 +16783,8 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 key="quotation_follow_up_date_toggle",
                 disabled=custom_follow_up,
             )
+            if custom_follow_up:
+                enable_follow_date = True
             follow_up_date_value = None
             if enable_follow_date:
                 follow_up_date_value = st.date_input(
@@ -17800,10 +17869,14 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         default_customer = do_customer_map.get(selected_do)
         state_key = "maintenance_customer_link"
         last_do_key = "maintenance_customer_last_do"
+        manual_toggle_key = f"{state_key}_manual_toggle"
+        manual_name_key = f"{state_key}_manual_name"
         linked_customer = default_customer
         if default_customer is not None:
             st.session_state[last_do_key] = selected_do
             st.session_state[state_key] = default_customer
+            st.session_state[manual_toggle_key] = False
+            st.session_state[manual_name_key] = ""
             customer_label = (
                 customer_labels.get(default_customer)
                 or customer_label_map.get(default_customer)
@@ -17817,12 +17890,23 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             if st.session_state.get(last_do_key) != selected_do:
                 st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
-            linked_customer = st.selectbox(
-                "Customer *",
-                options=choices,
-                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-                key=state_key,
+            use_manual_customer = st.checkbox(
+                "Enter customer manually",
+                key=manual_toggle_key,
             )
+            if use_manual_customer:
+                manual_name = st.text_input(
+                    "Customer name",
+                    key=manual_name_key,
+                )
+                linked_customer = None
+            else:
+                linked_customer = st.selectbox(
+                    "Customer *",
+                    options=choices,
+                    format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+                    key=state_key,
+                )
         status_value = status_input_widget("maintenance_new", DEFAULT_SERVICE_STATUS)
         maintenance_status_choice = get_status_choice("maintenance_new")
         today = datetime.now().date()
@@ -17912,6 +17996,10 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         selected_customer = (
             linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
         )
+        use_manual_customer = bool(st.session_state.get(manual_toggle_key))
+        manual_name = st.session_state.get(manual_name_key)
+        if use_manual_customer:
+            selected_customer = _resolve_manual_customer_id(conn, manual_name)
         selected_customer = int(selected_customer) if selected_customer is not None else None
         cur = conn.cursor()
         (
@@ -18514,6 +18602,8 @@ def delivery_orders_page(
     filter_customer_key = f"{key_prefix}_filter_customer"
     filter_date_toggle_key = f"{key_prefix}_filter_date_toggle"
     filter_date_range_key = f"{key_prefix}_filter_date_range"
+    manual_customer_toggle_key = f"{key_prefix}_customer_manual_toggle"
+    manual_customer_name_key = f"{key_prefix}_customer_manual_name"
 
     if st.session_state.pop(reset_pending_key, False):
         _reset_delivery_order_form_state(record_type_key)
@@ -18528,6 +18618,8 @@ def delivery_orders_page(
     st.session_state.setdefault(status_key, "due")
     autofill_customer_key = f"{record_type_key}_autofill_customer"
     st.session_state.setdefault(autofill_customer_key, None)
+    st.session_state.setdefault(manual_customer_toggle_key, False)
+    st.session_state.setdefault(manual_customer_name_key, "")
 
     customer_options, customer_labels, _, _ = fetch_customer_choices(conn)
     scope_clause, scope_params = customer_scope_filter("c")
@@ -18618,6 +18710,8 @@ def delivery_orders_page(
         st.session_state[autofill_customer_key] = None
     else:
         selected_customer_state = int_or_none(st.session_state.get(customer_key))
+        if st.session_state.get(manual_customer_toggle_key):
+            selected_customer_state = None
         last_autofill_customer = int_or_none(st.session_state.get(autofill_customer_key))
         current_number = clean_text(st.session_state.get(number_key))
         suggested_code = None
@@ -18647,12 +18741,24 @@ def delivery_orders_page(
             f"{record_label} number *",
             key=number_key,
         )
-        selected_customer = st.selectbox(
-            "Customer",
-            customer_options,
-            format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-            key=customer_key,
+        use_manual_customer = st.checkbox(
+            "Enter customer manually",
+            key=manual_customer_toggle_key,
         )
+        manual_customer_name = None
+        if use_manual_customer:
+            manual_customer_name = st.text_input(
+                "Customer name",
+                key=manual_customer_name_key,
+            )
+            selected_customer = None
+        else:
+            selected_customer = st.selectbox(
+                "Customer",
+                customer_options,
+                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+                key=customer_key,
+            )
         description = st.text_area(
             "Description / items",
             key=description_key,
@@ -18754,8 +18860,14 @@ def delivery_orders_page(
     if _guard_double_submit(f"{record_type_key}_save_form", submit):
         sales_person = clean_text(get_current_user().get("username"))
         cleaned_number = clean_text(do_number)
+        use_manual_customer = bool(st.session_state.get(manual_customer_toggle_key))
+        manual_customer_name = st.session_state.get(manual_customer_name_key)
+        if use_manual_customer:
+            selected_customer = _resolve_manual_customer_id(conn, manual_customer_name)
         if not cleaned_number:
             st.error(f"{record_label} number is required.")
+        elif use_manual_customer and selected_customer is None:
+            st.error("Enter a customer name for this record.")
         else:
             cur = conn.cursor()
             conflicting_type = df_query(
