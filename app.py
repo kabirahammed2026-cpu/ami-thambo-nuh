@@ -5339,6 +5339,37 @@ def apply_theme_css() -> None:
             font-size: 0.85rem;
             min-height: unset;
         }}
+        .ps-ribbon-nav {{
+            position: sticky;
+            top: 1rem;
+            z-index: 1000;
+            background: var(--ps-panel-bg);
+            border: 1px solid var(--ps-panel-border);
+            border-radius: 16px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+        }}
+        .ps-ribbon-nav h3 {{
+            margin-top: 0;
+        }}
+        .ps-ribbon-nav [role="radiogroup"] {{
+            gap: 0.35rem;
+        }}
+        .ps-ribbon-nav [data-testid="stRadio"] label {{
+            border-radius: 999px;
+            padding: 0.35rem 0.75rem;
+            border: 1px solid transparent;
+            transition: all 0.2s ease;
+        }}
+        .ps-ribbon-nav [data-testid="stRadio"] label:hover {{
+            background: rgba(15, 23, 42, 0.06);
+        }}
+        .ps-ribbon-nav [data-testid="stRadio"] label[data-selected="true"] {{
+            border-color: rgba(15, 23, 42, 0.16);
+            background: rgba(255, 255, 255, 0.9);
+            font-weight: 600;
+        }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
                 display: none !important;
@@ -11534,6 +11565,9 @@ def render_operations_document_uploader(
     conn,
     *,
     key_prefix: str,
+    selected_customer_id: Optional[int] = None,
+    selected_customer_label: Optional[str] = None,
+    show_customer_select: bool = True,
 ) -> None:
     st.markdown("### Operations document uploads")
     st.markdown(
@@ -11558,12 +11592,23 @@ def render_operations_document_uploader(
         st.info("No customers available for document uploads yet.")
         return
 
-    selected_customer = st.selectbox(
-        "Customer",
-        customer_choices,
-        format_func=lambda cid: customer_labels.get(cid, f"Customer #{cid}"),
-        key=f"{key_prefix}_customer",
-    )
+    selected_customer = selected_customer_id
+    if selected_customer is None and show_customer_select:
+        selected_customer = st.selectbox(
+            "Customer",
+            customer_choices,
+            format_func=lambda cid: customer_labels.get(cid, f"Customer #{cid}"),
+            key=f"{key_prefix}_customer",
+        )
+    elif selected_customer is not None:
+        label = selected_customer_label or customer_labels.get(
+            selected_customer, f"Customer #{selected_customer}"
+        )
+        st.markdown(f"**Selected customer:** {label}")
+
+    if selected_customer is None:
+        st.info("Select a customer to upload operations documents.")
+        return
     customer_seed = df_query(
         conn,
         """
@@ -12721,7 +12766,90 @@ def operations_page(conn):
     st.caption(
         "Review delivery orders, work done, service, maintenance, and other operational records in one place."
     )
-    render_operations_document_uploader(conn, key_prefix="operations_page")
+    st.markdown("### Customers")
+    st.caption(
+        "Select a customer from the table below to upload delivery orders, work done, service, maintenance, or other files."
+    )
+    search_query = st.text_input(
+        "Search customers",
+        key="operations_customer_search",
+        help="Search by customer name, company, phone, or sales rep.",
+    )
+    where_clause = ""
+    params: list[object] = []
+    if search_query:
+        like_value = f"%{search_query.strip().lower()}%"
+        where_clause = (
+            "WHERE lower(COALESCE(name, '')) LIKE ? "
+            "OR lower(COALESCE(company_name, '')) LIKE ? "
+            "OR lower(COALESCE(phone, '')) LIKE ? "
+            "OR lower(COALESCE(sales_person, '')) LIKE ?"
+        )
+        params = [like_value, like_value, like_value, like_value]
+    customers_df = df_query(
+        conn,
+        f"""
+        SELECT customer_id, name, company_name, phone, address, delivery_address, sales_person
+        FROM customers
+        {where_clause}
+        ORDER BY LOWER(COALESCE(name, '')), customer_id
+        LIMIT 20
+        """,
+        tuple(params),
+    )
+    selected_customer_id = None
+    selected_customer_label = None
+    if customers_df.empty:
+        st.info("No customers match that search.")
+    else:
+        table_df = pd.DataFrame(
+            {
+                "Select": False,
+                "ID": customers_df["customer_id"].astype(int),
+                "Customer": customers_df["name"].fillna(""),
+                "Company": customers_df["company_name"].fillna(""),
+                "Phone": customers_df["phone"].fillna(""),
+                "Sales rep": customers_df["sales_person"].fillna(""),
+                "Address": customers_df["address"].fillna(""),
+                "Delivery address": customers_df["delivery_address"].fillna(""),
+            }
+        )
+        edited_table = st.data_editor(
+            table_df,
+            hide_index=True,
+            use_container_width=True,
+            disabled=[col for col in table_df.columns if col != "Select"],
+            column_config={
+                "Select": st.column_config.CheckboxColumn(
+                    "Select",
+                    help="Choose a customer to upload operations documents.",
+                ),
+                "ID": st.column_config.NumberColumn("ID", disabled=True),
+            },
+            key="operations_customer_table",
+        )
+        selected_rows = edited_table[edited_table["Select"]]
+        if not selected_rows.empty:
+            selected_customer_id = int(selected_rows.iloc[0]["ID"])
+            selected_row = customers_df[
+                customers_df["customer_id"] == selected_customer_id
+            ]
+            if not selected_row.empty:
+                name = clean_text(selected_row.iloc[0].get("name"))
+                company = clean_text(selected_row.iloc[0].get("company_name"))
+                if name and company:
+                    selected_customer_label = f"{name} ({company})"
+                else:
+                    selected_customer_label = name or company
+        st.caption("Showing up to 20 customers. Use search to find others.")
+
+    render_operations_document_uploader(
+        conn,
+        key_prefix="operations_page",
+        selected_customer_id=selected_customer_id,
+        selected_customer_label=selected_customer_label,
+        show_customer_select=False,
+    )
 
     st.markdown("---")
     tabs = st.tabs(
@@ -22981,6 +23109,10 @@ def main():
         st.session_state["nav_selection_sidebar"] = current_page
     elif st.session_state.get("nav_selection_sidebar") not in pages:
         st.session_state["nav_selection_sidebar"] = current_page
+    if "nav_selection_ribbon" not in st.session_state:
+        st.session_state["nav_selection_ribbon"] = current_page
+    elif st.session_state.get("nav_selection_ribbon") not in pages:
+        st.session_state["nav_selection_ribbon"] = current_page
 
     def _render_mobile_nav() -> None:
         if "nav_selection_mobile" not in st.session_state:
@@ -23014,6 +23146,22 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
+    def _render_ribbon_nav() -> None:
+        st.markdown('<div class="ps-ribbon-nav">', unsafe_allow_html=True)
+        st.markdown("### Navigation")
+        st.radio(
+            "Navigate",
+            pages,
+            key="nav_selection_ribbon",
+            on_change=lambda: _sync_nav_choice("nav_selection_ribbon"),
+        )
+        st.write("---")
+        st.write(f"Logged in as **{user.get('username', 'User')}** ({user.get('role', 'user')})")
+        if st.button("Logout", key="ribbon_logout", use_container_width=True):
+            _request_logout()
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
     with st.sidebar:
         sidebar_dark = st.toggle(
             "Mode",
@@ -23036,6 +23184,7 @@ def main():
             st.rerun()
 
     _render_mobile_nav()
+    _render_ribbon_nav()
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
