@@ -1597,6 +1597,64 @@ def current_user_is_admin() -> bool:
     return get_current_user().get("role") == "admin"
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(clean_text(row[1]) == column for row in info)
+
+
+def delete_staff_with_uploads(conn: sqlite3.Connection, staff_user_id: int) -> None:
+    user_row = conn.execute(
+        "SELECT role FROM users WHERE user_id=?",
+        (int(staff_user_id),),
+    ).fetchone()
+    role_value = clean_text(user_row[0]) if user_row else ""
+    if role_value.lower() == "admin":
+        raise ValueError("Cannot delete admin user.")
+
+    uploaded_paths: list[str] = []
+    doc_tables = [
+        ("customer_documents", "file_path", "uploaded_by"),
+        ("operations_other_documents", "file_path", "uploaded_by"),
+        ("service_documents", "file_path", "uploaded_by"),
+        ("maintenance_documents", "file_path", "uploaded_by"),
+    ]
+    for table, file_column, user_column in doc_tables:
+        if not _table_has_column(conn, table, user_column):
+            continue
+        rows = conn.execute(
+            f"SELECT {file_column} FROM {table} WHERE {user_column}=?",
+            (int(staff_user_id),),
+        ).fetchall()
+        uploaded_paths.extend(
+            clean_text(row[0]) for row in rows if clean_text(row[0])
+        )
+        conn.execute(
+            f"DELETE FROM {table} WHERE {user_column}=?",
+            (int(staff_user_id),),
+        )
+
+    report_rows = conn.execute(
+        "SELECT attachment_path, import_file_path FROM work_reports WHERE user_id=?",
+        (int(staff_user_id),),
+    ).fetchall()
+    for attachment_path, import_path in report_rows:
+        if clean_text(attachment_path):
+            uploaded_paths.append(clean_text(attachment_path))
+        if clean_text(import_path):
+            uploaded_paths.append(clean_text(import_path))
+    conn.execute("DELETE FROM work_reports WHERE user_id=?", (int(staff_user_id),))
+    conn.execute("DELETE FROM users WHERE user_id=?", (int(staff_user_id),))
+    conn.commit()
+
+    for path_value in uploaded_paths:
+        resolved_path = resolve_upload_path(path_value)
+        if resolved_path and resolved_path.exists():
+            try:
+                resolved_path.unlink()
+            except Exception:
+                pass
+
+
 def customer_scope_filter(alias: str = "") -> tuple[str, tuple[object, ...]]:
     user = get_current_user()
     if not user or user.get("role") == "admin":
@@ -5251,14 +5309,17 @@ def apply_theme_css() -> None:
             white-space: pre-wrap;
         }}
         .ps-ribbon-nav {{
-            position: sticky;
+            position: fixed;
             top: 1rem;
+            left: 1rem;
+            right: 1rem;
+            z-index: 1200;
             background: var(--ps-sidebar-bg);
             border: 1px solid var(--ps-panel-border);
             border-radius: 18px;
-            padding: 1rem 0.85rem;
+            padding: 0.75rem 0.85rem;
             box-shadow: 0 18px 40px rgba(15, 23, 42, 0.12);
-            display: none !important;
+            display: none;
         }}
         .ps-ribbon-nav h3 {{
             margin-top: 0;
@@ -5297,15 +5358,26 @@ def apply_theme_css() -> None:
         }}
         @media (max-width: 1200px) {{
             .ps-ribbon-nav {{
-                display: block !important;
+                display: block;
             }}
             [data-testid="stSidebar"] {{
                 display: none !important;
+            }}
+            section.main,
+            [data-testid="stAppViewContainer"] {{
+                padding-top: 6.5rem;
             }}
         }}
         @media (max-width: 768px) {{
             .ps-mobile-nav {{
                 display: block;
+            }}
+            .ps-ribbon-nav {{
+                display: none;
+            }}
+            section.main,
+            [data-testid="stAppViewContainer"] {{
+                padding-top: 4.75rem;
             }}
         }}
         [data-testid="stTextInput"] input,
@@ -7736,8 +7808,8 @@ def dashboard(conn):
         dedent(
             f"""
             SELECT COUNT(*) AS total_reports,
-                   SUM(CASE WHEN date(wr.created_at) >= date('now', '-6 days') THEN 1 ELSE 0 END) AS weekly_reports,
-                   SUM(CASE WHEN strftime('%Y-%m', wr.created_at) = strftime('%Y-%m', 'now') THEN 1 ELSE 0 END) AS monthly_reports
+                   SUM(CASE WHEN LOWER(wr.period_type) = 'weekly' THEN 1 ELSE 0 END) AS weekly_reports,
+                   SUM(CASE WHEN LOWER(wr.period_type) = 'monthly' THEN 1 ELSE 0 END) AS monthly_reports
             FROM work_reports wr
             {report_scope}
             """
@@ -7777,8 +7849,8 @@ def dashboard(conn):
     st.markdown("#### Report submissions")
     report_metric_cols = st.columns(3)
     report_metric_cols[0].metric("Total reports", total_reports)
-    report_metric_cols[1].metric("Weekly reports", weekly_reports)
-    report_metric_cols[2].metric("Monthly reports", monthly_reports)
+    report_metric_cols[1].metric("Weekly cadence reports", weekly_reports)
+    report_metric_cols[2].metric("Monthly cadence reports", monthly_reports)
 
     if not recent_reports.empty:
         st.markdown("#### Recent report submissions")
@@ -8241,8 +8313,20 @@ def dashboard(conn):
         dedent(
             f"""
             SELECT COUNT(*) AS total_quotes,
-                   SUM(CASE WHEN date(quote_date) >= date('now', '-6 days') THEN 1 ELSE 0 END) AS weekly_quotes,
-                   SUM(CASE WHEN strftime('%Y-%m', quote_date) = strftime('%Y-%m', 'now') THEN 1 ELSE 0 END) AS monthly_quotes,
+                   SUM(
+                       CASE
+                           WHEN date(COALESCE(quote_date, created_at)) >= date('now', '-6 days')
+                           THEN 1
+                           ELSE 0
+                       END
+                   ) AS weekly_quotes,
+                   SUM(
+                       CASE
+                           WHEN strftime('%Y-%m', COALESCE(quote_date, created_at)) = strftime('%Y-%m', 'now')
+                           THEN 1
+                           ELSE 0
+                       END
+                   ) AS monthly_quotes,
                    SUM(CASE WHEN LOWER(status) = 'paid' THEN 1 ELSE 0 END) AS paid_quotes
             FROM quotations
             {quote_clause}
@@ -20650,6 +20734,46 @@ def users_admin_page(conn):
                 conn.commit()
                 st.warning("User deleted")
 
+    with st.expander("Delete staff and uploads"):
+        staff_users = df_query(
+            conn,
+            """
+            SELECT user_id, username
+            FROM users
+            WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
+            ORDER BY LOWER(username)
+            """,
+        )
+        if staff_users.empty:
+            st.caption("No staff accounts available.")
+        else:
+            staff_map = {
+                int(row["user_id"]): clean_text(row["username"]) or f"User #{int(row['user_id'])}"
+                for _, row in staff_users.iterrows()
+            }
+            staff_choices = list(staff_map.keys())
+            selected_staff = st.selectbox(
+                "Staff account",
+                staff_choices,
+                format_func=lambda val: staff_map.get(val, f"User #{val}"),
+                key="delete_staff_with_uploads_select",
+            )
+            confirm_delete = st.checkbox(
+                "I understand this removes the staff account and all uploaded files.",
+                key="delete_staff_with_uploads_confirm",
+            )
+            if st.button(
+                "Delete staff and uploads",
+                disabled=not confirm_delete,
+                key="delete_staff_with_uploads_button",
+            ):
+                try:
+                    delete_staff_with_uploads(conn, int(selected_staff))
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.warning("Staff account and uploads deleted.")
+
 # ---------- Import engine ----------
 def _import_clean6(conn, df, tag="Import"):
     """Import cleaned dataframe into database.
@@ -22825,6 +22949,32 @@ def main():
     elif st.session_state.get("nav_selection_sidebar") not in pages:
         st.session_state["nav_selection_sidebar"] = current_page
 
+    def _render_ribbon_nav() -> None:
+        if "nav_selection_ribbon" not in st.session_state:
+            st.session_state["nav_selection_ribbon"] = current_page
+        elif st.session_state.get("nav_selection_ribbon") not in pages:
+            st.session_state["nav_selection_ribbon"] = current_page
+        st.markdown('<div class="ps-ribbon-nav">', unsafe_allow_html=True)
+        st.markdown("### Navigation")
+        ribbon_dark = st.toggle(
+            "Mode",
+            value=get_theme() == "dark",
+            key="ribbon_theme_toggle",
+            help="Toggle between light and dark.",
+        )
+        set_theme(ribbon_dark)
+        apply_theme_css()
+        st.radio(
+            "Navigate",
+            pages,
+            key="nav_selection_ribbon",
+            on_change=lambda: _sync_nav_choice("nav_selection_ribbon"),
+        )
+        if st.button("Logout", key="ribbon_logout_main", use_container_width=True):
+            _request_logout()
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
     def _render_mobile_nav() -> None:
         if "nav_selection_mobile" not in st.session_state:
             st.session_state["nav_selection_mobile"] = current_page
@@ -22857,6 +23007,7 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
+    _render_ribbon_nav()
     _render_mobile_nav()
 
     with st.sidebar:
