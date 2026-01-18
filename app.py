@@ -5266,6 +5266,7 @@ def apply_theme_css() -> None:
         :root {{
             --ps-bg: {colors['bg']};
             --ps-sidebar-bg: {colors['sidebar_bg']};
+            --ps-sidebar-width: 18rem;
             --ps-panel-bg: {colors['panel_bg']};
             --ps-panel-border: {colors['panel_border']};
             --ps-text: {colors['text']};
@@ -5299,6 +5300,21 @@ def apply_theme_css() -> None:
         }}
         [data-testid="stSidebar"] {{
             background-color: var(--ps-sidebar-bg);
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            width: var(--ps-sidebar-width);
+            overflow-y: auto;
+            z-index: 1100;
+            border-right: 1px solid var(--ps-panel-border);
+        }}
+        [data-testid="stSidebar"] > div {{
+            height: 100%;
+        }}
+        section.main,
+        [data-testid="stAppViewContainer"] > .main {{
+            margin-left: var(--ps-sidebar-width);
         }}
         div[data-testid="stMarkdownContainer"] p,
         div[data-testid="stMarkdownContainer"] li,
@@ -5358,10 +5374,10 @@ def apply_theme_css() -> None:
         }}
         @media (max-width: 1200px) {{
             .ps-ribbon-nav {{
-                display: block;
+                display: none;
             }}
             [data-testid="stSidebar"] {{
-                display: none !important;
+                display: block !important;
             }}
             section.main,
             [data-testid="stAppViewContainer"] {{
@@ -5370,7 +5386,7 @@ def apply_theme_css() -> None:
         }}
         @media (max-width: 768px) {{
             .ps-mobile-nav {{
-                display: block;
+                display: none;
             }}
             .ps-ribbon-nav {{
                 display: none;
@@ -6773,8 +6789,17 @@ def login_box(conn, *, render_id=None):
         try:
             with open(cover_image, "rb") as handle:
                 encoded = base64.b64encode(handle.read()).decode("utf-8")
+            suffix = cover_image.suffix.lower()
+            mime_map = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+            }
+            mime_type = mime_map.get(suffix, "image/png")
             cover_css = (
-                "background-image: url('data:image/png;base64,"
+                f"background-image: url('data:{mime_type};base64,"
                 f"{encoded}');"
             )
         except OSError:
@@ -6802,6 +6827,8 @@ def login_box(conn, *, render_id=None):
         [data-testid="stSidebar"] {{
             display: none !important;
         }}
+        body,
+        .stApp,
         [data-testid="stAppViewContainer"] {{
             {cover_css}
             background-size: cover;
@@ -23006,9 +23033,6 @@ def main():
                     _request_logout()
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
-
-    _render_ribbon_nav()
-    _render_mobile_nav()
 
     with st.sidebar:
         sidebar_dark = st.toggle(
