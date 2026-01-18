@@ -5287,67 +5287,33 @@ def _build_master_sheet(sheets: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
 
 
 def get_theme() -> str:
-    theme = clean_text(st.session_state.get("theme")) or "light"
-    return "dark" if theme.lower().startswith("dark") else "light"
-
-
-def set_theme(value: object) -> None:
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        theme = "dark" if normalized.startswith("dark") else "light"
-    else:
-        theme = "dark" if bool(value) else "light"
-    st.session_state["theme"] = theme
+    return "light"
 
 
 def apply_theme_css() -> None:
     theme = get_theme()
-    if theme == "dark":
-        colors = {
-            "bg": "#0e1117",
-            "sidebar_bg": "#0b1220",
-            "panel_bg": "#0f172a",
-            "panel_border": "#1f2937",
-            "text": "#f8fafc",
-            "muted": "#94a3b8",
-            "input_bg": "#111827",
-            "input_border": "#334155",
-            "accent": "#38bdf8",
-            "button_bg": "#111827",
-            "button_border": "#334155",
-            "button_text": "#f8fafc",
-            "button_hover": "#1f2937",
-            "button_primary_bg": "#38bdf8",
-            "button_primary_text": "#0b1220",
-            "button_primary_hover": "#0ea5e9",
-            "metric_bg": "rgba(255, 255, 255, 0.04)",
-            "metric_border": "rgba(250, 250, 250, 0.12)",
-            "table_header_bg": "#111827",
-            "table_row_alt_bg": "rgba(148, 163, 184, 0.08)",
-        }
-    else:
-        colors = {
-            "bg": "#ffffff",
-            "sidebar_bg": "#f8f9fb",
-            "panel_bg": "#ffffff",
-            "panel_border": "#e5e7eb",
-            "text": "#111827",
-            "muted": "#6b7280",
-            "input_bg": "#ffffff",
-            "input_border": "#d1d5db",
-            "accent": "#1d3b64",
-            "button_bg": "#ffffff",
-            "button_border": "#d1d5db",
-            "button_text": "#111827",
-            "button_hover": "#f3f4f6",
-            "button_primary_bg": "#1d3b64",
-            "button_primary_text": "#ffffff",
-            "button_primary_hover": "#1e4b82",
-            "metric_bg": "#f7f9fc",
-            "metric_border": "rgba(49, 51, 63, 0.08)",
-            "table_header_bg": "#f3f4f6",
-            "table_row_alt_bg": "rgba(15, 23, 42, 0.04)",
-        }
+    colors = {
+        "bg": "#ffffff",
+        "sidebar_bg": "#ffffff",
+        "panel_bg": "#ffffff",
+        "panel_border": "#e5e7eb",
+        "text": "#111827",
+        "muted": "#6b7280",
+        "input_bg": "#ffffff",
+        "input_border": "#d1d5db",
+        "accent": "#1d3b64",
+        "button_bg": "#ffffff",
+        "button_border": "#d1d5db",
+        "button_text": "#111827",
+        "button_hover": "#ffffff",
+        "button_primary_bg": "#1d3b64",
+        "button_primary_text": "#ffffff",
+        "button_primary_hover": "#1e4b82",
+        "metric_bg": "#ffffff",
+        "metric_border": "rgba(49, 51, 63, 0.08)",
+        "table_header_bg": "#ffffff",
+        "table_row_alt_bg": "#ffffff",
+    }
     st.markdown(
         f"""
         <style>
@@ -5426,37 +5392,6 @@ def apply_theme_css() -> None:
             border-radius: 999px;
             font-size: 0.85rem;
             min-height: unset;
-        }}
-        .ps-ribbon-nav {{
-            position: sticky;
-            top: 1rem;
-            z-index: 1000;
-            background: var(--ps-panel-bg);
-            border: 1px solid var(--ps-panel-border);
-            border-radius: 16px;
-            padding: 1rem;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
-        }}
-        .ps-ribbon-nav h3 {{
-            margin-top: 0;
-        }}
-        .ps-ribbon-nav [role="radiogroup"] {{
-            gap: 0.35rem;
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label {{
-            border-radius: 999px;
-            padding: 0.35rem 0.75rem;
-            border: 1px solid transparent;
-            transition: all 0.2s ease;
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label:hover {{
-            background: rgba(15, 23, 42, 0.06);
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label[data-selected="true"] {{
-            border-color: rgba(15, 23, 42, 0.16);
-            background: rgba(255, 255, 255, 0.9);
-            font-weight: 600;
         }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
@@ -7134,13 +7069,8 @@ def _clear_session_for_logout(conn) -> None:
         conn.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
         conn.commit()
     _set_session_token_in_url(None)
-    preserved = {}
-    if "theme" in st.session_state:
-        preserved["theme"] = st.session_state.get("theme")
     for k in list(st.session_state.keys()):
         del st.session_state[k]
-    for k, val in preserved.items():
-        st.session_state[k] = val
 
 
 def _request_logout() -> None:
@@ -23643,11 +23573,6 @@ def main():
         st.session_state["nav_selection_sidebar"] = current_page
     elif st.session_state.get("nav_selection_sidebar") not in pages:
         st.session_state["nav_selection_sidebar"] = current_page
-    if "nav_selection_ribbon" not in st.session_state:
-        st.session_state["nav_selection_ribbon"] = current_page
-    elif st.session_state.get("nav_selection_ribbon") not in pages:
-        st.session_state["nav_selection_ribbon"] = current_page
-
     def _render_mobile_nav() -> None:
         if "nav_selection_mobile" not in st.session_state:
             st.session_state["nav_selection_mobile"] = current_page
@@ -23680,30 +23605,7 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    def _render_ribbon_nav() -> None:
-        st.markdown('<div class="ps-ribbon-nav">', unsafe_allow_html=True)
-        st.markdown("### Navigation")
-        st.radio(
-            "Navigate",
-            pages,
-            key="nav_selection_ribbon",
-            on_change=lambda: _sync_nav_choice("nav_selection_ribbon"),
-        )
-        st.write("---")
-        st.write(f"Logged in as **{user.get('username', 'User')}** ({user.get('role', 'user')})")
-        if st.button("Logout", key="ribbon_logout", use_container_width=True):
-            _request_logout()
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
     with st.sidebar:
-        sidebar_dark = st.toggle(
-            "Mode",
-            value=get_theme() == "dark",
-            key="sidebar_theme_toggle",
-            help="Toggle between light and dark.",
-        )
-        set_theme(sidebar_dark)
         apply_theme_css()
         st.markdown("### Navigation")
         st.radio(
@@ -23718,7 +23620,6 @@ def main():
             st.rerun()
 
     _render_mobile_nav()
-    _render_ribbon_nav()
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
