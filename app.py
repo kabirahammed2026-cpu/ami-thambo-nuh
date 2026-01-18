@@ -6780,6 +6780,12 @@ def login_box(conn, *, render_id=None):
             )
         except OSError:
             cover_css = ""
+    if not cover_css:
+        cover_css = (
+            "background-image: radial-gradient(circle at top, rgba(15, 23, 42, 0.55), "
+            "rgba(15, 23, 42, 0.95)), "
+            "linear-gradient(120deg, rgba(30, 64, 175, 0.6), rgba(15, 23, 42, 0.95));"
+        )
     app_bg = "#ffffff"
     panel_bg = "#ffffff"
     panel_text = "#111827"
@@ -6813,6 +6819,7 @@ def login_box(conn, *, render_id=None):
             background-position: center;
             background-repeat: no-repeat;
             background-color: {app_bg};
+            min-height: 100vh;
         }}
         section.main,
         [data-testid="stAppViewContainer"] > .main {{
