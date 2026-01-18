@@ -5267,8 +5267,8 @@ def apply_theme_css() -> None:
             --ps-bg: {colors['bg']};
             --ps-sidebar-bg: {colors['sidebar_bg']};
             --ps-sidebar-width: 18rem;
-            --ps-ribbon-width: 16rem;
-            --ps-content-offset: calc(var(--ps-sidebar-width) + var(--ps-ribbon-width));
+            --ps-ribbon-width: 0rem;
+            --ps-content-offset: var(--ps-sidebar-width);
             --ps-panel-bg: {colors['panel_bg']};
             --ps-panel-border: {colors['panel_border']};
             --ps-text: {colors['text']};
@@ -5326,45 +5326,6 @@ def apply_theme_css() -> None:
             word-break: break-word;
             white-space: pre-wrap;
         }}
-        .ps-ribbon-nav {{
-            position: fixed;
-            top: 0;
-            left: var(--ps-sidebar-width);
-            bottom: 0;
-            height: 100vh;
-            width: var(--ps-ribbon-width);
-            z-index: 1200;
-            background: var(--ps-sidebar-bg);
-            border: 1px solid var(--ps-panel-border);
-            border-radius: 0;
-            padding: 1.25rem 1rem 1.5rem;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.12);
-            display: block;
-            overflow-y: auto;
-        }}
-        .ps-ribbon-nav h3 {{
-            margin-top: 0;
-        }}
-        .ps-ribbon-nav [role="radiogroup"] {{
-            gap: 0.35rem;
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label {{
-            border-radius: 999px;
-            padding: 0.35rem 0.75rem;
-            border: 1px solid transparent;
-            transition: all 0.2s ease;
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label:hover {{
-            background: var(--ps-button-hover);
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label[data-selected="true"] {{
-            border-color: var(--ps-button-border);
-            background: var(--ps-panel-bg);
-            font-weight: 600;
-        }}
-        .ps-ribbon-nav .stButton > button {{
-            border-radius: 999px;
-        }}
         .ps-mobile-nav {{
             display: none;
             position: sticky;
@@ -5383,9 +5344,6 @@ def apply_theme_css() -> None:
             }}
         }}
         @media (max-width: 768px) {{
-            .ps-ribbon-nav {{
-                display: none;
-            }}
             .ps-mobile-nav {{
                 display: block;
             }}
@@ -6847,12 +6805,18 @@ def login_box(conn, *, render_id=None):
         }}
         body,
         .stApp,
-        [data-testid="stAppViewContainer"] {{
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main,
+        section.main {{
             {cover_css}
             background-size: cover;
             background-position: center;
             background-repeat: no-repeat;
             background-color: {app_bg};
+        }}
+        section.main,
+        [data-testid="stAppViewContainer"] > .main {{
+            background-color: transparent;
         }}
         section.main > div {{
             padding-top: 6rem;
@@ -22994,32 +22958,6 @@ def main():
     elif st.session_state.get("nav_selection_sidebar") not in pages:
         st.session_state["nav_selection_sidebar"] = current_page
 
-    def _render_ribbon_nav() -> None:
-        if "nav_selection_ribbon" not in st.session_state:
-            st.session_state["nav_selection_ribbon"] = current_page
-        elif st.session_state.get("nav_selection_ribbon") not in pages:
-            st.session_state["nav_selection_ribbon"] = current_page
-        st.markdown('<div class="ps-ribbon-nav">', unsafe_allow_html=True)
-        st.markdown("### Navigation")
-        ribbon_dark = st.toggle(
-            "Mode",
-            value=get_theme() == "dark",
-            key="ribbon_theme_toggle",
-            help="Toggle between light and dark.",
-        )
-        set_theme(ribbon_dark)
-        apply_theme_css()
-        st.radio(
-            "Navigate",
-            pages,
-            key="nav_selection_ribbon",
-            on_change=lambda: _sync_nav_choice("nav_selection_ribbon"),
-        )
-        if st.button("Logout", key="ribbon_logout_main", use_container_width=True):
-            _request_logout()
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
     def _render_mobile_nav() -> None:
         if "nav_selection_mobile" not in st.session_state:
             st.session_state["nav_selection_mobile"] = current_page
@@ -23073,7 +23011,6 @@ def main():
             _request_logout()
             st.rerun()
 
-    _render_ribbon_nav()
     _render_mobile_nav()
 
     page = st.session_state.get("nav_page", pages[0])
