@@ -5335,7 +5335,7 @@ def apply_theme_css() -> None:
             border-radius: 18px;
             padding: 0.75rem 0.85rem;
             box-shadow: 0 18px 40px rgba(15, 23, 42, 0.12);
-            display: none;
+            display: block;
         }}
         .ps-ribbon-nav h3 {{
             margin-top: 0;
@@ -5373,9 +5373,6 @@ def apply_theme_css() -> None:
             min-height: unset;
         }}
         @media (max-width: 1200px) {{
-            .ps-ribbon-nav {{
-                display: none;
-            }}
             [data-testid="stSidebar"] {{
                 display: block !important;
             }}
@@ -5385,11 +5382,11 @@ def apply_theme_css() -> None:
             }}
         }}
         @media (max-width: 768px) {{
-            .ps-mobile-nav {{
-                display: none;
-            }}
             .ps-ribbon-nav {{
                 display: none;
+            }}
+            .ps-mobile-nav {{
+                display: block;
             }}
             section.main,
             [data-testid="stAppViewContainer"] {{
@@ -23054,6 +23051,9 @@ def main():
         if st.button("Logout", key="sidebar_logout_main", use_container_width=True):
             _request_logout()
             st.rerun()
+
+    _render_ribbon_nav()
+    _render_mobile_nav()
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
