@@ -5267,6 +5267,8 @@ def apply_theme_css() -> None:
             --ps-bg: {colors['bg']};
             --ps-sidebar-bg: {colors['sidebar_bg']};
             --ps-sidebar-width: 18rem;
+            --ps-ribbon-width: 16rem;
+            --ps-content-offset: calc(var(--ps-sidebar-width) + var(--ps-ribbon-width));
             --ps-panel-bg: {colors['panel_bg']};
             --ps-panel-border: {colors['panel_border']};
             --ps-text: {colors['text']};
@@ -5314,7 +5316,7 @@ def apply_theme_css() -> None:
         }}
         section.main,
         [data-testid="stAppViewContainer"] > .main {{
-            margin-left: var(--ps-sidebar-width);
+            margin-left: var(--ps-content-offset);
         }}
         div[data-testid="stMarkdownContainer"] p,
         div[data-testid="stMarkdownContainer"] li,
@@ -5326,16 +5328,19 @@ def apply_theme_css() -> None:
         }}
         .ps-ribbon-nav {{
             position: fixed;
-            top: 1rem;
-            left: 1rem;
-            right: 1rem;
+            top: 0;
+            left: var(--ps-sidebar-width);
+            bottom: 0;
+            height: 100vh;
+            width: var(--ps-ribbon-width);
             z-index: 1200;
             background: var(--ps-sidebar-bg);
             border: 1px solid var(--ps-panel-border);
-            border-radius: 18px;
-            padding: 0.75rem 0.85rem;
+            border-radius: 0;
+            padding: 1.25rem 1rem 1.5rem;
             box-shadow: 0 18px 40px rgba(15, 23, 42, 0.12);
             display: block;
+            overflow-y: auto;
         }}
         .ps-ribbon-nav h3 {{
             margin-top: 0;
@@ -5376,10 +5381,6 @@ def apply_theme_css() -> None:
             [data-testid="stSidebar"] {{
                 display: block !important;
             }}
-            section.main,
-            [data-testid="stAppViewContainer"] {{
-                padding-top: 6.5rem;
-            }}
         }}
         @media (max-width: 768px) {{
             .ps-ribbon-nav {{
@@ -5390,6 +5391,7 @@ def apply_theme_css() -> None:
             }}
             section.main,
             [data-testid="stAppViewContainer"] {{
+                margin-left: var(--ps-sidebar-width);
                 padding-top: 4.75rem;
             }}
         }}
@@ -5826,19 +5828,32 @@ def _guard_double_submit(
 
 
 def _find_login_cover_image() -> Optional[Path]:
+    env_path = os.getenv("PS_LOGIN_COVER_IMAGE") or os.getenv("LOGIN_COVER_IMAGE")
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.is_absolute() and candidate.exists():
+            return candidate
+        for root in (PROJECT_ROOT, BASE_DIR):
+            resolved = root / candidate
+            if resolved.exists():
+                return resolved
     preferred = PROJECT_ROOT / "assets" / "login cover.png"
     if preferred.exists():
         return preferred
     candidates = [
+        "login cover",
+        "login_cover",
+        "login-cover",
         "cover photo (1)",
         "cover photo(1)",
         "cover_photo(1)",
         "cover_photo",
         "cover-photo",
         "cover",
+        "login",
     ]
     extensions = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
-    search_roots = [PROJECT_ROOT, BASE_DIR]
+    search_roots = [PROJECT_ROOT, BASE_DIR, PROJECT_ROOT / "assets", BASE_DIR / "assets"]
     for root in search_roots:
         for base in candidates:
             for ext in extensions:
@@ -5851,6 +5866,12 @@ def _find_login_cover_image() -> Optional[Path]:
                 return path
         for path in root.rglob("cover photo(1).*"):
             if path.is_file():
+                return path
+        for path in root.rglob("*login*"):
+            if path.is_file() and path.suffix.lower() in extensions:
+                return path
+        for path in root.rglob("*cover*"):
+            if path.is_file() and path.suffix.lower() in extensions:
                 return path
     return None
 
