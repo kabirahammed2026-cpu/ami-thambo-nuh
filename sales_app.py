@@ -2430,20 +2430,20 @@ def login_screen() -> None:
 
 
 def apply_theme_styles() -> None:
-    theme = st.session_state.setdefault(
-        "theme_colors",
-        {
-            "primary": "#1f77b4",
-            "sidebar_bg": "#f8f9fb",
-        },
-    )
-    primary = theme.get("primary", "#1f77b4")
-    sidebar_bg = theme.get("sidebar_bg", "#f8f9fb")
+    primary = "#1f77b4"
+    sidebar_bg = "#ffffff"
     st.markdown(
         f"""
         <style>
         :root {{
             --ps-primary-color: {primary};
+        }}
+        body,
+        .stApp,
+        section.main,
+        [data-testid="stAppViewContainer"] {{
+            background-color: #ffffff;
+            color: #111827;
         }}
         .stButton > button {{
             background-color: var(--ps-primary-color);
@@ -2457,37 +2457,15 @@ def apply_theme_styles() -> None:
         [data-testid="stSidebar"] {{
             background-color: {sidebar_bg};
         }}
-        .ps-ribbon-nav {{
-            position: sticky;
-            top: 1rem;
-            background: {sidebar_bg};
-            border: 1px solid rgba(15, 23, 42, 0.12);
-            border-radius: 18px;
-            padding: 1rem 0.85rem;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.12);
+        [data-baseweb="table"],
+        [data-baseweb="table"] thead,
+        [data-baseweb="table"] tbody,
+        [data-baseweb="table"] th,
+        [data-baseweb="table"] td {{
+            background-color: #ffffff !important;
         }}
-        .ps-ribbon-nav h3 {{
-            margin-top: 0;
-        }}
-        .ps-ribbon-nav [role="radiogroup"] {{
-            gap: 0.35rem;
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label {{
-            border-radius: 999px;
-            padding: 0.35rem 0.75rem;
-            border: 1px solid transparent;
-            transition: all 0.2s ease;
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label:hover {{
-            background: rgba(15, 23, 42, 0.06);
-        }}
-        .ps-ribbon-nav [data-testid="stRadio"] label[data-selected="true"] {{
-            border-color: rgba(15, 23, 42, 0.16);
-            background: #ffffff;
-            font-weight: 600;
-        }}
-        .ps-ribbon-nav .stButton > button {{
-            border-radius: 999px;
+        [data-baseweb="table"] tr:nth-child(even) {{
+            background-color: #ffffff !important;
         }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
@@ -2498,38 +2476,6 @@ def apply_theme_styles() -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
-def _theme_controls() -> None:
-    theme = st.session_state.setdefault(
-        "theme_colors",
-        {
-            "primary": "#1f77b4",
-            "sidebar_bg": "#f8f9fb",
-        },
-    )
-
-    def _render_controls() -> None:
-        theme["primary"] = st.color_picker(
-            "Primary color",
-            value=theme.get("primary", "#1f77b4"),
-            key="theme_primary_color",
-        )
-        theme["sidebar_bg"] = st.color_picker(
-            "Sidebar background",
-            value=theme.get("sidebar_bg", "#f8f9fb"),
-            key="theme_sidebar_bg",
-        )
-        if st.button("Reset theme", use_container_width=True):
-            theme.update({"primary": "#1f77b4", "sidebar_bg": "#f8f9fb"})
-            rerun()
-
-    if hasattr(st.sidebar, "popover"):
-        with st.sidebar.popover("Theme"):
-            _render_controls()
-    else:
-        with st.sidebar.expander("Theme", expanded=False):
-            _render_controls()
 
 
 def _navigation_pages(user: Dict) -> dict[str, str]:
@@ -2582,7 +2528,6 @@ def sidebar(user: Dict, pages: dict[str, str]) -> None:
     )
     st.sidebar.write("---")
     st.sidebar.write(f"Logged in as **{user['username']}** ({user['role']})")
-    _theme_controls()
     if st.sidebar.button("Logout"):
         st.session_state["logout_requested"] = True
         rerun()
@@ -6071,36 +6016,28 @@ def main() -> None:
 
     sidebar(user, pages)
 
-    nav_col, content_col = st.columns([1, 5], gap="large")
-    with nav_col:
-        st.markdown('<div class="ps-ribbon-nav">', unsafe_allow_html=True)
-        st.markdown("### Navigation")
-        ribbon_navigation(user, pages)
-        st.markdown("</div>", unsafe_allow_html=True)
-
     page = st.session_state.get("active_page", pages[labels[0]])
-    with content_col:
-        quick_nav_menu(user, pages)
-        if page == "dashboard":
-            render_dashboard(user)
-        elif page == "quotation_letters":
-            render_quotation_letter_page(user)
-        elif page == "quotations":
-            render_quotations(user)
-        elif page == "work_orders":
-            render_work_orders(user)
-        elif page == "delivery_orders":
-            render_delivery_orders(user)
-        elif page == "companies":
-            render_companies()
-        elif page == "admin_filters":
-            render_admin_filters()
-        elif page == "settings":
-            render_settings()
-        elif page == "users":
-            render_users()
-        elif page == "notifications":
-            render_notifications(user)
+    quick_nav_menu(user, pages)
+    if page == "dashboard":
+        render_dashboard(user)
+    elif page == "quotation_letters":
+        render_quotation_letter_page(user)
+    elif page == "quotations":
+        render_quotations(user)
+    elif page == "work_orders":
+        render_work_orders(user)
+    elif page == "delivery_orders":
+        render_delivery_orders(user)
+    elif page == "companies":
+        render_companies()
+    elif page == "admin_filters":
+        render_admin_filters()
+    elif page == "settings":
+        render_settings()
+    elif page == "users":
+        render_users()
+    elif page == "notifications":
+        render_notifications(user)
 
 
 if __name__ == "__main__":
