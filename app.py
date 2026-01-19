@@ -5556,6 +5556,14 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             color: var(--ps-text);
             border-color: var(--ps-panel-border);
         }}
+        [data-baseweb="menu"],
+        [data-baseweb="menu"] [role="menu"],
+        [data-baseweb="menu"] [role="menuitem"],
+        [data-baseweb="menu"] [role="option"] {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+            border-color: var(--ps-panel-border) !important;
+        }}
         [data-testid="stSelectbox"] [role="option"],
         [data-testid="stMultiSelect"] [role="option"] {{
             color: var(--ps-text);
@@ -5876,6 +5884,27 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [data-baseweb="select"] svg {{
             color: var(--ps-muted) !important;
             fill: var(--ps-muted) !important;
+        }}
+        [data-testid="stDataEditor"] [role="listbox"],
+        [data-testid="stDataEditor"] [data-baseweb="menu"] {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+            border-color: var(--ps-panel-border) !important;
+        }}
+        [data-testid="stDataEditor"] [role="option"],
+        [data-testid="stDataEditor"] [role="menuitem"] {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+        }}
+        [data-testid="stDataEditor"] [role="option"][aria-selected="true"],
+        [data-testid="stDataEditor"] [role="menuitem"][aria-selected="true"] {{
+            background-color: rgba(56, 189, 248, 0.18) !important;
+        }}
+        [data-baseweb="calendar"],
+        [data-baseweb="calendar"] * {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+            border-color: var(--ps-panel-border) !important;
         }}
         [data-baseweb="table"] {{
             background: var(--ps-panel-bg) !important;
@@ -12052,11 +12081,6 @@ def render_customer_document_uploader(
                             details_key_prefix=f"{key_prefix}_do_details",
                             doc_type="Delivery order",
                         )
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_do_file",
-                            details_key_prefix=f"{key_prefix}_do_details",
-                            doc_type="Delivery order",
-                        )
 
         with upload_cols[1]:
             st.markdown("**Service / Maintenance**")
@@ -12247,6 +12271,11 @@ def render_operations_document_uploader(
                     )
                     if saved:
                         st.success("Delivery order uploaded.")
+                        _clear_operations_upload_state(
+                            file_key=f"{key_prefix}_do_file",
+                            details_key_prefix=f"{key_prefix}_do_details",
+                            doc_type="Delivery order",
+                        )
 
         with upload_cols[1]:
             st.markdown("**Work done**")
@@ -13484,6 +13513,38 @@ def operations_page(conn):
         st.caption(
             "Showing all matching customers. Use search to narrow the list if needed."
         )
+
+    last_customer_key = "operations_page_selected_customer_id"
+    if selected_customer_id is not None:
+        previous_customer_id = st.session_state.get(last_customer_key)
+        if previous_customer_id != selected_customer_id:
+            st.session_state[last_customer_key] = selected_customer_id
+            st.session_state["operations_page_show_uploads"] = False
+            _clear_operations_upload_state(
+                file_key="operations_page_do_file",
+                details_key_prefix="operations_page_do_details",
+                doc_type="Delivery order",
+            )
+            _clear_operations_upload_state(
+                file_key="operations_page_work_done_file",
+                details_key_prefix="operations_page_work_done_details",
+                doc_type="Work done",
+            )
+            _clear_operations_upload_state(
+                file_key="operations_page_service_file",
+                details_key_prefix="operations_page_service_details",
+                doc_type="Service",
+            )
+            _clear_operations_upload_state(
+                file_key="operations_page_maintenance_file",
+                details_key_prefix="operations_page_maintenance_details",
+                doc_type="Maintenance",
+            )
+            _clear_operations_upload_state(
+                file_key="operations_page_other_file",
+                details_key_prefix="operations_page_other_details",
+                doc_type="Other",
+            )
 
     render_operations_document_uploader(
         conn,
@@ -15013,9 +15074,13 @@ def warranties_page(conn):
             note_default = f"{note_default} Product: {product_label}."
         if serial_label:
             note_default = f"{note_default} Serial: {serial_label}."
+        note_key = f"warranty_followup_note_{selected_warranty}"
+        if note_key not in st.session_state:
+            st.session_state[note_key] = note_default
         note_input = st.text_area(
             "Remark",
-            value=note_default,
+            value=st.session_state[note_key],
+            key=note_key,
             help="Store remarks that will show up in follow-up reminders.",
         )
         reminder_date = st.date_input(
@@ -17243,7 +17308,8 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
         items_clean, totals_data = normalize_quotation_items(prepared_items)
 
         reminder_days = follow_up_presets.get(follow_up_choice)
-        follow_up_date = follow_up_date_value
+        follow_up_date_seed = parse_date_value(st.session_state.get("quotation_follow_up_date"))
+        follow_up_date = follow_up_date_seed.date() if follow_up_date_seed is not None else None
         if reminder_days is not None:
             follow_up_date = quotation_date + timedelta(days=reminder_days)
         follow_up_iso = to_iso_date(follow_up_date) if follow_up_date else None
