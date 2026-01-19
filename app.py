@@ -5354,6 +5354,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             --ps-sidebar-width: 18rem;
             --ps-ribbon-width: 0rem;
             --ps-content-offset: {content_offset};
+            --ps-sidebar-display: {sidebar_display};
             --ps-panel-bg: {colors['panel_bg']};
             --ps-panel-border: {colors['panel_border']};
             --ps-text: {colors['text']};
@@ -5396,7 +5397,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             overflow-y: auto;
             z-index: 1100;
             border-right: 1px solid var(--ps-panel-border);
-            display: {sidebar_display};
+            display: var(--ps-sidebar-display);
         }}
         [data-testid="stSidebar"] > div {{
             height: 100%;
@@ -5426,9 +5427,24 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             font-size: 0.85rem;
             min-height: unset;
         }}
+        button[title="Show menu"],
+        button[title="Hide menu"],
+        button[aria-label="Show menu"],
+        button[aria-label="Hide menu"] {{
+            position: fixed;
+            top: 1.25rem;
+            left: 1rem;
+            z-index: 2300;
+            padding: 0.2rem 0.55rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            min-height: unset;
+        }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
-                display: none !important;
+                display: var(--ps-sidebar-display);
+                width: min(18rem, 85vw);
+                box-shadow: 0 18px 38px rgba(15, 23, 42, 0.2);
             }}
             section.main,
             [data-testid="stAppViewContainer"] > .main {{
@@ -6335,6 +6351,48 @@ def export_full_archive(
     finally:
         if close_conn:
             active_conn.close()
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def export_uploads_archive() -> bytes:
+    """Bundle all uploaded files into a zip for admin download."""
+
+    def _hash_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    buffer = io.BytesIO()
+    db_path = Path(DB_PATH)
+    raw_storage_files = [
+        path
+        for path in (BASE_DIR.rglob("*") if BASE_DIR.exists() else [])
+        if path.is_file()
+    ]
+    storage_files = [
+        path
+        for path in raw_storage_files
+        if not (db_path.exists() and path.resolve() == db_path.resolve())
+    ]
+    checksum_lines: list[str] = []
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if BASE_DIR.exists():
+            for path in storage_files:
+                arcname = Path("storage") / path.relative_to(BASE_DIR)
+                zf.write(path, arcname=str(arcname))
+                checksum_lines.append(f"{_hash_file(path)}  {arcname}")
+        manifest_lines = [
+            f"Export generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Storage directory: {BASE_DIR} (files: {len(storage_files)})",
+            f"Checksum file: checksums.txt (entries: {len(checksum_lines)})",
+        ]
+        zf.writestr("manifest.txt", "\n".join(manifest_lines))
+        if checksum_lines:
+            zf.writestr("checksums.txt", "\n".join(checksum_lines))
 
     buffer.seek(0)
     return buffer.getvalue()
@@ -8947,12 +9005,14 @@ def dashboard(conn):
             excel_bytes = export_database_to_excel(conn, include_all=True)
             export_state["excel_bytes"] = excel_bytes
             export_state["archive_bytes"] = export_full_archive(conn, excel_bytes)
+            export_state["uploads_archive_bytes"] = export_uploads_archive()
         excel_bytes = export_state.get("excel_bytes")
         archive_bytes = export_state.get("archive_bytes")
+        uploads_archive_bytes = export_state.get("uploads_archive_bytes")
         if downloads_enabled:
-            if not excel_bytes and not archive_bytes:
+            if not excel_bytes and not archive_bytes and not uploads_archive_bytes:
                 st.info("Click “Prepare downloads” to generate export files.")
-            download_cols = st.columns([0.5, 0.5])
+            download_cols = st.columns([0.34, 0.33, 0.33])
             with download_cols[0]:
                 if excel_bytes:
                     st.download_button(
@@ -8974,6 +9034,17 @@ def dashboard(conn):
                     )
                 else:
                     st.info("Archive export not ready yet.")
+            with download_cols[2]:
+                if uploads_archive_bytes:
+                    st.download_button(
+                        "⬇️ Download all uploads (.zip)",
+                        uploads_archive_bytes,
+                        file_name="ps_crm_uploads.zip",
+                        mime="application/zip",
+                        help="Bundles every uploaded document, receipt, and attachment.",
+                    )
+                else:
+                    st.info("Uploads archive not ready yet.")
         backup_status = get_backup_status(BACKUP_DIR)
         if backup_status:
             backup_label = backup_status.get("last_backup_at") or "Unknown time"
@@ -9358,6 +9429,7 @@ def dashboard(conn):
             LEFT JOIN delivery_orders d ON d.do_number = s.do_number
             LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
             WHERE s.deleted_at IS NULL
+              AND LOWER(COALESCE(s.payment_status, 'pending')) = 'paid'
             ORDER BY datetime(s.service_date) DESC, s.service_id DESC
             {services_limit}
             """,
@@ -9413,6 +9485,7 @@ def dashboard(conn):
             LEFT JOIN delivery_orders d ON d.do_number = m.do_number
             LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
             WHERE m.deleted_at IS NULL
+              AND LOWER(COALESCE(m.payment_status, 'pending')) = 'paid'
             ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
             {maintenance_limit}
             """,
@@ -9470,6 +9543,7 @@ def dashboard(conn):
             LEFT JOIN customers c ON c.customer_id = d.customer_id
             WHERE d.deleted_at IS NULL
               AND COALESCE(d.record_type, 'delivery_order') = 'delivery_order'
+              AND LOWER(COALESCE(d.status, 'due')) = 'paid'
             ORDER BY datetime(d.created_at) DESC
             {delivery_limit}
             """,
@@ -9534,6 +9608,7 @@ def dashboard(conn):
             LEFT JOIN customers c ON c.customer_id = d.customer_id
             WHERE d.deleted_at IS NULL
               AND COALESCE(d.record_type, 'delivery_order') = 'work_done'
+              AND LOWER(COALESCE(d.status, 'due')) = 'paid'
             ORDER BY datetime(d.created_at) DESC
             {work_limit}
             """,
@@ -16852,6 +16927,8 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 key="quotation_follow_up_choice",
             )
             custom_follow_up = follow_up_choice == "Custom date"
+            if custom_follow_up:
+                st.session_state["quotation_follow_up_date_toggle"] = True
             enable_follow_date = st.checkbox(
                 "Set follow-up date",
                 value=bool(st.session_state.get("quotation_follow_up_date"))
@@ -16863,13 +16940,14 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 enable_follow_date = True
             follow_up_seed = parse_date_value(st.session_state.get("quotation_follow_up_date"))
             follow_up_default = follow_up_seed.date() if follow_up_seed else datetime.now().date()
-            follow_up_date_value = st.date_input(
-                "Next follow-up date",
-                value=follow_up_default,
-                key="quotation_follow_up_date",
-                disabled=not enable_follow_date,
-            )
-            if not enable_follow_date:
+            if enable_follow_date:
+                follow_up_date_value = st.date_input(
+                    "Next follow-up date",
+                    value=follow_up_default,
+                    key="quotation_follow_up_date",
+                    disabled=False,
+                )
+            else:
                 follow_up_date_value = None
         follow_up_notes = st.text_area(
             "Follow-up remarks for admins",
@@ -23825,7 +23903,7 @@ def main():
 
     sidebar_hidden = bool(st.session_state.get("sidebar_hidden"))
     toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
-    if st.button(toggle_label, key="sidebar_toggle_main"):
+    if st.button("☰", key="sidebar_toggle_main", help=toggle_label):
         st.session_state["sidebar_hidden"] = not sidebar_hidden
         st.rerun()
 
