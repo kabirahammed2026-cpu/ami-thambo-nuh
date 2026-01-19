@@ -20968,16 +20968,15 @@ def import_page(conn):
             phone_series = ready["phone"].fillna("").astype(str).str.strip()
             missing_phone = phone_series.eq("")
             if missing_phone.any():
-                st.error(
+                st.warning(
                     f"{missing_phone.sum()} row(s) are missing a phone number. "
-                    "Add a unique phone number before importing."
+                    "They will still import and appear under Scraps until completed."
                 )
                 st.dataframe(
                     ready[missing_phone],
                     use_container_width=True,
                     hide_index=True,
                 )
-                return
         seeded, d_c, d_p = _import_clean6(conn, ready, tag="Manual import (mapped)")
         if seeded == 0:
             st.warning("No rows added (rows empty/invalid). Check mapping or file.")
