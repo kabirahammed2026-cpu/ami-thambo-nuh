@@ -2865,6 +2865,43 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
 
     scope_clause, scope_params = customer_scope_filter("c")
     scope_filter = f" AND {scope_clause}" if scope_clause else ""
+    note_alerts = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT n.note_id,
+                   n.note,
+                   n.remind_on,
+                   c.name AS customer
+            FROM customer_notes n
+            LEFT JOIN customers c ON c.customer_id = n.customer_id
+            WHERE n.is_done = 0
+              AND n.remind_on IS NOT NULL
+              {scope_filter}
+            ORDER BY date(n.remind_on) ASC, datetime(n.created_at) ASC
+            LIMIT 20
+            """
+        ),
+        scope_params,
+    )
+    if not note_alerts.empty:
+        for _, row in note_alerts.iterrows():
+            remind_on = clean_text(row.get("remind_on"))
+            reminder_dt = pd.to_datetime(remind_on, errors="coerce")
+            reminder_date = reminder_dt.date() if pd.notna(reminder_dt) else None
+            customer_label = clean_text(row.get("customer")) or "(unknown)"
+            note_text = clean_text(row.get("note")) or "Reminder"
+            date_label = format_period_range(remind_on, remind_on) or "(date pending)"
+            alerts.append(
+                {
+                    "title": customer_label,
+                    "message": f"{note_text} (due {date_label})",
+                    "severity": "warning"
+                    if reminder_date and reminder_date <= date.today()
+                    else "info",
+                }
+            )
+
     warranty_soon = df_query(
         conn,
         dedent(
@@ -5827,6 +5864,18 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-input-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-input-border) !important;
+        }}
+        [data-testid="stDataEditor"] [data-baseweb="select"] > div {{
+            background-color: var(--ps-input-bg) !important;
+            border-color: var(--ps-input-border) !important;
+            color: var(--ps-text) !important;
+        }}
+        [data-testid="stDataEditor"] [data-baseweb="select"] input {{
+            color: var(--ps-text) !important;
+        }}
+        [data-testid="stDataEditor"] [data-baseweb="select"] svg {{
+            color: var(--ps-muted) !important;
+            fill: var(--ps-muted) !important;
         }}
         [data-baseweb="table"] {{
             background: var(--ps-panel-bg) !important;
@@ -9952,12 +10001,14 @@ def show_expiry_notifications(conn):
     )
 
     scope_filter_clause = f" AND {scope_clause}" if scope_clause else ""
+    warranty_status_clause = "COALESCE(w.status, 'active') NOT IN ('deleted', 'completed')"
     total_expired_query = dedent(
         f"""
         SELECT COUNT(*) c
         FROM warranties w
         LEFT JOIN customers c ON c.customer_id = w.customer_id
-        WHERE date(w.expiry_date) < date('now'){scope_filter_clause}
+        WHERE {warranty_status_clause}
+          AND date(w.expiry_date) < date('now'){scope_filter_clause}
         """
     )
     total_expired = int(df_query(conn, total_expired_query, scope_params).iloc[0]["c"])
@@ -9969,7 +10020,8 @@ def show_expiry_notifications(conn):
             SELECT COUNT(*) c
             FROM warranties w
             LEFT JOIN customers c ON c.customer_id = w.customer_id
-            WHERE date(w.expiry_date) < date('now')
+            WHERE {warranty_status_clause}
+              AND date(w.expiry_date) < date('now')
               AND strftime('%Y-%m', w.expiry_date) = strftime('%Y-%m', 'now'){scope_filter_clause}
             """
         )
@@ -9980,7 +10032,8 @@ def show_expiry_notifications(conn):
             FROM warranties w
             LEFT JOIN customers c ON c.customer_id = w.customer_id
             LEFT JOIN products p ON p.product_id = w.product_id
-            WHERE date(w.expiry_date) < date('now'){scope_filter_clause}
+            WHERE {warranty_status_clause}
+              AND date(w.expiry_date) < date('now'){scope_filter_clause}
             ORDER BY date(w.expiry_date) DESC
             LIMIT 12
             """
@@ -14816,7 +14869,7 @@ def warranties_page(conn):
     )
 
     search_filter = "(? = '' OR c.name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')"
-    status_filter = "(w.status IS NULL OR w.status <> 'deleted')"
+    status_filter = "(COALESCE(w.status, 'active') NOT IN ('deleted', 'completed'))"
     product_filter = "(p.name IS NOT NULL AND TRIM(p.name) != '')"
     scope_clause, scope_params = customer_scope_filter("c")
 
@@ -15005,15 +15058,19 @@ def warranties_page(conn):
         st.caption("No saved warranty reminders yet.")
     else:
         followup_rows: list[dict[str, object]] = []
+        warranty_note_map: dict[int, int] = {}
         for row in saved_followups.to_dict("records"):
             warranty_id, note_text = _parse_warranty_followup_note(row.get("note"))
             warranty_label = ""
             if warranty_id:
                 warranty_label = warranty_labels.get(warranty_id, f"Warranty #{warranty_id}")
             reminder_label = format_period_range(row.get("remind_on"), row.get("remind_on"))
+            note_id = int_or_none(row.get("note_id"))
+            if warranty_id and note_id is not None:
+                warranty_note_map[note_id] = warranty_id
             followup_rows.append(
                 {
-                    "Note ID": int_or_none(row.get("note_id")),
+                    "Note ID": note_id,
                     "Warranty": warranty_label,
                     "Customer": clean_text(row.get("customer")) or "(unknown)",
                     "Reminder date": reminder_label,
@@ -15035,25 +15092,33 @@ def warranties_page(conn):
                 )
             },
         )
-        if st.button("Save follow-up status", type="primary"):
-            updates: list[tuple[int, int]] = []
-            if isinstance(edited_followups, pd.DataFrame):
-                for note_id, row in edited_followups.iterrows():
-                    original = clean_text(followup_df.at[note_id, "Status"])
-                    updated = clean_text(row.get("Status"))
-                    if original != updated:
-                        is_done_value = 1 if updated == "Completed" else 0
-                        updates.append((is_done_value, int(note_id)))
-            if updates:
-                conn.executemany(
-                    "UPDATE customer_notes SET is_done=? WHERE note_id=?",
-                    updates,
-                )
-                conn.commit()
-                st.success("Follow-up status updated.")
-                _safe_rerun()
-            else:
-                st.info("No follow-up status changes to save.")
+        updates: list[tuple[int, int]] = []
+        warranty_updates: list[tuple[str, int]] = []
+        if isinstance(edited_followups, pd.DataFrame):
+            for note_id, row in edited_followups.iterrows():
+                original = clean_text(followup_df.at[note_id, "Status"])
+                updated = clean_text(row.get("Status"))
+                if original != updated:
+                    is_done_value = 1 if updated == "Completed" else 0
+                    updates.append((is_done_value, int(note_id)))
+                    warranty_id = warranty_note_map.get(int(note_id))
+                    if warranty_id is not None:
+                        status_value = "completed" if updated == "Completed" else "active"
+                        warranty_updates.append((status_value, int(warranty_id)))
+        if updates:
+            conn.executemany(
+                "UPDATE customer_notes SET is_done=? WHERE note_id=?",
+                updates,
+            )
+        if warranty_updates:
+            conn.executemany(
+                "UPDATE warranties SET status=? WHERE warranty_id=?",
+                warranty_updates,
+            )
+        if updates or warranty_updates:
+            conn.commit()
+            st.success("Follow-up status updated.")
+            _safe_rerun()
 
 
 def _render_service_section(conn, *, show_heading: bool = True):
