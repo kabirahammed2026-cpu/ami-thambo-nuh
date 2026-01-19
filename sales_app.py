@@ -2530,7 +2530,7 @@ def apply_theme_styles() -> None:
             color-scheme: light !important;
         }}
         [data-baseweb="table"] tr:nth-child(even) {{
-            background-color: #f8fafc !important;
+            background-color: #ffffff !important;
         }}
         [data-testid="stTable"] {{
             background-color: var(--ps-panel-bg) !important;
@@ -2551,6 +2551,15 @@ def apply_theme_styles() -> None:
             background-color: var(--ps-panel-bg) !important;
             color: #111827 !important;
             border-color: var(--ps-panel-border) !important;
+        }}
+        [data-testid="stDataFrame"],
+        [data-testid="stDataEditor"],
+        [data-testid="stTable"],
+        [data-baseweb="table"],
+        [data-baseweb="table"] * {{
+            background-color: #ffffff !important;
+            color: #111827 !important;
+            color-scheme: light !important;
         }}
         .ps-quick-nav {{
             position: sticky;
