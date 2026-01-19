@@ -2432,11 +2432,19 @@ def login_screen() -> None:
 def apply_theme_styles() -> None:
     primary = "#1f77b4"
     sidebar_bg = "#ffffff"
+    button_bg = "#ffffff"
+    button_border = "#d1d5db"
+    button_text = "#111827"
+    button_hover = "#f3f4f6"
     st.markdown(
         f"""
         <style>
         :root {{
             --ps-primary-color: {primary};
+            color-scheme: light;
+        }}
+        html {{
+            color-scheme: light !important;
         }}
         body,
         .stApp,
@@ -2444,15 +2452,33 @@ def apply_theme_styles() -> None:
         [data-testid="stAppViewContainer"] {{
             background-color: #ffffff;
             color: #111827;
+            color-scheme: light !important;
         }}
-        .stButton > button {{
-            background-color: var(--ps-primary-color);
-            border-color: var(--ps-primary-color);
-            color: #ffffff;
+        div[data-testid="stButton"] > button,
+        div[data-testid="stDownloadButton"] > button,
+        div[data-testid="stFormSubmitButton"] > button,
+        div[data-testid="stForm"] button {{
+            background-color: {button_bg};
+            border-color: {button_border};
+            color: {button_text};
         }}
-        .stButton > button:hover {{
-            border-color: var(--ps-primary-color);
-            color: #ffffff;
+        div[data-testid="stButton"] > button:hover,
+        div[data-testid="stDownloadButton"] > button:hover,
+        div[data-testid="stFormSubmitButton"] > button:hover,
+        div[data-testid="stForm"] button:hover {{
+            background-color: {button_hover};
+            border-color: {button_border};
+            color: {button_text};
+        }}
+        button[data-testid="baseButton-primary"] {{
+            background-color: var(--ps-primary-color) !important;
+            border-color: var(--ps-primary-color) !important;
+            color: #ffffff !important;
+        }}
+        button[data-testid="baseButton-primary"]:hover {{
+            background-color: var(--ps-primary-color) !important;
+            border-color: var(--ps-primary-color) !important;
+            color: #ffffff !important;
         }}
         [data-testid="stSidebar"] {{
             background-color: {sidebar_bg};
@@ -2463,6 +2489,16 @@ def apply_theme_styles() -> None:
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
             background-color: #ffffff !important;
+            color: #111827 !important;
+            border-color: #e5e7eb !important;
+        }}
+        [data-baseweb="table"] [role="rowgroup"],
+        [data-baseweb="table"] [role="row"],
+        [data-baseweb="table"] [role="gridcell"],
+        [data-baseweb="table"] [role="columnheader"] {{
+            background-color: #ffffff !important;
+            color: #111827 !important;
+            border-color: #e5e7eb !important;
         }}
         [data-baseweb="table"] tr:nth-child(even) {{
             background-color: #ffffff !important;
