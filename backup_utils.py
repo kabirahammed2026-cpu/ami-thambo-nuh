@@ -97,7 +97,23 @@ def get_backup_status(backup_dir: Path) -> dict[str, str]:
     metadata_path = backup_dir / "backup_metadata.json"
     metadata = _load_backup_metadata(metadata_path)
     if not metadata:
-        return {}
+        backup_files = sorted(
+            backup_dir.glob("*.zip"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        if not backup_files:
+            return {}
+        latest = backup_files[0]
+        return {
+            "last_backup_at": datetime.fromtimestamp(latest.stat().st_mtime).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "last_backup_file": latest.name,
+            "backup_dir": str(backup_dir),
+            "mirror_dir": "",
+            "mirror_error": "",
+        }
     last_backup_at = metadata.get("last_backup_at", "")
     try:
         if last_backup_at:

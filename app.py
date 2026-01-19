@@ -5464,7 +5464,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         button[aria-label="Show menu"],
         button[aria-label="Hide menu"] {{
             position: fixed;
-            top: 1.25rem;
+            top: 0.5rem;
             left: 1rem;
             z-index: 2300;
             padding: 0.1rem 0.35rem;
@@ -5474,6 +5474,9 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             min-width: unset;
             width: 1.6rem;
             height: 1.6rem;
+            background-color: var(--ps-button-bg) !important;
+            border: 1px solid var(--ps-button-border) !important;
+            color: var(--ps-button-text) !important;
         }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
@@ -5704,6 +5707,11 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             border-radius: 0.65rem;
             color-scheme: light !important;
         }}
+        [data-testid="stDataFrameContainer"],
+        [data-testid="stDataFrameResizable"] {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+        }}
         [data-testid="stTable"],
         .stDataFrame,
         .stTable {{
@@ -5811,6 +5819,11 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         }}
         [data-baseweb="table"] [role="row"] {{
             background-color: var(--ps-panel-bg) !important;
+        }}
+        [data-baseweb="table"] thead,
+        [data-baseweb="table"] tbody {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
         }}
         [data-baseweb="table"] [role="row"]:nth-child(even) {{
             background-color: var(--ps-table-row-alt-bg) !important;
@@ -14828,7 +14841,6 @@ def warranties_page(conn):
               AND w.expiry_date IS NOT NULL
               {scope_filter}
             ORDER BY date(w.expiry_date) ASC, w.warranty_id ASC
-            LIMIT 200
             """
         ),
         scope_params,
@@ -14937,7 +14949,6 @@ def warranties_page(conn):
         LEFT JOIN customers c ON c.customer_id = n.customer_id
         WHERE n.note LIKE '[Warranty #%'
         ORDER BY datetime(COALESCE(n.remind_on, n.created_at)) DESC
-        LIMIT 200
         """,
     )
     st.markdown("#### Saved warranty follow-ups")
@@ -14953,6 +14964,7 @@ def warranties_page(conn):
             reminder_label = format_period_range(row.get("remind_on"), row.get("remind_on"))
             followup_rows.append(
                 {
+                    "Note ID": int_or_none(row.get("note_id")),
                     "Warranty": warranty_label,
                     "Customer": clean_text(row.get("customer")) or "(unknown)",
                     "Reminder date": reminder_label,
@@ -14960,8 +14972,39 @@ def warranties_page(conn):
                     "Remark": note_text,
                 }
             )
-        followup_df = pd.DataFrame(followup_rows)
-        st.dataframe(followup_df, use_container_width=True, hide_index=True)
+        followup_df = pd.DataFrame(followup_rows).set_index("Note ID")
+        editable_df = followup_df.copy()
+        edited_followups = st.data_editor(
+            editable_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[col for col in editable_df.columns if col != "Status"],
+            column_config={
+                "Status": st.column_config.SelectboxColumn(
+                    "Status",
+                    options=["Pending", "Completed"],
+                )
+            },
+        )
+        if st.button("Save follow-up status", type="primary"):
+            updates: list[tuple[int, int]] = []
+            if isinstance(edited_followups, pd.DataFrame):
+                for note_id, row in edited_followups.iterrows():
+                    original = clean_text(followup_df.at[note_id, "Status"])
+                    updated = clean_text(row.get("Status"))
+                    if original != updated:
+                        is_done_value = 1 if updated == "Completed" else 0
+                        updates.append((is_done_value, int(note_id)))
+            if updates:
+                conn.executemany(
+                    "UPDATE customer_notes SET is_done=? WHERE note_id=?",
+                    updates,
+                )
+                conn.commit()
+                st.success("Follow-up status updated.")
+                _safe_rerun()
+            else:
+                st.info("No follow-up status changes to save.")
 
 
 def _render_service_section(conn, *, show_heading: bool = True):
