@@ -2436,11 +2436,15 @@ def apply_theme_styles() -> None:
     button_border = "#d1d5db"
     button_text = "#111827"
     button_hover = "#f3f4f6"
+    panel_bg = "#ffffff"
+    panel_border = "#e5e7eb"
     st.markdown(
         f"""
         <style>
         :root {{
             --ps-primary-color: {primary};
+            --ps-panel-bg: {panel_bg};
+            --ps-panel-border: {panel_border};
             color-scheme: light;
         }}
         html {{
@@ -2462,6 +2466,12 @@ def apply_theme_styles() -> None:
             border-color: {button_border};
             color: {button_text};
         }}
+        [data-baseweb="button"] button,
+        button[kind] {{
+            background-color: {button_bg} !important;
+            border-color: {button_border} !important;
+            color: {button_text} !important;
+        }}
         div[data-testid="stButton"] > button:hover,
         div[data-testid="stDownloadButton"] > button:hover,
         div[data-testid="stFormSubmitButton"] > button:hover,
@@ -2469,6 +2479,12 @@ def apply_theme_styles() -> None:
             background-color: {button_hover};
             border-color: {button_border};
             color: {button_text};
+        }}
+        [data-baseweb="button"] button:hover,
+        button[kind]:hover {{
+            background-color: {button_hover} !important;
+            border-color: {button_border} !important;
+            color: {button_text} !important;
         }}
         button[data-testid="baseButton-primary"] {{
             background-color: var(--ps-primary-color) !important;
@@ -2483,25 +2499,74 @@ def apply_theme_styles() -> None:
         [data-testid="stSidebar"] {{
             background-color: {sidebar_bg};
         }}
+        [data-testid="stDataFrame"],
+        [data-testid="stDataEditor"] {{
+            background-color: var(--ps-panel-bg) !important;
+            color: #111827 !important;
+            border: 1px solid var(--ps-panel-border) !important;
+            border-radius: 0.65rem;
+            color-scheme: light !important;
+        }}
+        [data-testid="stDataFrame"] > div,
+        [data-testid="stDataEditor"] > div,
+        [data-testid="stDataFrame"] [role="grid"],
+        [data-testid="stDataEditor"] [role="grid"] {{
+            background-color: var(--ps-panel-bg) !important;
+            color: #111827 !important;
+        }}
+        [data-testid="stDataFrame"] [role="columnheader"],
+        [data-testid="stDataFrame"] [role="gridcell"],
+        [data-testid="stDataEditor"] [role="columnheader"],
+        [data-testid="stDataEditor"] [role="gridcell"] {{
+            background-color: var(--ps-panel-bg) !important;
+            color: #111827 !important;
+            border-color: var(--ps-panel-border) !important;
+        }}
+        [data-testid="stDataEditor"] input,
+        [data-testid="stDataEditor"] textarea {{
+            background-color: #ffffff !important;
+            color: #111827 !important;
+            border-color: var(--ps-panel-border) !important;
+        }}
         [data-baseweb="table"],
         [data-baseweb="table"] thead,
         [data-baseweb="table"] tbody,
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
-            background-color: #ffffff !important;
+            background-color: var(--ps-panel-bg) !important;
             color: #111827 !important;
-            border-color: #e5e7eb !important;
+            border-color: var(--ps-panel-border) !important;
         }}
         [data-baseweb="table"] [role="rowgroup"],
         [data-baseweb="table"] [role="row"],
         [data-baseweb="table"] [role="gridcell"],
         [data-baseweb="table"] [role="columnheader"] {{
-            background-color: #ffffff !important;
+            background-color: var(--ps-panel-bg) !important;
             color: #111827 !important;
-            border-color: #e5e7eb !important;
+            border-color: var(--ps-panel-border) !important;
         }}
         [data-baseweb="table"] tr:nth-child(even) {{
-            background-color: #ffffff !important;
+            background-color: #f8fafc !important;
+        }}
+        [data-testid="stTable"] {{
+            background-color: var(--ps-panel-bg) !important;
+            border: 1px solid var(--ps-panel-border) !important;
+            border-radius: 0.65rem;
+            overflow: hidden;
+        }}
+        [data-testid="stTable"] table,
+        [data-testid="stTable"] th,
+        [data-testid="stTable"] td {{
+            background-color: var(--ps-panel-bg) !important;
+            color: #111827 !important;
+            border-color: var(--ps-panel-border) !important;
+        }}
+        [data-testid="stMarkdownContainer"] table,
+        [data-testid="stMarkdownContainer"] th,
+        [data-testid="stMarkdownContainer"] td {{
+            background-color: var(--ps-panel-bg) !important;
+            color: #111827 !important;
+            border-color: var(--ps-panel-border) !important;
         }}
         .ps-quick-nav {{
             position: sticky;
