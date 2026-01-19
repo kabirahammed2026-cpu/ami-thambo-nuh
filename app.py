@@ -5409,7 +5409,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         "metric_bg": "#ffffff",
         "metric_border": "rgba(49, 51, 63, 0.08)",
         "table_header_bg": "#ffffff",
-        "table_row_alt_bg": "#f8fafc",
+        "table_row_alt_bg": "#ffffff",
     }
     st.markdown(
         f"""
@@ -5999,6 +5999,15 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         }}
         table tbody tr:nth-child(even) {{
             background-color: var(--ps-table-row-alt-bg) !important;
+        }}
+        [data-testid="stDataFrame"],
+        [data-testid="stDataEditor"],
+        [data-testid="stTable"],
+        [data-baseweb="table"],
+        [data-baseweb="table"] * {{
+            background-color: #ffffff !important;
+            color: #111827 !important;
+            color-scheme: light !important;
         }}
         [data-testid="stFileUploader"] section {{
             background-color: var(--ps-panel-bg) !important;
@@ -7410,7 +7419,7 @@ def login_box(conn, *, render_id=None):
     placeholder_color = "rgba(75, 85, 99, 0.9)"
     button_bg = "#ffffff"
     button_text = "#111827"
-    button_hover = "#f3f4f6"
+    button_hover = "#ffffff"
     st.markdown(
         f"""
         <style>
