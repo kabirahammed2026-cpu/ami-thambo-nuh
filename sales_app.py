@@ -2536,6 +2536,7 @@ def apply_theme_styles() -> None:
             background-color: var(--ps-panel-bg) !important;
             color: #111827 !important;
             border-color: var(--ps-panel-border) !important;
+            color-scheme: light !important;
         }}
         [data-baseweb="table"] [role="rowgroup"],
         [data-baseweb="table"] [role="row"],
@@ -2544,6 +2545,7 @@ def apply_theme_styles() -> None:
             background-color: var(--ps-panel-bg) !important;
             color: #111827 !important;
             border-color: var(--ps-panel-border) !important;
+            color-scheme: light !important;
         }}
         [data-baseweb="table"] tr:nth-child(even) {{
             background-color: #f8fafc !important;

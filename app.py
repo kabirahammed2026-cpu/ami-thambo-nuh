@@ -5880,16 +5880,19 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-baseweb="table"] {{
             background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
+            color-scheme: light !important;
         }}
         [data-baseweb="table"] * {{
             background-color: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
+            color-scheme: light !important;
         }}
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
             background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-panel-border) !important;
+            color-scheme: light !important;
         }}
         [data-baseweb="table"] th {{
             background-color: var(--ps-table-header-bg) !important;
@@ -15058,27 +15061,44 @@ def warranties_page(conn):
         st.caption("No saved warranty reminders yet.")
     else:
         followup_rows: list[dict[str, object]] = []
-        warranty_note_map: dict[int, int] = {}
+        warranty_note_map: dict[int, list[int]] = {}
+        grouped_followups: dict[int, dict[str, object]] = {}
         for row in saved_followups.to_dict("records"):
             warranty_id, note_text = _parse_warranty_followup_note(row.get("note"))
-            warranty_label = ""
-            if warranty_id:
-                warranty_label = warranty_labels.get(warranty_id, f"Warranty #{warranty_id}")
+            if not warranty_id:
+                continue
+            warranty_label = warranty_labels.get(warranty_id, f"Warranty #{warranty_id}")
             reminder_label = format_period_range(row.get("remind_on"), row.get("remind_on"))
+            created_label = format_period_range(row.get("created_at"), row.get("created_at"))
             note_id = int_or_none(row.get("note_id"))
-            if warranty_id and note_id is not None:
-                warranty_note_map[note_id] = warranty_id
-            followup_rows.append(
-                {
-                    "Note ID": note_id,
+            is_done = bool(int_or_none(row.get("is_done")))
+            status_label = "Completed" if is_done else "Pending"
+            history_entry = f"{reminder_label or created_label}: {note_text}".strip()
+            group = grouped_followups.get(warranty_id)
+            if not group:
+                group = {
+                    "Warranty ID": warranty_id,
                     "Warranty": warranty_label,
                     "Customer": clean_text(row.get("customer")) or "(unknown)",
                     "Reminder date": reminder_label,
-                    "Status": "Completed" if int_or_none(row.get("is_done")) else "Pending",
+                    "Status": status_label,
                     "Remark": note_text,
+                    "Remarks history": [],
+                    "has_pending": not is_done,
                 }
-            )
-        followup_df = pd.DataFrame(followup_rows).set_index("Note ID")
+                grouped_followups[warranty_id] = group
+            group["Remarks history"].append(history_entry)
+            if not is_done:
+                group["has_pending"] = True
+            if note_id is not None:
+                warranty_note_map.setdefault(warranty_id, []).append(int(note_id))
+        for group in grouped_followups.values():
+            history_entries = [entry for entry in group.get("Remarks history", []) if entry]
+            group["Remarks history"] = "\n".join(history_entries)
+            group["Status"] = "Pending" if group.get("has_pending") else "Completed"
+            group.pop("has_pending", None)
+            followup_rows.append(group)
+        followup_df = pd.DataFrame(followup_rows).set_index("Warranty ID")
         editable_df = followup_df.copy()
         edited_followups = st.data_editor(
             editable_df,
@@ -15095,16 +15115,15 @@ def warranties_page(conn):
         updates: list[tuple[int, int]] = []
         warranty_updates: list[tuple[str, int]] = []
         if isinstance(edited_followups, pd.DataFrame):
-            for note_id, row in edited_followups.iterrows():
-                original = clean_text(followup_df.at[note_id, "Status"])
+            for warranty_id, row in edited_followups.iterrows():
+                original = clean_text(followup_df.at[warranty_id, "Status"])
                 updated = clean_text(row.get("Status"))
                 if original != updated:
                     is_done_value = 1 if updated == "Completed" else 0
-                    updates.append((is_done_value, int(note_id)))
-                    warranty_id = warranty_note_map.get(int(note_id))
-                    if warranty_id is not None:
-                        status_value = "completed" if updated == "Completed" else "active"
-                        warranty_updates.append((status_value, int(warranty_id)))
+                    for note_id_value in warranty_note_map.get(int(warranty_id), []):
+                        updates.append((is_done_value, int(note_id_value)))
+                    status_value = "completed" if updated == "Completed" else "active"
+                    warranty_updates.append((status_value, int(warranty_id)))
         if updates:
             conn.executemany(
                 "UPDATE customer_notes SET is_done=? WHERE note_id=?",
@@ -23509,41 +23528,6 @@ def reports_page(conn):
                 ]
                 if helper_label:
                     st.info(helper_label, icon="📝")
-        if template_key == "service":
-            customer_scope, customer_params = customer_scope_filter()
-            customer_clause = f"WHERE {customer_scope}" if customer_scope else ""
-            customer_df = df_query(
-                conn,
-                f"""
-                SELECT name, company_name
-                FROM customers
-                {customer_clause}
-                ORDER BY LOWER(COALESCE(name, company_name, ''))
-                """,
-                customer_params,
-            )
-            customer_options: list[str] = []
-            if not customer_df.empty:
-                for _, row in customer_df.iterrows():
-                    display = clean_text(row.get("name")) or clean_text(
-                        row.get("company_name")
-                    )
-                    if display and display not in customer_options:
-                        customer_options.append(display)
-            existing_customers = {
-                clean_text(row.get("customer_name"))
-                for row in (grid_seed_rows or [])
-                if clean_text(row.get("customer_name"))
-            }
-            for name in sorted(existing_customers):
-                if name and name not in customer_options:
-                    customer_options.append(name)
-            if customer_options:
-                column_config["customer_name"] = st.column_config.SelectboxColumn(
-                    "Customer Name",
-                    options=[""] + customer_options,
-                    help="Choose an existing customer for this service report.",
-                )
         report_grid_df = st.data_editor(
             grid_df_seed,
             column_config=column_config,
