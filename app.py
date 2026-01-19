@@ -5409,7 +5409,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         "metric_bg": "#ffffff",
         "metric_border": "rgba(49, 51, 63, 0.08)",
         "table_header_bg": "#ffffff",
-        "table_row_alt_bg": "#f8fafc",
+        "table_row_alt_bg": "#ffffff",
     }
     st.markdown(
         f"""
@@ -7356,52 +7356,7 @@ def login_box(conn, *, render_id=None):
         return True
     # Hide Streamlit chrome on the login screen (auth gate UI only).
     st.set_option("client.toolbarMode", "viewer")
-    cover_image = _find_login_cover_image()
-    cover_css = ""
-    if cover_image:
-        try:
-            with open(cover_image, "rb") as handle:
-                encoded = base64.b64encode(handle.read()).decode("utf-8")
-            suffix = cover_image.suffix.lower()
-            mime_map = {
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-                ".gif": "image/gif",
-            }
-            mime_type = mime_map.get(suffix, "image/png")
-            cover_css = (
-                f"background-image: url('data:{mime_type};base64,"
-                f"{encoded}') !important;"
-            )
-        except OSError:
-            cover_css = ""
-    if not cover_css:
-        fallback_svg = (
-            "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800'>"
-            "<defs>"
-            "<linearGradient id='bg' x1='0' x2='1' y1='0' y2='1'>"
-            "<stop offset='0' stop-color='#0f172a'/>"
-            "<stop offset='1' stop-color='#1e3a8a'/>"
-            "</linearGradient>"
-            "<linearGradient id='accent' x1='0' x2='1' y1='1' y2='0'>"
-            "<stop offset='0' stop-color='#38bdf8' stop-opacity='0.15'/>"
-            "<stop offset='1' stop-color='#f8fafc' stop-opacity='0.05'/>"
-            "</linearGradient>"
-            "</defs>"
-            "<rect width='1200' height='800' fill='url(#bg)'/>"
-            "<circle cx='980' cy='120' r='260' fill='url(#accent)'/>"
-            "<circle cx='220' cy='640' r='280' fill='url(#accent)'/>"
-            "</svg>"
-        )
-        fallback_data_uri = fallback_svg.replace("#", "%23").replace(" ", "%20")
-        cover_css = (
-            "background-image: url('data:image/svg+xml;utf8,"
-            f"{fallback_data_uri}'), "
-            "radial-gradient(circle at top, rgba(15, 23, 42, 0.55), "
-            "rgba(15, 23, 42, 0.95)) !important;"
-        )
+    cover_css = "background-image: none !important;"
     app_bg = "#ffffff"
     panel_bg = "#ffffff"
     panel_text = "#111827"
@@ -7410,7 +7365,7 @@ def login_box(conn, *, render_id=None):
     placeholder_color = "rgba(75, 85, 99, 0.9)"
     button_bg = "#ffffff"
     button_text = "#111827"
-    button_hover = "#f3f4f6"
+    button_hover = "#ffffff"
     st.markdown(
         f"""
         <style>
