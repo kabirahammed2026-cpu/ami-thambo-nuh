@@ -17249,15 +17249,32 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             )
             if custom_follow_up:
                 enable_follow_date = True
-            follow_up_seed = parse_date_value(st.session_state.get("quotation_follow_up_date"))
-            follow_up_default = follow_up_seed.date() if follow_up_seed else datetime.now().date()
             if enable_follow_date:
-                follow_up_date_value = st.date_input(
-                    "Next follow-up date",
-                    value=follow_up_default,
-                    key="quotation_follow_up_date",
-                    disabled=False,
-                )
+                follow_up_raw = st.session_state.get("quotation_follow_up_date")
+                if custom_follow_up:
+                    if isinstance(follow_up_raw, (date, datetime)):
+                        follow_up_raw = follow_up_raw.strftime("%d-%m-%Y")
+                        st.session_state["quotation_follow_up_date"] = follow_up_raw
+                    follow_up_date_value = st.text_input(
+                        "Next follow-up date",
+                        value=follow_up_raw or "",
+                        key="quotation_follow_up_date",
+                        help="Enter any date format; we will standardise it later.",
+                        placeholder="e.g. 12-03-2025 or March 12, 2025",
+                    )
+                else:
+                    follow_up_seed = parse_date_value(follow_up_raw)
+                    follow_up_default = (
+                        follow_up_seed.date() if follow_up_seed else datetime.now().date()
+                    )
+                    if not isinstance(follow_up_raw, (date, datetime)):
+                        st.session_state["quotation_follow_up_date"] = follow_up_default
+                    follow_up_date_value = st.date_input(
+                        "Next follow-up date",
+                        value=follow_up_default,
+                        key="quotation_follow_up_date",
+                        disabled=False,
+                    )
             else:
                 follow_up_date_value = None
         follow_up_notes = st.text_area(
