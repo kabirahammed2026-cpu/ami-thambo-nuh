@@ -5576,6 +5576,12 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             border-color: var(--ps-button-border);
             color: var(--ps-button-text);
         }}
+        [data-baseweb="button"] button,
+        button[kind] {{
+            background-color: var(--ps-button-bg) !important;
+            border-color: var(--ps-button-border) !important;
+            color: var(--ps-button-text) !important;
+        }}
         div[data-testid="stButton"] > button:hover,
         div[data-testid="stDownloadButton"] > button:hover,
         div[data-testid="stFormSubmitButton"] > button:hover,
@@ -5583,6 +5589,12 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-button-hover);
             border-color: var(--ps-button-border);
             color: var(--ps-button-text);
+        }}
+        [data-baseweb="button"] button:hover,
+        button[kind]:hover {{
+            background-color: var(--ps-button-hover) !important;
+            border-color: var(--ps-button-border) !important;
+            color: var(--ps-button-text) !important;
         }}
         button[data-testid="baseButton-primary"] {{
             background-color: var(--ps-button-primary-bg) !important;
@@ -5733,6 +5745,18 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
         }}
+        [data-testid="stDataFrame"] [data-baseweb="table"] div,
+        [data-testid="stDataEditor"] [data-baseweb="table"] div,
+        .stDataFrame [data-baseweb="table"] div {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+        }}
+        [data-baseweb="table"] > div,
+        [data-baseweb="table"] [role="row"] > div,
+        [data-baseweb="table"] [role="columnheader"] > div {{
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+        }}
         [data-testid="stDataFrame"] table,
         [data-testid="stDataEditor"] table,
         [data-testid="stDataFrame"] [role="grid"],
@@ -5806,6 +5830,10 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         }}
         [data-baseweb="table"] {{
             background: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+        }}
+        [data-baseweb="table"] * {{
+            background-color: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
         }}
         [data-baseweb="table"] th,
@@ -13323,8 +13351,29 @@ def operations_page(conn):
             }
         )
         state_key = "operations_customer_table_state"
-        if state_key not in st.session_state:
+        if (
+            state_key not in st.session_state
+            or not isinstance(st.session_state.get(state_key), pd.DataFrame)
+        ):
             st.session_state[state_key] = table_df
+        else:
+            previous_table = st.session_state[state_key]
+            previous_ids = previous_table.get("ID") if "ID" in previous_table else None
+            current_ids = table_df.get("ID")
+            previous_list = (
+                previous_ids.tolist() if isinstance(previous_ids, pd.Series) else []
+            )
+            current_list = current_ids.tolist() if isinstance(current_ids, pd.Series) else []
+            if previous_list != current_list:
+                selected_ids = set()
+                if "Select" in previous_table and "ID" in previous_table:
+                    selected_ids = set(
+                        previous_table.loc[previous_table["Select"], "ID"].tolist()
+                    )
+                refreshed_table = table_df.copy()
+                if selected_ids:
+                    refreshed_table["Select"] = refreshed_table["ID"].isin(selected_ids)
+                st.session_state[state_key] = refreshed_table
         table_source = st.session_state.get(state_key, table_df)
         edited_table = st.data_editor(
             table_source,
@@ -17240,7 +17289,16 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             "created_by": current_user_id(),
         }
         record_id = _save_quotation_record(conn, payload)
-        if clean_text(customer_company):
+        if any(
+            clean_text(value)
+            for value in (
+                customer_contact_name,
+                customer_company,
+                customer_contact,
+                customer_address,
+                customer_district,
+            )
+        ):
             lead_status = LEAD_REMARK_TAG if status_value != "paid" else None
             _upsert_customer_from_manual_quotation(
                 conn,
