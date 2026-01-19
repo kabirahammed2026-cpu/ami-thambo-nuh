@@ -533,10 +533,12 @@ def _coerce_date(value: Any) -> Optional[date]:
     if isinstance(value, date):
         return value
     if isinstance(value, str) and value:
-        try:
-            return date.fromisoformat(value)
-        except ValueError:
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+        if pd.isna(parsed):
             return None
+        if isinstance(parsed, pd.DatetimeIndex):
+            parsed = parsed[0]
+        return parsed.date()
     return None
 
 
@@ -661,18 +663,8 @@ def prepare_letter_payload(
         data["salesperson_title"] = user.get("designation") or ""
         data["salesperson_contact"] = user.get("phone") or ""
 
-    quote_date = data.get("quote_date")
-    if isinstance(quote_date, date):
-        data["quote_date"] = quote_date.isoformat()
-    elif isinstance(quote_date, datetime):
-        data["quote_date"] = quote_date.date().isoformat()
-    elif isinstance(quote_date, str) and quote_date:
-        try:
-            data["quote_date"] = date.fromisoformat(quote_date).isoformat()
-        except ValueError:
-            data["quote_date"] = date.today().isoformat()
-    else:
-        data["quote_date"] = date.today().isoformat()
+    quote_date = _coerce_date(data.get("quote_date")) or date.today()
+    data["quote_date"] = quote_date.isoformat()
 
     amount = data.get("amount")
     if isinstance(amount, str):
@@ -694,19 +686,9 @@ def prepare_letter_payload(
         follow_up_status = "possible"
     data["follow_up_status"] = follow_up_status
 
-    follow_up_date = data.get("follow_up_date")
-    if follow_up_status == "possible" and follow_up_date:
-        if isinstance(follow_up_date, datetime):
-            data["follow_up_date"] = follow_up_date.date().isoformat()
-        elif isinstance(follow_up_date, date):
-            data["follow_up_date"] = follow_up_date.isoformat()
-        elif isinstance(follow_up_date, str):
-            try:
-                data["follow_up_date"] = date.fromisoformat(follow_up_date).isoformat()
-            except ValueError:
-                data["follow_up_date"] = None
-        else:
-            data["follow_up_date"] = None
+    if follow_up_status == "possible":
+        parsed_follow_up = _coerce_date(data.get("follow_up_date"))
+        data["follow_up_date"] = parsed_follow_up.isoformat() if parsed_follow_up else None
     else:
         data["follow_up_date"] = None
 
@@ -4267,14 +4249,29 @@ def render_quotation_letter_page(user: Dict) -> None:
             previous_choice = st.session_state.get("_letter_follow_up_last_selection")
             if quick_choice != previous_choice:
                 set_follow_up_choice(quick_choice)
-            st.date_input(
-                "Follow-up date",
-                key=letter_form_key("follow_up_date"),
-                min_value=date.today(),
-                help="Choose when to receive a reminder while the opportunity is possible.",
-            )
+            follow_up_key = letter_form_key("follow_up_date")
+            if quick_choice == CUSTOM_FOLLOW_UP_CHOICE:
+                follow_up_value = st.session_state.get(follow_up_key)
+                if isinstance(follow_up_value, (date, datetime)):
+                    st.session_state[follow_up_key] = follow_up_value.strftime("%d-%m-%Y")
+                st.text_input(
+                    "Follow-up date",
+                    key=follow_up_key,
+                    help="Enter any date format; we will standardise it later.",
+                    placeholder="e.g. 12-03-2025 or March 12, 2025",
+                )
+            else:
+                follow_up_value = _coerce_date(st.session_state.get(follow_up_key)) or date.today()
+                st.session_state[follow_up_key] = follow_up_value
+                st.date_input(
+                    "Follow-up date",
+                    key=follow_up_key,
+                    min_value=date.today(),
+                    value=follow_up_value,
+                    help="Choose when to receive a reminder while the opportunity is possible.",
+                )
             scheduled_date = _coerce_date(
-                st.session_state.get(letter_form_key("follow_up_date"))
+                st.session_state.get(follow_up_key)
             )
             if scheduled_date:
                 delta_days = (scheduled_date - date.today()).days
