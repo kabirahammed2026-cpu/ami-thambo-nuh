@@ -5319,8 +5319,10 @@ def get_theme() -> str:
     return "light"
 
 
-def apply_theme_css() -> None:
+def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
     theme = get_theme()
+    sidebar_display = "none" if sidebar_hidden else "block"
+    content_offset = "0rem" if sidebar_hidden else "var(--ps-sidebar-width)"
     colors = {
         "bg": "#ffffff",
         "sidebar_bg": "#ffffff",
@@ -5351,7 +5353,7 @@ def apply_theme_css() -> None:
             --ps-sidebar-bg: {colors['sidebar_bg']};
             --ps-sidebar-width: 18rem;
             --ps-ribbon-width: 0rem;
-            --ps-content-offset: var(--ps-sidebar-width);
+            --ps-content-offset: {content_offset};
             --ps-panel-bg: {colors['panel_bg']};
             --ps-panel-border: {colors['panel_border']};
             --ps-text: {colors['text']};
@@ -5394,6 +5396,7 @@ def apply_theme_css() -> None:
             overflow-y: auto;
             z-index: 1100;
             border-right: 1px solid var(--ps-panel-border);
+            display: {sidebar_display};
         }}
         [data-testid="stSidebar"] > div {{
             height: 100%;
@@ -6917,6 +6920,7 @@ def init_ui():
         initial_sidebar_state="expanded",
     )
     st.session_state["ocr_uploads_enabled"] = True
+    st.session_state.setdefault("sidebar_hidden", False)
     if "user" not in st.session_state:
         st.session_state.user = None
     if st.session_state.user:
@@ -6932,9 +6936,6 @@ def init_ui():
             div[data-testid="stDecoration"],
             div[data-testid="stToolbar"] {
                 display: none !important;
-            }
-            [data-testid="stSidebar"] {
-                display: block !important;
             }
             </style>
             """,
@@ -7119,7 +7120,7 @@ def _request_logout() -> None:
 
 
 def login_box(conn, *, render_id=None):
-    apply_theme_css()
+    apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
     if st.session_state.user:
         _ensure_session_token(conn, st.session_state.user)
         st.sidebar.markdown("### Login")
@@ -13169,8 +13170,12 @@ def operations_page(conn):
                 "Delivery address": customers_df["delivery_address"].fillna(""),
             }
         )
+        state_key = "operations_customer_table_state"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = table_df
+        table_source = st.session_state.get(state_key, table_df)
         edited_table = st.data_editor(
-            table_df,
+            table_source,
             hide_index=True,
             use_container_width=True,
             disabled=[col for col in table_df.columns if col != "Select"],
@@ -13183,7 +13188,30 @@ def operations_page(conn):
             },
             key="operations_customer_table",
         )
+        edited_table = (
+            edited_table
+            if isinstance(edited_table, pd.DataFrame)
+            else pd.DataFrame(edited_table)
+        )
+        prev_table = st.session_state.get(state_key, table_df)
+        prev_select = pd.Series(
+            prev_table.get("Select", [False] * len(edited_table)),
+            index=edited_table.index,
+        ).fillna(False)
         selected_rows = edited_table[edited_table["Select"]]
+        if len(selected_rows.index) > 1:
+            newly_selected = edited_table[
+                edited_table["Select"] & ~prev_select.astype(bool)
+            ]
+            if not newly_selected.empty:
+                chosen_idx = newly_selected.index[-1]
+            else:
+                chosen_idx = selected_rows.index[-1]
+            edited_table["Select"] = False
+            edited_table.loc[chosen_idx, "Select"] = True
+            st.session_state[state_key] = edited_table
+            st.rerun()
+        st.session_state[state_key] = edited_table
         if not selected_rows.empty:
             selected_customer_id = int(selected_rows.iloc[0]["ID"])
             selected_row = customers_df[
@@ -14686,6 +14714,15 @@ def warranties_page(conn):
             label_parts.append(f"exp {expiry_label}")
         warranty_labels[warranty_id] = " • ".join(label_parts)
 
+    def _parse_warranty_followup_note(note: Optional[str]) -> tuple[Optional[int], str]:
+        text = clean_text(note) or ""
+        if text.startswith("[Warranty #"):
+            closing = text.find("]")
+            if closing != -1:
+                warranty_id = int_or_none(text[len("[Warranty #") : closing])
+                return warranty_id, text[closing + 1 :].strip()
+        return None, text
+
     with st.form("warranty_follow_up_form"):
         selected_warranty = st.selectbox(
             "Select warranty",
@@ -14735,14 +14772,55 @@ def warranties_page(conn):
         if not note_value:
             st.error("Remark text is required.")
         else:
+            tagged_note = f"[Warranty #{selected_warranty}] {note_value}"
             reminder_iso = to_iso_date(reminder_date)
             conn.execute(
                 "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
-                (int(selected_record["customer_id"]), note_value, reminder_iso),
+                (int(selected_record["customer_id"]), tagged_note, reminder_iso),
             )
             conn.commit()
             st.success("Warranty reminder saved.")
             _safe_rerun()
+
+    saved_followups = df_query(
+        conn,
+        """
+        SELECT n.note_id,
+               n.customer_id,
+               n.note,
+               n.remind_on,
+               n.is_done,
+               n.created_at,
+               c.name AS customer
+        FROM customer_notes n
+        LEFT JOIN customers c ON c.customer_id = n.customer_id
+        WHERE n.note LIKE '[Warranty #%'
+        ORDER BY datetime(COALESCE(n.remind_on, n.created_at)) DESC
+        LIMIT 200
+        """,
+    )
+    st.markdown("#### Saved warranty follow-ups")
+    if saved_followups.empty:
+        st.caption("No saved warranty reminders yet.")
+    else:
+        followup_rows: list[dict[str, object]] = []
+        for row in saved_followups.to_dict("records"):
+            warranty_id, note_text = _parse_warranty_followup_note(row.get("note"))
+            warranty_label = ""
+            if warranty_id:
+                warranty_label = warranty_labels.get(warranty_id, f"Warranty #{warranty_id}")
+            reminder_label = format_period_range(row.get("remind_on"), row.get("remind_on"))
+            followup_rows.append(
+                {
+                    "Warranty": warranty_label,
+                    "Customer": clean_text(row.get("customer")) or "(unknown)",
+                    "Reminder date": reminder_label,
+                    "Status": "Completed" if int_or_none(row.get("is_done")) else "Pending",
+                    "Remark": note_text,
+                }
+            )
+        followup_df = pd.DataFrame(followup_rows)
+        st.dataframe(followup_df, use_container_width=True, hide_index=True)
 
 
 def _render_service_section(conn, *, show_heading: bool = True):
@@ -16774,8 +16852,6 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 key="quotation_follow_up_choice",
             )
             custom_follow_up = follow_up_choice == "Custom date"
-            if custom_follow_up:
-                st.session_state["quotation_follow_up_date_toggle"] = True
             enable_follow_date = st.checkbox(
                 "Set follow-up date",
                 value=bool(st.session_state.get("quotation_follow_up_date"))
@@ -16785,14 +16861,16 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             )
             if custom_follow_up:
                 enable_follow_date = True
-            follow_up_date_value = None
-            if enable_follow_date:
-                follow_up_date_value = st.date_input(
-                    "Next follow-up date",
-                    value=st.session_state.get("quotation_follow_up_date")
-                    or datetime.now().date(),
-                    key="quotation_follow_up_date",
-                )
+            follow_up_seed = parse_date_value(st.session_state.get("quotation_follow_up_date"))
+            follow_up_default = follow_up_seed.date() if follow_up_seed else datetime.now().date()
+            follow_up_date_value = st.date_input(
+                "Next follow-up date",
+                value=follow_up_default,
+                key="quotation_follow_up_date",
+                disabled=not enable_follow_date,
+            )
+            if not enable_follow_date:
+                follow_up_date_value = None
         follow_up_notes = st.text_area(
             "Follow-up remarks for admins",
             value=st.session_state.get("quotation_follow_up_notes", ""),
@@ -21793,6 +21871,14 @@ def _import_clean6(conn, df, tag="Import"):
     for p in phones_to_recalc:
         recalc_customer_duplicate_flag(conn, p)
     conn.commit()
+    if seeded:
+        log_activity(
+            conn,
+            event_type="customer_imported",
+            description=f"Imported {seeded} customer row(s) via {tag}.",
+            entity_type="import",
+            user_id=created_by,
+        )
     return seeded, d_c, d_p
 
 
@@ -23620,7 +23706,7 @@ def main():
     st.session_state["_render_id"] = st.session_state.get("_render_id", 0) + 1
     render_id = st.session_state["_render_id"]
     init_ui()
-    apply_theme_css()
+    apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
     _ensure_quotation_editor_server()
     conn = get_conn()
     init_schema(conn)
@@ -23719,8 +23805,11 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
 
     with st.sidebar:
-        apply_theme_css()
+        apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
         st.markdown("### Navigation")
+        if st.button("Hide menu", key="sidebar_hide_menu", use_container_width=True):
+            st.session_state["sidebar_hidden"] = True
+            st.rerun()
         st.radio(
             "Navigate",
             pages,
@@ -23733,6 +23822,12 @@ def main():
             st.rerun()
 
     _render_mobile_nav()
+
+    sidebar_hidden = bool(st.session_state.get("sidebar_hidden"))
+    toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
+    if st.button(toggle_label, key="sidebar_toggle_main"):
+        st.session_state["sidebar_hidden"] = not sidebar_hidden
+        st.rerun()
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
