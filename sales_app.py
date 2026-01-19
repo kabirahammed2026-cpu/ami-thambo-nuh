@@ -2467,6 +2467,15 @@ def apply_theme_styles() -> None:
         [data-baseweb="table"] tr:nth-child(even) {{
             background-color: #ffffff !important;
         }}
+        .ps-quick-nav {{
+            position: sticky;
+            top: 0.5rem;
+            z-index: 1000;
+            display: flex;
+            justify-content: flex-end;
+            padding: 0.25rem 0;
+            background-color: #ffffff;
+        }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
                 display: none !important;
@@ -2560,6 +2569,7 @@ def ribbon_navigation(user: Dict, pages: dict[str, str]) -> None:
 
 
 def quick_nav_menu(user: Dict, pages: dict[str, str]) -> None:
+    st.markdown('<div class="ps-quick-nav">', unsafe_allow_html=True)
     if hasattr(st, "popover"):
         with st.popover("☰ Menu"):
             st.markdown("### Navigation")
@@ -2568,6 +2578,7 @@ def quick_nav_menu(user: Dict, pages: dict[str, str]) -> None:
         with st.expander("☰ Menu", expanded=False):
             st.markdown("### Navigation")
             ribbon_navigation(user, pages)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def show_pdf_link(relative_path: Optional[str], label: str) -> None:

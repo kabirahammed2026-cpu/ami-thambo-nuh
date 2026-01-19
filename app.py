@@ -7624,6 +7624,258 @@ def dashboard(conn):
     if "show_today_expired" not in st.session_state:
         st.session_state.show_today_expired = False
 
+    report_scope = ""
+    report_params: tuple[object, ...] = ()
+    viewer_id = current_user_id()
+    if not is_admin:
+        if viewer_id is not None:
+            report_scope = "WHERE wr.user_id = ?"
+            report_params = (viewer_id,)
+        else:
+            report_scope = "WHERE 1=0"
+
+    report_metrics = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT COUNT(*) AS total_reports,
+                   SUM(CASE WHEN LOWER(wr.period_type) = 'weekly' THEN 1 ELSE 0 END) AS weekly_reports,
+                   SUM(CASE WHEN LOWER(wr.period_type) = 'monthly' THEN 1 ELSE 0 END) AS monthly_reports
+            FROM work_reports wr
+            {report_scope}
+            """
+        ),
+        report_params,
+    )
+    recent_reports = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT wr.report_id,
+                   wr.period_type,
+                   wr.period_start,
+                   wr.period_end,
+                   wr.created_at,
+                   wr.report_template,
+                   COALESCE(u.username, 'User #' || wr.user_id) AS owner
+            FROM work_reports wr
+            LEFT JOIN users u ON u.user_id = wr.user_id
+            {report_scope}
+            ORDER BY datetime(wr.created_at) DESC, wr.report_id DESC
+            LIMIT 6
+            """
+        ),
+        report_params,
+    )
+
+    if not report_metrics.empty:
+        total_reports = int(report_metrics.iloc[0].get("total_reports") or 0)
+        weekly_reports = int(report_metrics.iloc[0].get("weekly_reports") or 0)
+        monthly_reports = int(report_metrics.iloc[0].get("monthly_reports") or 0)
+    else:
+        total_reports = 0
+        weekly_reports = 0
+        monthly_reports = 0
+
+    st.markdown("#### Report submissions")
+    report_metric_cols = st.columns(3)
+    report_metric_cols[0].metric("Total reports", total_reports)
+    report_metric_cols[1].metric("Weekly cadence reports", weekly_reports)
+    report_metric_cols[2].metric("Monthly cadence reports", monthly_reports)
+
+    if not recent_reports.empty:
+        st.markdown("#### Recent report submissions")
+        recent_reports["Template"] = recent_reports["report_template"].apply(
+            lambda value: REPORT_TEMPLATE_LABELS.get(
+                _normalize_report_template(value), "Service report"
+            )
+        )
+        recent_reports["Submitted"] = recent_reports["created_at"].apply(
+            lambda value: format_period_range(value, value)
+        )
+        recent_reports["Cadence"] = recent_reports["period_type"].apply(
+            lambda val: REPORT_PERIOD_OPTIONS.get(clean_text(val) or "", str(val).title())
+        )
+        recent_reports["When"] = recent_reports["created_at"].apply(
+            lambda value: format_time_ago(value) or format_period_range(value, value)
+        )
+        display_cols = ["Team member", "Template", "Cadence", "Submitted", "When"]
+        recent_display = recent_reports.rename(columns={"owner": "Team member"})
+        st.dataframe(
+            recent_display[display_cols],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    uploads_scope = report_scope.replace("WHERE", "AND", 1) if report_scope else ""
+    uploads_params = tuple(report_params)
+    uploads_df = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT wr.report_id,
+                   wr.attachment_path,
+                   wr.import_file_path,
+                   wr.period_start,
+                   wr.period_end,
+                   wr.report_template,
+                   COALESCE(u.username, 'User #' || wr.user_id) AS owner,
+                   wr.created_at
+            FROM work_reports wr
+            LEFT JOIN users u ON u.user_id = wr.user_id
+            WHERE wr.attachment_path IS NOT NULL AND wr.attachment_path != ''
+            {uploads_scope}
+            ORDER BY datetime(wr.created_at) DESC
+            LIMIT 5
+            """
+        ),
+        uploads_params,
+    )
+
+    if not uploads_df.empty:
+        st.markdown("#### Latest report uploads")
+        uploads_df["Template"] = uploads_df["report_template"].apply(
+            lambda value: REPORT_TEMPLATE_LABELS.get(
+                _normalize_report_template(value), "Service report"
+            )
+        )
+        uploads_df["Period"] = uploads_df.apply(
+            lambda row: format_period_range(row.get("period_start"), row.get("period_end")),
+            axis=1,
+        )
+        uploads_df["When"] = uploads_df["created_at"].apply(
+            lambda value: format_time_ago(value) or format_period_range(value, value)
+        )
+        for _, row in uploads_df.iterrows():
+            file_entries = []
+            attachment_value = clean_text(row.get("attachment_path"))
+            if attachment_value:
+                file_entries.append(("Attachment", attachment_value))
+            import_value = clean_text(row.get("import_file_path"))
+            if import_value:
+                file_entries.append(("Import", import_value))
+            if not file_entries:
+                continue
+            label_prefix = (
+                f"{row.get('owner')} • {row.get('Template')} • {row.get('Period')}"
+            )
+            for idx, (kind, file_value) in enumerate(file_entries, start=1):
+                path = resolve_upload_path(file_value)
+                if not path or not path.exists():
+                    continue
+                try:
+                    payload = path.read_bytes()
+                except OSError:
+                    continue
+                label = f"{label_prefix} • {kind}"
+                st.download_button(
+                    label,
+                    data=payload,
+                    file_name=path.name,
+                    key=f"recent_attachment_{row.get('report_id')}_{idx}",
+                )
+
+    quote_scope, quote_params = _quotation_scope_filter()
+    quote_clause = quote_scope.replace("WHERE", "WHERE", 1)
+    quote_metrics = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT COUNT(*) AS total_quotes,
+                   SUM(
+                       CASE
+                           WHEN date(COALESCE(quote_date, created_at)) >= date('now', '-6 days')
+                           THEN 1
+                           ELSE 0
+                       END
+                   ) AS weekly_quotes,
+                   SUM(
+                       CASE
+                           WHEN strftime('%Y-%m', COALESCE(quote_date, created_at)) = strftime('%Y-%m', 'now')
+                           THEN 1
+                           ELSE 0
+                       END
+                   ) AS monthly_quotes,
+                   SUM(CASE WHEN LOWER(status) = 'paid' THEN 1 ELSE 0 END) AS paid_quotes
+            FROM quotations
+            {quote_clause}
+            """
+        ),
+        quote_params,
+    )
+    quotes_df = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT quotation_id,
+                   reference,
+                   quote_date,
+                   total_amount,
+                   status,
+                   COALESCE(
+                       NULLIF(TRIM(customer_company), ''),
+                       NULLIF(TRIM(customer_name), ''),
+                       '—'
+                   ) AS customer,
+                   COALESCE(
+                       NULLIF(TRIM(subject), ''),
+                       NULLIF(TRIM(remarks_internal), '')
+                   ) AS product_details
+            FROM quotations
+            {quote_clause}
+            ORDER BY datetime(quote_date) DESC, quotation_id DESC
+            LIMIT 20
+            """
+        ),
+        quote_params,
+    )
+    st.markdown("#### Quotation insights")
+    if quote_metrics.empty:
+        total_quotes = 0
+        weekly_quotes = 0
+        monthly_quotes = 0
+        paid_quotes = 0
+    else:
+        total_quotes = int(quote_metrics.iloc[0].get("total_quotes") or 0)
+        weekly_quotes = int(quote_metrics.iloc[0].get("weekly_quotes") or 0)
+        monthly_quotes = int(quote_metrics.iloc[0].get("monthly_quotes") or 0)
+        paid_quotes = int(quote_metrics.iloc[0].get("paid_quotes") or 0)
+    conversion = (paid_quotes / total_quotes) * 100 if total_quotes else 0.0
+    metrics_cols = st.columns(5)
+    metrics_cols[0].metric("Quotations created", total_quotes)
+    metrics_cols[1].metric("Weekly quotations", weekly_quotes)
+    metrics_cols[2].metric("Monthly quotations", monthly_quotes)
+    metrics_cols[3].metric("Paid / converted", paid_quotes)
+    metrics_cols[4].metric("Conversion rate", f"{conversion:.1f}%")
+
+    if quotes_df.empty:
+        st.info("No quotations available for the selected scope yet.")
+    else:
+        quotes_df = fmt_dates(quotes_df, ["quote_date"])
+        quotes_df["customer"] = quotes_df["customer"].apply(
+            lambda value: clean_text(value) or "—"
+        )
+        quotes_df["product_details"] = quotes_df["product_details"].apply(
+            lambda value: clean_text(value) or "—"
+        )
+        quotes_df["total_amount"] = quotes_df["total_amount"].apply(
+            lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+        )
+        st.dataframe(
+            quotes_df.rename(
+                columns={
+                    "reference": "Reference",
+                    "quote_date": "Date",
+                    "total_amount": "Total (BDT)",
+                    "status": "Status",
+                    "customer": "Customer",
+                    "product_details": "Product details",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
     if not is_admin:
         _render_dashboard_announcement(allow_edit=False)
 
@@ -8204,157 +8456,6 @@ def dashboard(conn):
                 hide_index=True,
             )
 
-    report_scope = ""
-    report_params: tuple[object, ...] = ()
-    viewer_id = current_user_id()
-    if not is_admin:
-        if viewer_id is not None:
-            report_scope = "WHERE wr.user_id = ?"
-            report_params = (viewer_id,)
-        else:
-            report_scope = "WHERE 1=0"
-
-    report_metrics = df_query(
-        conn,
-        dedent(
-            f"""
-            SELECT COUNT(*) AS total_reports,
-                   SUM(CASE WHEN LOWER(wr.period_type) = 'weekly' THEN 1 ELSE 0 END) AS weekly_reports,
-                   SUM(CASE WHEN LOWER(wr.period_type) = 'monthly' THEN 1 ELSE 0 END) AS monthly_reports
-            FROM work_reports wr
-            {report_scope}
-            """
-        ),
-        report_params,
-    )
-    recent_reports = df_query(
-        conn,
-        dedent(
-            f"""
-            SELECT wr.report_id,
-                   wr.period_type,
-                   wr.period_start,
-                   wr.period_end,
-                   wr.created_at,
-                   wr.report_template,
-                   COALESCE(u.username, 'User #' || wr.user_id) AS owner
-            FROM work_reports wr
-            LEFT JOIN users u ON u.user_id = wr.user_id
-            {report_scope}
-            ORDER BY datetime(wr.created_at) DESC, wr.report_id DESC
-            LIMIT 6
-            """
-        ),
-        report_params,
-    )
-
-    if not report_metrics.empty:
-        total_reports = int(report_metrics.iloc[0].get("total_reports") or 0)
-        weekly_reports = int(report_metrics.iloc[0].get("weekly_reports") or 0)
-        monthly_reports = int(report_metrics.iloc[0].get("monthly_reports") or 0)
-    else:
-        total_reports = 0
-        weekly_reports = 0
-        monthly_reports = 0
-
-    st.markdown("#### Report submissions")
-    report_metric_cols = st.columns(3)
-    report_metric_cols[0].metric("Total reports", total_reports)
-    report_metric_cols[1].metric("Weekly cadence reports", weekly_reports)
-    report_metric_cols[2].metric("Monthly cadence reports", monthly_reports)
-
-    if not recent_reports.empty:
-        st.markdown("#### Recent report submissions")
-        recent_reports["Template"] = recent_reports["report_template"].apply(
-            lambda value: REPORT_TEMPLATE_LABELS.get(
-                _normalize_report_template(value), "Service report"
-            )
-        )
-        recent_reports["Submitted"] = recent_reports["created_at"].apply(
-            lambda value: format_period_range(value, value)
-        )
-        recent_reports["Cadence"] = recent_reports["period_type"].apply(
-            lambda val: REPORT_PERIOD_OPTIONS.get(clean_text(val) or "", str(val).title())
-        )
-        recent_reports["When"] = recent_reports["created_at"].apply(
-            lambda value: format_time_ago(value) or format_period_range(value, value)
-        )
-        display_cols = ["Team member", "Template", "Cadence", "Submitted", "When"]
-        recent_display = recent_reports.rename(columns={"owner": "Team member"})
-        st.dataframe(
-            recent_display[display_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    uploads_scope = report_scope.replace("WHERE", "AND", 1) if report_scope else ""
-    uploads_params = tuple(report_params)
-    uploads_df = df_query(
-        conn,
-        dedent(
-            f"""
-            SELECT wr.report_id,
-                   wr.attachment_path,
-                   wr.import_file_path,
-                   wr.period_start,
-                   wr.period_end,
-                   wr.report_template,
-                   COALESCE(u.username, 'User #' || wr.user_id) AS owner,
-                   wr.created_at
-            FROM work_reports wr
-            LEFT JOIN users u ON u.user_id = wr.user_id
-            WHERE wr.attachment_path IS NOT NULL AND wr.attachment_path != ''
-            {uploads_scope}
-            ORDER BY datetime(wr.created_at) DESC
-            LIMIT 5
-            """
-        ),
-        uploads_params,
-    )
-
-    if not uploads_df.empty:
-        st.markdown("#### Latest report uploads")
-        uploads_df["Template"] = uploads_df["report_template"].apply(
-            lambda value: REPORT_TEMPLATE_LABELS.get(
-                _normalize_report_template(value), "Service report"
-            )
-        )
-        uploads_df["Period"] = uploads_df.apply(
-            lambda row: format_period_range(row.get("period_start"), row.get("period_end")),
-            axis=1,
-        )
-        uploads_df["When"] = uploads_df["created_at"].apply(
-            lambda value: format_time_ago(value) or format_period_range(value, value)
-        )
-        for _, row in uploads_df.iterrows():
-            file_entries = []
-            attachment_value = clean_text(row.get("attachment_path"))
-            if attachment_value:
-                file_entries.append(("Attachment", attachment_value))
-            import_value = clean_text(row.get("import_file_path"))
-            if import_value:
-                file_entries.append(("Import", import_value))
-            if not file_entries:
-                continue
-            label_prefix = (
-                f"{row.get('owner')} • {row.get('Template')} • {row.get('Period')}"
-            )
-            for idx, (kind, file_value) in enumerate(file_entries, start=1):
-                path = resolve_upload_path(file_value)
-                if not path or not path.exists():
-                    continue
-                try:
-                    payload = path.read_bytes()
-                except OSError:
-                    continue
-                label = f"{label_prefix} • {kind}"
-                st.download_button(
-                    label,
-                    data=payload,
-                    file_name=path.name,
-                    key=f"recent_attachment_{row.get('report_id')}_{idx}",
-                )
-
     if is_admin:
         recent_template_reports = df_query(
             conn,
@@ -8716,107 +8817,6 @@ def dashboard(conn):
                 st.markdown("</div>", unsafe_allow_html=True)
         else:
             st.info("No quotations found for the current filters.")
-
-    quote_scope, quote_params = _quotation_scope_filter()
-    quote_clause = quote_scope.replace("WHERE", "WHERE", 1)
-    quote_metrics = df_query(
-        conn,
-        dedent(
-            f"""
-            SELECT COUNT(*) AS total_quotes,
-                   SUM(
-                       CASE
-                           WHEN date(COALESCE(quote_date, created_at)) >= date('now', '-6 days')
-                           THEN 1
-                           ELSE 0
-                       END
-                   ) AS weekly_quotes,
-                   SUM(
-                       CASE
-                           WHEN strftime('%Y-%m', COALESCE(quote_date, created_at)) = strftime('%Y-%m', 'now')
-                           THEN 1
-                           ELSE 0
-                       END
-                   ) AS monthly_quotes,
-                   SUM(CASE WHEN LOWER(status) = 'paid' THEN 1 ELSE 0 END) AS paid_quotes
-            FROM quotations
-            {quote_clause}
-            """
-        ),
-        quote_params,
-    )
-    quotes_df = df_query(
-        conn,
-        dedent(
-            f"""
-            SELECT quotation_id,
-                   reference,
-                   quote_date,
-                   total_amount,
-                   status,
-                   COALESCE(
-                       NULLIF(TRIM(customer_company), ''),
-                       NULLIF(TRIM(customer_name), ''),
-                       '—'
-                   ) AS customer,
-                   COALESCE(
-                       NULLIF(TRIM(subject), ''),
-                       NULLIF(TRIM(remarks_internal), '')
-                   ) AS product_details
-            FROM quotations
-            {quote_clause}
-            ORDER BY datetime(quote_date) DESC, quotation_id DESC
-            LIMIT 20
-            """
-        ),
-        quote_params,
-    )
-    st.markdown("#### Quotation insights")
-    if quote_metrics.empty:
-        total_quotes = 0
-        weekly_quotes = 0
-        monthly_quotes = 0
-        paid_quotes = 0
-    else:
-        total_quotes = int(quote_metrics.iloc[0].get("total_quotes") or 0)
-        weekly_quotes = int(quote_metrics.iloc[0].get("weekly_quotes") or 0)
-        monthly_quotes = int(quote_metrics.iloc[0].get("monthly_quotes") or 0)
-        paid_quotes = int(quote_metrics.iloc[0].get("paid_quotes") or 0)
-    conversion = (paid_quotes / total_quotes) * 100 if total_quotes else 0.0
-    metrics_cols = st.columns(5)
-    metrics_cols[0].metric("Quotations created", total_quotes)
-    metrics_cols[1].metric("Weekly quotations", weekly_quotes)
-    metrics_cols[2].metric("Monthly quotations", monthly_quotes)
-    metrics_cols[3].metric("Paid / converted", paid_quotes)
-    metrics_cols[4].metric("Conversion rate", f"{conversion:.1f}%")
-
-    if quotes_df.empty:
-        st.info("No quotations available for the selected scope yet.")
-    else:
-        quotes_df = fmt_dates(quotes_df, ["quote_date"])
-        quotes_df["customer"] = quotes_df["customer"].apply(
-            lambda value: clean_text(value) or "—"
-        )
-        quotes_df["product_details"] = quotes_df["product_details"].apply(
-            lambda value: clean_text(value) or "—"
-        )
-        quotes_df["total_amount"] = quotes_df["total_amount"].apply(
-            lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
-        )
-        st.dataframe(
-            quotes_df.rename(
-                columns={
-                    "reference": "Reference",
-                    "quote_date": "Date",
-                    "total_amount": "Total (BDT)",
-                    "status": "Status",
-                    "customer": "Customer",
-                    "product_details": "Product details",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
 
     staff_scope_clause = ""
     staff_scope_params: tuple[object, ...] = ()
@@ -21396,6 +21396,7 @@ def users_admin_page(conn):
         """
         SELECT user_id as id, username, phone, email, title, role, created_at
         FROM users
+        WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
         ORDER BY datetime(created_at) DESC
         """,
     )
