@@ -1962,7 +1962,7 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
 
 
 def format_sales_amount(value: float) -> str:
-    return format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+    return format_money(value) or format_number(_coerce_float(value, 0.0))
 
 
 def upcoming_warranty_projection(conn, months_ahead: int = 6) -> pd.DataFrame:
@@ -2332,7 +2332,7 @@ def _apply_ocr_autofill(
                         }
                     )
                 st.session_state[items_key] = mapped_items
-    elif doc_type in ("Delivery order", "Work done", "Service", "Maintenance"):
+    elif doc_type in ("Delivery order", "Work done", "Service", "Maintenance", "Other"):
         lines = [line.strip() for line in text_content.splitlines() if line.strip()]
         detected_items = _parse_line_items_from_text(lines)
         if doc_type in ("Delivery order", "Work done"):
@@ -2391,6 +2391,25 @@ def _apply_ocr_autofill(
             parsed_date = _parse_date_from_text(text_content)
             if parsed_date and not st.session_state.get(date_key):
                 st.session_state[date_key] = parsed_date
+        if doc_type == "Other":
+            items_key = f"{details_key_prefix}_other_items"
+            existing_items = st.session_state.get(items_key, [])
+            if detected_items and _items_blank(
+                existing_items, fields=("description", "quantity", "unit_price")
+            ):
+                mapped_items = []
+                for item in detected_items:
+                    mapped_items.append(
+                        {
+                            "description": item.get("description") or "",
+                            "quantity": _coerce_float(item.get("quantity"), 1.0),
+                            "unit_price": _coerce_float(item.get("rate"), 0.0),
+                        }
+                    )
+                st.session_state[items_key] = mapped_items
+            description_key = f"{details_key_prefix}_other_description"
+            if not clean_text(st.session_state.get(description_key)) and lines:
+                st.session_state[description_key] = " ".join(lines[:2])
 
 
 def _parse_date_from_text(value: str) -> Optional[date]:
@@ -3078,7 +3097,7 @@ def to_iso_date(value) -> Optional[str]:
     return pd.Timestamp(parsed).normalize().strftime("%Y-%m-%d")
 
 
-def format_money(value) -> Optional[str]:
+def format_number(value) -> Optional[str]:
     if value is None:
         return None
     try:
@@ -3090,10 +3109,20 @@ def format_money(value) -> Optional[str]:
         amount = float(value)
     except (TypeError, ValueError):
         return None
+    formatted = f"{amount:,.2f}"
+    if formatted.endswith(".00"):
+        return formatted[:-3]
+    return formatted
+
+
+def format_money(value) -> Optional[str]:
+    formatted = format_number(value)
+    if formatted is None:
+        return None
     symbol = CURRENCY_SYMBOL.strip()
     if symbol:
-        return f"{symbol} {amount:,.2f}"
-    return f"{amount:,.2f}"
+        return f"{symbol} {formatted}"
+    return formatted
 
 
 def format_amount_in_words(value: object) -> Optional[str]:
@@ -3386,7 +3415,7 @@ def _generate_editor_pdf(
         "discount_total": 0.0,
         "gross_total": grand_total,
     }
-    grand_total_label = format_money(grand_total) or f"{grand_total:,.2f}"
+    grand_total_label = format_money(grand_total) or format_number(grand_total)
     grand_total_words = format_amount_in_words(grand_total)
     template_choice = clean_text(record.get("letter_template")) or "PS letterhead"
 
@@ -3644,9 +3673,9 @@ def normalize_product_entries(
         if qty_val > 1:
             label = f"{label} ×{qty_val}" if label else f"×{qty_val}"
         if unit_price:
-            price_block = f"Tk {unit_price:,.2f}"
+            price_block = f"Tk {format_number(unit_price)}"
             if line_total:
-                price_block = f"{price_block} (Total Tk {line_total:,.2f})"
+                price_block = f"{price_block} (Total Tk {format_number(line_total)})"
             label = f"{label} @ {price_block}" if label else price_block
         if serial_clean:
             label = f"{label} (Serial: {serial_clean})" if label else f"Serial: {serial_clean}"
@@ -4078,7 +4107,7 @@ def format_simple_item_labels(items: Iterable[dict[str, object]]) -> list[str]:
             qty_label = int(quantity) if math.isclose(quantity, round(quantity)) else quantity
             label = f"{label} ×{qty_label}"
         if unit_price:
-            label = f"{label} @ Tk {unit_price:,.2f}"
+            label = f"{label} @ Tk {format_number(unit_price)}"
         labels.append(label)
     return labels
 
@@ -5375,6 +5404,9 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             --ps-table-row-alt-bg: {colors['table_row_alt_bg']};
             color-scheme: {theme};
         }}
+        html {{
+            color-scheme: light !important;
+        }}
         body,
         .stApp,
         section.main {{
@@ -5435,10 +5467,13 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             top: 1.25rem;
             left: 1rem;
             z-index: 2300;
-            padding: 0.2rem 0.55rem;
+            padding: 0.1rem 0.35rem;
             border-radius: 999px;
-            font-size: 0.8rem;
+            font-size: 0.7rem;
             min-height: unset;
+            min-width: unset;
+            width: 1.6rem;
+            height: 1.6rem;
         }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
@@ -5667,6 +5702,12 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             color: var(--ps-text) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
+            color-scheme: light !important;
+        }}
+        [data-testid="stTable"],
+        .stDataFrame,
+        .stTable {{
+            color-scheme: light !important;
         }}
         [data-testid="stDataFrame"] > div,
         [data-testid="stDataFrame"] [data-testid="stDataFrameResizable"],
@@ -5922,7 +5963,14 @@ def _find_login_cover_image() -> Optional[Path]:
         "login",
     ]
     extensions = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
-    search_roots = [PROJECT_ROOT, BASE_DIR, PROJECT_ROOT / "assets", BASE_DIR / "assets"]
+    search_roots = [
+        PROJECT_ROOT,
+        BASE_DIR,
+        PROJECT_ROOT / "assets",
+        BASE_DIR / "assets",
+        UPLOADS_DIR,
+        UPLOADS_DIR / "assets",
+    ]
     for root in search_roots:
         for base in candidates:
             for ext in extensions:
@@ -7203,7 +7251,7 @@ def login_box(conn, *, render_id=None):
             mime_type = mime_map.get(suffix, "image/png")
             cover_css = (
                 f"background-image: url('data:{mime_type};base64,"
-                f"{encoded}');"
+                f"{encoded}') !important;"
             )
         except OSError:
             cover_css = ""
@@ -7230,7 +7278,7 @@ def login_box(conn, *, render_id=None):
             "background-image: url('data:image/svg+xml;utf8,"
             f"{fallback_data_uri}'), "
             "radial-gradient(circle at top, rgba(15, 23, 42, 0.55), "
-            "rgba(15, 23, 42, 0.95));"
+            "rgba(15, 23, 42, 0.95)) !important;"
         )
     app_bg = "#ffffff"
     panel_bg = "#ffffff"
@@ -7264,7 +7312,7 @@ def login_box(conn, *, render_id=None):
             background-size: cover;
             background-position: center;
             background-repeat: no-repeat;
-            background-color: {app_bg};
+            background-color: {app_bg} !important;
             min-height: 100vh;
         }}
         section.main,
@@ -7918,7 +7966,7 @@ def dashboard(conn):
             lambda value: clean_text(value) or "—"
         )
         quotes_df["total_amount"] = quotes_df["total_amount"].apply(
-            lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+            lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
         )
         st.dataframe(
             quotes_df.rename(
@@ -8670,7 +8718,9 @@ def dashboard(conn):
                 left.markdown("\n".join(customer_lines))
 
                 status_label = clean_text(quote_match.get("status")) or "Pending"
-                amount_label = format_money(quote_match.get("total_amount")) or f"{_coerce_float(quote_match.get('total_amount'), 0.0):,.2f}"
+                amount_label = format_money(quote_match.get("total_amount")) or format_number(
+                    _coerce_float(quote_match.get("total_amount"), 0.0)
+                )
                 right.metric(
                     "Total (BDT)",
                     amount_label,
@@ -8783,7 +8833,9 @@ def dashboard(conn):
                         or clean_text(row.get("username"))
                         or "—"
                     )
-                    total_value = format_money(row.get("total_amount")) or f"{_coerce_float(row.get('total_amount'), 0.0):,.2f}"
+                    total_value = format_money(row.get("total_amount")) or format_number(
+                        _coerce_float(row.get("total_amount"), 0.0)
+                    )
                     cols[2].write(
                         f"{clean_text(row.get('status')).title() if row.get('status') else 'Pending'}\n"
                         f"{row.get('quote_date')}\n{total_value}"
@@ -9562,7 +9614,7 @@ def dashboard(conn):
                 "total_amount"
             ].apply(
                 lambda value: format_money(value)
-                or (f"{_coerce_float(value, 0.0):,.2f}" if pd.notna(value) else "—")
+                or (format_number(_coerce_float(value, 0.0)) if pd.notna(value) else "—")
             )
             st.dataframe(
                 recent_delivery_orders.rename(
@@ -9625,7 +9677,7 @@ def dashboard(conn):
             recent_work_orders = fmt_dates(recent_work_orders, ["created_at"])
             recent_work_orders["total_amount"] = recent_work_orders["total_amount"].apply(
                 lambda value: format_money(value)
-                or (f"{_coerce_float(value, 0.0):,.2f}" if pd.notna(value) else "—")
+                or (format_number(_coerce_float(value, 0.0)) if pd.notna(value) else "—")
             )
             st.dataframe(
                 recent_work_orders.rename(
@@ -10637,6 +10689,12 @@ def render_customer_quick_edit_section(
                         type=None,
                         accept_multiple_files=False,
                         key=upload_key,
+                    )
+                    _apply_ocr_autofill(
+                        upload=upload_file,
+                        ocr_key_prefix=upload_key,
+                        doc_type=doc_type,
+                        details_key_prefix=f"{upload_key}_details",
                     )
                     details = _render_doc_detail_inputs(
                         doc_type,
@@ -12235,6 +12293,12 @@ def render_operations_document_uploader(
                 key=f"{key_prefix}_other_file",
                 help="Upload any other supporting document.",
             )
+            _apply_ocr_autofill(
+                upload=other_file,
+                ocr_key_prefix=f"{key_prefix}_other_file",
+                doc_type="Other",
+                details_key_prefix=f"{key_prefix}_other_details",
+            )
             other_details = _render_doc_detail_inputs(
                 "Other",
                 key_prefix=f"{key_prefix}_other_details",
@@ -13404,7 +13468,7 @@ def customers_page(conn):
                 key="new_customer_company",
                 help="Optional organisation or business associated with this customer.",
             )
-            phone = st.text_input("Phone", key="new_customer_phone")
+            phone = st.text_input("Phone *", key="new_customer_phone")
             address = st.text_area(
                 "Billing address",
                 key="new_customer_address",
@@ -13715,6 +13779,8 @@ def customers_page(conn):
                 errors: list[str] = []
                 if not name.strip():
                     errors.append("Customer name is required before saving.")
+                if not clean_text(phone):
+                    errors.append("Phone number is required and must be unique.")
                 do_serial = clean_text(do_code)
                 work_done_serial = clean_text(work_done_number)
                 if create_work_done and not work_done_serial:
@@ -14101,7 +14167,7 @@ def customers_page(conn):
                                 formatted_work_done = format_money(work_done_total)
                                 if not formatted_work_done and work_done_total is not None:
                                     try:
-                                        formatted_work_done = f"{float(work_done_total):,.2f}"
+                                        formatted_work_done = format_number(float(work_done_total))
                                     except (TypeError, ValueError):
                                         formatted_work_done = ""
                                 log_activity(
@@ -15814,7 +15880,7 @@ def _regenerate_quotation_pdf_from_workbook(file_path: Path) -> Optional[bytes]:
         ),
     }
 
-    grand_total_label = format_money(totals["grand_total"]) or f"{totals['grand_total']:,.2f}"
+    grand_total_label = format_money(totals["grand_total"]) or format_number(totals["grand_total"])
     grand_total_words = format_amount_in_words(totals["grand_total"]) or grand_total_label
 
     try:
@@ -16040,9 +16106,13 @@ def _build_quotation_pdf(
                 str(idx),
                 Paragraph(description, styles["BodySmall"]),
                 Paragraph(f"{qty_value:,.0f}", styles["BodySmall"]),
-                Paragraph(format_money(rate_value) or f"{_coerce_float(rate_value, 0.0):,.2f}", styles["BodySmall"]),
                 Paragraph(
-                    format_money(line_total_value) or f"{_coerce_float(line_total_value, 0.0):,.2f}",
+                    format_money(rate_value) or format_number(_coerce_float(rate_value, 0.0)),
+                    styles["BodySmall"],
+                ),
+                Paragraph(
+                    format_money(line_total_value)
+                    or format_number(_coerce_float(line_total_value, 0.0)),
                     styles["BodySmall"],
                 ),
             ]
@@ -16089,7 +16159,7 @@ def _build_quotation_pdf(
         grand_total_words = amount_in_words or grand_total_label
 
     if discount_value:
-        discount_label = format_money(discount_value) or f"{discount_value:,.2f}"
+        discount_label = format_money(discount_value) or format_number(discount_value)
         story.append(
             Paragraph(
                 f"Discount applied: {discount_label} (reflected in totals)",
@@ -16171,7 +16241,7 @@ def _render_letterhead_preview(
         return
 
     def _format_currency(value: object) -> str:
-        return format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+        return format_money(value) or format_number(_coerce_float(value, 0.0))
 
     items = items or []
     totals = totals or {}
@@ -16240,7 +16310,7 @@ def _render_letterhead_preview(
     line_items = items[:8]
     discount_value = _coerce_float(totals.get("discount_total") if totals else None, 0.0)
     discount_label = (
-        format_money(discount_value) or f"{discount_value:,.2f}"
+        format_money(discount_value) or format_number(discount_value)
         if discount_value
         else ""
     )
@@ -17072,13 +17142,14 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             amount = _coerce_float(value, 0.0)
             if math.isclose(amount, round(amount)):
                 return f"{int(round(amount))}"
-            return f"{amount:,.2f}"
+            return format_number(amount) or ""
 
         money_columns = ["Unit Price, Tk.", "Total Price, Tk."]
         for col in money_columns:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
-                    lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+                    lambda value: format_money(value)
+                    or format_number(_coerce_float(value, 0.0))
                 )
         for qty_col in ["Qty.", "Quantity"]:
             if qty_col in display_df.columns:
@@ -17172,11 +17243,12 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
         if totals_rows:
             totals_df = pd.DataFrame(totals_rows, columns=["Label", "Amount"])
             totals_df["Amount"] = totals_df["Amount"].apply(
-                lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+                lambda value: format_money(value)
+                or format_number(_coerce_float(value, 0.0))
             )
             st.table(totals_df)
 
-        grand_total_label = format_money(result["grand_total"]) or f"{result['grand_total']:,.2f}"
+        grand_total_label = format_money(result["grand_total"]) or format_number(result["grand_total"])
         st.markdown(f"**Grand total:** {grand_total_label}")
 
 
@@ -17316,7 +17388,7 @@ def _render_quotation_management(conn):
     )
     quotes_df = fmt_dates(quotes_df, ["quote_date"])
     quotes_df["total_amount"] = quotes_df["total_amount"].apply(
-        lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+        lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
     )
 
     tracker_source = quotes_df.drop(
@@ -19001,7 +19073,7 @@ def delivery_orders_page(
             st.session_state.get(items_rows_key, [])
         )
         st.caption(
-            f"Estimated total: {format_money(estimated_total) or f'{estimated_total:,.2f}'}"
+            f"Estimated total: {format_money(estimated_total) or format_number(estimated_total)}"
         )
         submit = st.form_submit_button(f"Save {record_label_lower}", type="primary")
 
@@ -19186,7 +19258,9 @@ def delivery_orders_page(
             customer_display = customer_labels.get(
                 int(selected_customer) if selected_customer else None, "(customer)"
             )
-            total_display = format_money(total_amount_value) or f"{_coerce_float(total_amount_value, 0.0):,.2f}"
+            total_display = format_money(total_amount_value) or format_number(
+                _coerce_float(total_amount_value, 0.0)
+            )
             event_prefix = record_label.lower().replace(" ", "_") or "delivery_order"
             event_type = f"{event_prefix}_{'updated' if not existing.empty else 'created'}"
             entity_type = clean_text(record_type_key) or (
@@ -19309,7 +19383,7 @@ def delivery_orders_page(
                         return ""
                 except Exception:
                     pass
-                return format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+                return format_money(value) or format_number(_coerce_float(value, 0.0))
 
             do_df["total_amount"] = do_df["total_amount"].apply(_format_total_value)
         st.markdown(f"#### {record_label} records")
@@ -20777,7 +20851,7 @@ def import_page(conn):
         "Remarks", options=opts, index=(guess.get("remarks", None) + 1) if guess.get("remarks") is not None else 0
     )
     sel_amount = col14.selectbox(
-        "Amount spent", options=opts, index=(guess.get("amount_spent", None) + 1) if guess.get("amount_spent") is not None else 0
+        "Product price", options=opts, index=(guess.get("amount_spent", None) + 1) if guess.get("amount_spent") is not None else 0
     )
     sel_quantity = col15.selectbox(
         "Quantity", options=opts, index=(guess.get("quantity", None) + 1) if guess.get("quantity") is not None else 0
@@ -20878,7 +20952,7 @@ def import_page(conn):
             "Action": st.column_config.SelectboxColumn("Action", options=["Import", "Skip"], required=True),
             "remarks": st.column_config.TextColumn("Remarks", required=False),
             "amount_spent": st.column_config.NumberColumn(
-                "Amount spent", min_value=0.0, step=0.01, format="%.2f", required=False
+                "Product price", min_value=0.0, step=0.01, format="%.2f", required=False
             ),
             "quantity": st.column_config.NumberColumn(
                 "Quantity", min_value=1, step=1, format="%d", required=False
@@ -20890,6 +20964,20 @@ def import_page(conn):
         editor = editor if isinstance(editor, pd.DataFrame) else pd.DataFrame(editor)
         ready = editor[editor["Action"].fillna("Import").str.lower() == "import"].copy()
         ready.drop(columns=["Action"], inplace=True, errors="ignore")
+        if "phone" in ready.columns:
+            phone_series = ready["phone"].fillna("").astype(str).str.strip()
+            missing_phone = phone_series.eq("")
+            if missing_phone.any():
+                st.error(
+                    f"{missing_phone.sum()} row(s) are missing a phone number. "
+                    "Add a unique phone number before importing."
+                )
+                st.dataframe(
+                    ready[missing_phone],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                return
         seeded, d_c, d_p = _import_clean6(conn, ready, tag="Manual import (mapped)")
         if seeded == 0:
             st.warning("No rows added (rows empty/invalid). Check mapping or file.")
@@ -21112,7 +21200,7 @@ def duplicates_page(conn):
                         return ""
                 except Exception:
                     pass
-                return format_money(val) or f"{_coerce_float(val, 0.0):,.2f}"
+                return format_money(val) or format_number(_coerce_float(val, 0.0))
 
             preview_df["amount_spent_fmt"] = preview_df["amount_spent"].apply(
                 _format_amount_cell
@@ -22596,7 +22684,7 @@ def manage_import_history(conn):
     amount_value = parse_amount(amount_seed)
     amount_display = ""
     if amount_value is not None:
-        amount_display = format_money(amount_value) or f"{amount_value:,.2f}"
+        amount_display = format_money(amount_value) or format_number(amount_value)
     current_quantity = parse_quantity(selected.get("quantity"), default=1)
 
     user = st.session_state.user or {}
@@ -23903,7 +23991,8 @@ def main():
 
     sidebar_hidden = bool(st.session_state.get("sidebar_hidden"))
     toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
-    if st.button("☰", key="sidebar_toggle_main", help=toggle_label):
+    toggle_icon = ">" if sidebar_hidden else "<"
+    if st.button(toggle_icon, key="sidebar_toggle_main", help=toggle_label):
         st.session_state["sidebar_hidden"] = not sidebar_hidden
         st.rerun()
 
