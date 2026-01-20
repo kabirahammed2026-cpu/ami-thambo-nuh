@@ -5993,6 +5993,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-baseweb="table"] * {{
             background-color: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
+            -webkit-text-fill-color: var(--ps-text) !important;
             color-scheme: light !important;
         }}
         [data-baseweb="table"] [role="gridcell"] *,
@@ -6096,6 +6097,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-baseweb="table"] * {{
             background-color: #ffffff !important;
             color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
             color-scheme: light !important;
         }}
         [data-testid="stDataFrame"] *,
@@ -6103,6 +6105,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stTable"] * {{
             background-color: #ffffff !important;
             color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
         }}
         [data-testid="stDataFrame"] svg,
         [data-testid="stDataEditor"] svg,

@@ -2631,6 +2631,7 @@ def apply_theme_styles() -> None:
         [data-baseweb="table"] * {{
             background-color: #ffffff !important;
             color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
             color-scheme: light !important;
         }}
         [data-baseweb="table"] [role="gridcell"] *,
@@ -2648,6 +2649,7 @@ def apply_theme_styles() -> None:
         [data-testid="stTable"] * {{
             background-color: #ffffff !important;
             color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
         }}
         [data-testid="stDataFrame"] svg,
         [data-testid="stDataEditor"] svg,
