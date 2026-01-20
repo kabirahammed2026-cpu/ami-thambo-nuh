@@ -5456,35 +5456,94 @@ def _build_master_sheet(sheets: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
 
 
 def get_theme() -> str:
-    return "light"
+    base = st.get_option("theme.base") or "light"
+    base_normalized = str(base).lower()
+    return base_normalized if base_normalized in {"light", "dark"} else "light"
+
+
+def _build_theme_colors(theme: str) -> dict[str, str]:
+    defaults = {
+        "light": {
+            "bg": "#ffffff",
+            "secondary_bg": "#ffffff",
+            "text": "#111827",
+            "muted": "#6b7280",
+            "panel_border": "#e5e7eb",
+            "input_border": "#d1d5db",
+            "accent": "#1d3b64",
+            "button_primary_text": "#ffffff",
+            "button_primary_hover": "#1e4b82",
+            "metric_border": "rgba(49, 51, 63, 0.08)",
+        },
+        "dark": {
+            "bg": "#0f172a",
+            "secondary_bg": "#111827",
+            "text": "#f9fafb",
+            "muted": "#94a3b8",
+            "panel_border": "#1f2937",
+            "input_border": "#334155",
+            "accent": "#60a5fa",
+            "button_primary_text": "#0f172a",
+            "button_primary_hover": "#3b82f6",
+            "metric_border": "rgba(148, 163, 184, 0.18)",
+        },
+    }
+    theme_key = theme if theme in defaults else "light"
+    theme_defaults = defaults[theme_key]
+    background = st.get_option("theme.backgroundColor") or theme_defaults["bg"]
+    secondary_bg = st.get_option("theme.secondaryBackgroundColor") or theme_defaults["secondary_bg"]
+    text = st.get_option("theme.textColor") or theme_defaults["text"]
+    accent = st.get_option("theme.primaryColor") or theme_defaults["accent"]
+    panel_border = theme_defaults["panel_border"]
+    input_border = theme_defaults["input_border"]
+    muted = theme_defaults["muted"]
+    button_primary_text = theme_defaults["button_primary_text"]
+    button_primary_hover = theme_defaults["button_primary_hover"]
+    metric_border = theme_defaults["metric_border"]
+    return {
+        "bg": background,
+        "sidebar_bg": secondary_bg,
+        "panel_bg": secondary_bg,
+        "panel_border": panel_border,
+        "text": text,
+        "muted": muted,
+        "input_bg": secondary_bg,
+        "input_border": input_border,
+        "accent": accent,
+        "button_bg": secondary_bg,
+        "button_border": panel_border,
+        "button_text": text,
+        "button_hover": background,
+        "button_primary_bg": accent,
+        "button_primary_text": button_primary_text,
+        "button_primary_hover": button_primary_hover,
+        "metric_bg": secondary_bg,
+        "metric_border": metric_border,
+        "table_header_bg": secondary_bg,
+        "table_row_alt_bg": background,
+    }
+
+
+def _render_theme_debug_panel(*, sidebar_hidden: bool) -> None:
+    if os.getenv("DEBUG_THEME") != "1":
+        return
+    container = st if sidebar_hidden else st.sidebar
+    with container.expander("Theme debug", expanded=True):
+        st.write(
+            {
+                "theme.base": st.get_option("theme.base"),
+                "theme.textColor": st.get_option("theme.textColor"),
+                "theme.backgroundColor": st.get_option("theme.backgroundColor"),
+                "theme.secondaryBackgroundColor": st.get_option("theme.secondaryBackgroundColor"),
+            }
+        )
 
 
 def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
     theme = get_theme()
     sidebar_display = "none" if sidebar_hidden else "block"
     content_offset = "0rem" if sidebar_hidden else "var(--ps-sidebar-width)"
-    colors = {
-        "bg": "#ffffff",
-        "sidebar_bg": "#ffffff",
-        "panel_bg": "#ffffff",
-        "panel_border": "#e5e7eb",
-        "text": "#111827",
-        "muted": "#6b7280",
-        "input_bg": "#ffffff",
-        "input_border": "#d1d5db",
-        "accent": "#1d3b64",
-        "button_bg": "#ffffff",
-        "button_border": "#d1d5db",
-        "button_text": "#111827",
-        "button_hover": "#ffffff",
-        "button_primary_bg": "#1d3b64",
-        "button_primary_text": "#ffffff",
-        "button_primary_hover": "#1e4b82",
-        "metric_bg": "#ffffff",
-        "metric_border": "rgba(49, 51, 63, 0.08)",
-        "table_header_bg": "#ffffff",
-        "table_row_alt_bg": "#ffffff",
-    }
+    colors = _build_theme_colors(theme)
     st.markdown(
         f"""
         <style>
@@ -5513,22 +5572,23 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             --ps-button-primary-hover: {colors['button_primary_hover']};
             --ps-table-header-bg: {colors['table_header_bg']};
             --ps-table-row-alt-bg: {colors['table_row_alt_bg']};
+            --ps-color-scheme: {theme};
             --text-color: {colors['text']};
             --secondary-text-color: {colors['muted']};
             --background-color: {colors['bg']};
             --secondary-background-color: {colors['panel_bg']};
             --primary-color: {colors['accent']};
-            color-scheme: {theme};
+            color-scheme: var(--ps-color-scheme);
         }}
         html {{
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme);
         }}
         body,
         .stApp,
         section.main {{
             background-color: var(--ps-bg);
             color: var(--ps-text) !important;
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme);
         }}
         [data-testid="stAppViewContainer"],
         [data-testid="stSidebar"] {{
@@ -5841,7 +5901,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             color: var(--ps-text) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-testid="stDataFrameContainer"],
         [data-testid="stDataFrameResizable"] {{
@@ -5851,7 +5911,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stTable"],
         .stDataFrame,
         .stTable {{
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-testid="stDataFrame"] > div,
         [data-testid="stDataFrame"] [data-testid="stDataFrameResizable"],
@@ -5988,13 +6048,13 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-baseweb="table"] {{
             background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-baseweb="table"] * {{
             background-color: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             -webkit-text-fill-color: var(--ps-text) !important;
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-baseweb="table"] [role="gridcell"] *,
         [data-baseweb="table"] [role="columnheader"] *,
@@ -6011,7 +6071,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             border-color: var(--ps-panel-border) !important;
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-baseweb="table"] th {{
             background-color: var(--ps-table-header-bg) !important;
@@ -6098,7 +6158,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-panel-bg) !important;
             color: var(--ps-text) !important;
             -webkit-text-fill-color: var(--ps-text) !important;
-            color-scheme: light !important;
+            color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-testid="stDataFrame"] *,
         [data-testid="stDataEditor"] *,
@@ -6184,6 +6244,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         """,
         unsafe_allow_html=True,
     )
+    _render_theme_debug_panel(sidebar_hidden=sidebar_hidden)
 
 
 def _guard_double_submit(
