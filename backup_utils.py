@@ -41,6 +41,28 @@ def _prune_backups(backup_dir: Path, keep: int, prefix: str) -> None:
         old_backup.unlink(missing_ok=True)
 
 
+def enforce_backup_retention(
+    backup_dir: Path,
+    keep: int,
+    prefix: str,
+) -> Optional[str]:
+    """Prune backups and return a warning message on failure."""
+
+    if keep <= 0:
+        return "Backup retention is disabled; old backups will not be pruned."
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        _prune_backups(backup_dir, keep, prefix)
+    except OSError as exc:
+        return f"Backup retention cleanup failed: {exc}"
+    remaining = sorted(backup_dir.glob(f"{prefix}_*.zip"))
+    if len(remaining) > keep:
+        return (
+            f"Backup retention cleanup expected <= {keep} files but found {len(remaining)}."
+        )
+    return None
+
+
 def ensure_monthly_backup(
     backup_dir: Path,
     prefix: str,
