@@ -2656,6 +2656,20 @@ def apply_theme_styles() -> None:
         [data-testid="stTable"] svg {{
             fill: #111827 !important;
         }}
+        [data-testid="stDataFrame"] [role="gridcell"] *,
+        [data-testid="stDataFrame"] [role="columnheader"] *,
+        [data-testid="stDataEditor"] [role="gridcell"] *,
+        [data-testid="stDataEditor"] [role="columnheader"] * {{
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+        }}
+        [data-testid="stDataEditor"] input,
+        [data-testid="stDataEditor"] textarea,
+        [data-testid="stDataEditor"] [data-baseweb="select"] input {{
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+            caret-color: #111827 !important;
+        }}
         .ps-quick-nav {{
             position: sticky;
             top: 0.5rem;

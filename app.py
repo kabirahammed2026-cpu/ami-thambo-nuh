@@ -6112,6 +6112,20 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stTable"] svg {{
             fill: #111827 !important;
         }}
+        [data-testid="stDataFrame"] [role="gridcell"] *,
+        [data-testid="stDataFrame"] [role="columnheader"] *,
+        [data-testid="stDataEditor"] [role="gridcell"] *,
+        [data-testid="stDataEditor"] [role="columnheader"] * {{
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+        }}
+        [data-testid="stDataEditor"] input,
+        [data-testid="stDataEditor"] textarea,
+        [data-testid="stDataEditor"] [data-baseweb="select"] input {{
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+            caret-color: #111827 !important;
+        }}
         [data-testid="stFileUploader"] section {{
             background-color: var(--ps-panel-bg) !important;
             border-color: var(--ps-panel-border) !important;
