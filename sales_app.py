@@ -2628,6 +2628,17 @@ def apply_theme_styles() -> None:
             color: #111827 !important;
             color-scheme: light !important;
         }}
+        [data-testid="stDataFrame"] *,
+        [data-testid="stDataEditor"] *,
+        [data-testid="stTable"] * {{
+            background-color: #ffffff !important;
+            color: #111827 !important;
+        }}
+        [data-testid="stDataFrame"] svg,
+        [data-testid="stDataEditor"] svg,
+        [data-testid="stTable"] svg {{
+            fill: #111827 !important;
+        }}
         .ps-quick-nav {{
             position: sticky;
             top: 0.5rem;

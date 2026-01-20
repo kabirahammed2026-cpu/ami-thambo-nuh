@@ -6089,6 +6089,17 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             color: #111827 !important;
             color-scheme: light !important;
         }}
+        [data-testid="stDataFrame"] *,
+        [data-testid="stDataEditor"] *,
+        [data-testid="stTable"] * {{
+            background-color: #ffffff !important;
+            color: #111827 !important;
+        }}
+        [data-testid="stDataFrame"] svg,
+        [data-testid="stDataEditor"] svg,
+        [data-testid="stTable"] svg {{
+            fill: #111827 !important;
+        }}
         [data-testid="stFileUploader"] section {{
             background-color: var(--ps-panel-bg) !important;
             border-color: var(--ps-panel-border) !important;
@@ -15022,7 +15033,11 @@ def warranties_page(conn):
     )
 
     search_filter = "(? = '' OR c.name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')"
-    status_filter = "(COALESCE(w.status, 'active') NOT IN ('deleted', 'completed'))"
+    status_filter = (
+        "1=1"
+        if is_admin
+        else "(COALESCE(w.status, 'active') NOT IN ('deleted', 'completed'))"
+    )
     product_filter = "(p.name IS NOT NULL AND TRIM(p.name) != '')"
     scope_clause, scope_params = customer_scope_filter("c")
 
@@ -15077,6 +15092,7 @@ def warranties_page(conn):
     st.caption("Add remarks and schedule a reminder before a warranty expires.")
     scope_clause, scope_params = customer_scope_filter("c")
     scope_filter = f" AND {scope_clause}" if scope_clause else ""
+    status_condition = "1=1" if is_admin else "w.status = 'active'"
     warranty_followups = df_query(
         conn,
         dedent(
@@ -15092,7 +15108,7 @@ def warranties_page(conn):
             FROM warranties w
             LEFT JOIN customers c ON c.customer_id = w.customer_id
             LEFT JOIN products p ON p.product_id = w.product_id
-            WHERE w.status = 'active'
+            WHERE {status_condition}
               AND w.expiry_date IS NOT NULL
               {scope_filter}
             ORDER BY date(w.expiry_date) ASC, w.warranty_id ASC
@@ -15186,9 +15202,18 @@ def warranties_page(conn):
         else:
             tagged_note = f"[Warranty #{selected_warranty}] {note_value}"
             reminder_iso = to_iso_date(reminder_date)
+            existing_remarks = clean_text(selected_record.get("remarks"))
+            if existing_remarks and note_value not in existing_remarks:
+                combined_remarks = f"{existing_remarks}\n{note_value}"
+            else:
+                combined_remarks = existing_remarks or note_value
             conn.execute(
                 "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
                 (int(selected_record["customer_id"]), tagged_note, reminder_iso),
+            )
+            conn.execute(
+                "UPDATE warranties SET remarks=? WHERE warranty_id=?",
+                (combined_remarks, int(selected_warranty)),
             )
             conn.commit()
             st.success("Warranty reminder saved.")
@@ -17150,13 +17175,6 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             autofill_labels[cid] = " • ".join(part for part in label_parts if part)
             autofill_records[cid] = row.to_dict()
 
-    follow_up_presets = {
-        "In 3 days": 3,
-        "In 1 week": 7,
-        "In 2 weeks": 14,
-        "Custom date": None,
-    }
-
     st.session_state["quotation_autofill_customer"] = None
     st.markdown("### Upload to auto-fill")
     st.caption(
@@ -17320,51 +17338,29 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 help="Visible to admins for tracking next steps.",
             )
         with follow_cols[1]:
-            follow_up_choice = st.selectbox(
-                "Reminder preset",
-                list(follow_up_presets.keys()),
-                index=1,
-                key="quotation_follow_up_choice",
-            )
-            custom_follow_up = follow_up_choice == "Custom date"
-            if custom_follow_up:
-                st.session_state["quotation_follow_up_date_toggle"] = True
             enable_follow_date = st.checkbox(
                 "Set follow-up date",
                 value=bool(st.session_state.get("quotation_follow_up_date"))
-                or custom_follow_up,
+                or False,
                 key="quotation_follow_up_date_toggle",
-                disabled=custom_follow_up,
+                disabled=False,
             )
-            if custom_follow_up:
-                enable_follow_date = True
             if enable_follow_date:
                 follow_up_raw = st.session_state.get("quotation_follow_up_date")
-                if custom_follow_up:
-                    if isinstance(follow_up_raw, (date, datetime)):
-                        follow_up_raw = follow_up_raw.strftime("%d-%m-%Y")
-                        st.session_state["quotation_follow_up_date"] = follow_up_raw
-                    follow_up_date_value = st.text_input(
-                        "Next follow-up date",
-                        value=follow_up_raw or "",
-                        key="quotation_follow_up_date",
-                        help="Enter any date format; we will standardise it later.",
-                        placeholder="e.g. 12-03-2025 or March 12, 2025",
-                    )
-                else:
-                    follow_up_seed = parse_date_value(follow_up_raw)
-                    follow_up_default = (
-                        follow_up_seed.date() if follow_up_seed else datetime.now().date()
-                    )
-                    if not isinstance(follow_up_raw, (date, datetime)):
-                        st.session_state["quotation_follow_up_date"] = follow_up_default
-                    follow_up_date_value = st.date_input(
-                        "Next follow-up date",
-                        value=follow_up_default,
-                        key="quotation_follow_up_date",
-                        disabled=False,
-                    )
+                follow_up_seed = parse_date_value(follow_up_raw)
+                follow_up_default = (
+                    follow_up_seed.date() if follow_up_seed else datetime.now().date()
+                )
+                if not isinstance(follow_up_raw, (date, datetime)):
+                    st.session_state["quotation_follow_up_date"] = follow_up_default
+                follow_up_date_value = st.date_input(
+                    "Next follow-up date",
+                    value=follow_up_default,
+                    key="quotation_follow_up_date",
+                    disabled=False,
+                )
             else:
+                st.session_state["quotation_follow_up_date"] = None
                 follow_up_date_value = None
         follow_up_notes = st.text_area(
             "Follow-up remarks for admins",
@@ -17385,7 +17381,6 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     customer_district = st.session_state.get("quotation_customer_district", "")
     attention_title = st.session_state.get("quotation_attention_title", "")
     admin_notes = terms_notes
-    follow_up_choice = st.session_state.get("quotation_follow_up_choice")
     salesperson_title = salesperson_profile.get("title", "")
     salesperson_contact = salesperson_profile.get("phone", "")
     salesperson_email = salesperson_profile.get("email", "")
@@ -17413,16 +17408,13 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
 
         items_clean, totals_data = normalize_quotation_items(prepared_items)
 
-        reminder_days = follow_up_presets.get(follow_up_choice)
         follow_up_date_seed = parse_date_value(st.session_state.get("quotation_follow_up_date"))
         follow_up_date = follow_up_date_seed.date() if follow_up_date_seed is not None else None
-        if reminder_days is not None:
-            follow_up_date = quotation_date + timedelta(days=reminder_days)
         follow_up_iso = to_iso_date(follow_up_date) if follow_up_date else None
         follow_up_label = format_period_range(follow_up_iso, follow_up_iso) if follow_up_iso else ""
         reminder_label = None
-        if follow_up_label and reminder_days is not None:
-            reminder_label = f"Reminder scheduled in {reminder_days} days on {follow_up_label}."
+        if follow_up_label:
+            reminder_label = f"Reminder scheduled for {follow_up_label}."
         manual_total_override = max(
             _coerce_float(manual_total_value, 0.0),
             0.0,
