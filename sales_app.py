@@ -2494,6 +2494,11 @@ def apply_theme_styles() -> None:
             --ps-primary-color: {primary};
             --ps-panel-bg: {panel_bg};
             --ps-panel-border: {panel_border};
+            --text-color: #111827;
+            --secondary-text-color: #6b7280;
+            --background-color: #ffffff;
+            --secondary-background-color: {panel_bg};
+            --primary-color: {primary};
             color-scheme: light;
         }}
         html {{
@@ -2504,7 +2509,7 @@ def apply_theme_styles() -> None:
         section.main,
         [data-testid="stAppViewContainer"] {{
             background-color: #ffffff;
-            color: #111827;
+            color: #111827 !important;
             color-scheme: light !important;
         }}
         div[data-testid="stButton"] > button,
