@@ -5513,6 +5513,11 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             --ps-button-primary-hover: {colors['button_primary_hover']};
             --ps-table-header-bg: {colors['table_header_bg']};
             --ps-table-row-alt-bg: {colors['table_row_alt_bg']};
+            --text-color: {colors['text']};
+            --secondary-text-color: {colors['muted']};
+            --background-color: {colors['bg']};
+            --secondary-background-color: {colors['panel_bg']};
+            --primary-color: {colors['accent']};
             color-scheme: {theme};
         }}
         html {{
@@ -5522,7 +5527,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         .stApp,
         section.main {{
             background-color: var(--ps-bg);
-            color: var(--ps-text);
+            color: var(--ps-text) !important;
             color-scheme: light !important;
         }}
         [data-testid="stAppViewContainer"],
@@ -9939,11 +9944,6 @@ def dashboard(conn):
                 recent_work_orders,
                 "recent_work_pdf",
             )
-
-    if is_admin:
-        st.markdown("---")
-        _render_admin_kpi_panel(conn)
-
 
 def show_expiry_notifications(conn):
     is_admin = current_user_is_admin()
