@@ -62,6 +62,11 @@ def main() -> None:
         os.environ.setdefault("APP_STORAGE_DIR", str(storage_dir))
 
     os.environ.setdefault("BROWSER", "none")
+    os.environ["STREAMLIT_THEME_BASE"] = "light"
+    os.environ["STREAMLIT_THEME_TEXTCOLOR"] = "#111827"
+    os.environ["STREAMLIT_THEME_BACKGROUNDCOLOR"] = "#FFFFFF"
+    os.environ["STREAMLIT_THEME_SECONDARYBACKGROUNDCOLOR"] = "#FFFFFF"
+    os.environ["STREAMLIT_THEME_PRIMARYCOLOR"] = "#1d3b64"
 
     port = os.getenv("PORT", "8501")
     command = [

@@ -74,6 +74,11 @@ def main() -> None:
     # Streamlit tries to launch the system browser unless this environment
     # variable is set. We want everything contained inside the desktop window.
     os.environ.setdefault("BROWSER", "none")
+    os.environ["STREAMLIT_THEME_BASE"] = "light"
+    os.environ["STREAMLIT_THEME_TEXTCOLOR"] = "#111827"
+    os.environ["STREAMLIT_THEME_BACKGROUNDCOLOR"] = "#FFFFFF"
+    os.environ["STREAMLIT_THEME_SECONDARYBACKGROUNDCOLOR"] = "#FFFFFF"
+    os.environ["STREAMLIT_THEME_PRIMARYCOLOR"] = "#1d3b64"
 
     app_script = resource_path(APP_SCRIPT_NAME)
 
@@ -136,4 +141,3 @@ def _wait_for_server(port: int, *, timeout: float) -> bool:
 
 if __name__ == "__main__":
     main()
-
