@@ -6126,6 +6126,25 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             -webkit-text-fill-color: #111827 !important;
             caret-color: #111827 !important;
         }}
+        [data-testid="stDataFrame"] [role="gridcell"],
+        [data-testid="stDataFrame"] [role="columnheader"],
+        [data-testid="stDataEditor"] [role="gridcell"],
+        [data-testid="stDataEditor"] [role="columnheader"],
+        [data-testid="stTable"] th,
+        [data-testid="stTable"] td {{
+            background-color: #ffffff !important;
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+        }}
+        [data-testid="stDataFrame"] [role="gridcell"] span,
+        [data-testid="stDataFrame"] [role="columnheader"] span,
+        [data-testid="stDataEditor"] [role="gridcell"] span,
+        [data-testid="stDataEditor"] [role="columnheader"] span,
+        [data-testid="stTable"] th span,
+        [data-testid="stTable"] td span {{
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+        }}
         [data-testid="stFileUploader"] section {{
             background-color: var(--ps-panel-bg) !important;
             border-color: var(--ps-panel-border) !important;
