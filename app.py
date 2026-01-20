@@ -6095,36 +6095,36 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stTable"],
         [data-baseweb="table"],
         [data-baseweb="table"] * {{
-            background-color: #ffffff !important;
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+            -webkit-text-fill-color: var(--ps-text) !important;
             color-scheme: light !important;
         }}
         [data-testid="stDataFrame"] *,
         [data-testid="stDataEditor"] *,
         [data-testid="stTable"] * {{
-            background-color: #ffffff !important;
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+            -webkit-text-fill-color: var(--ps-text) !important;
         }}
         [data-testid="stDataFrame"] svg,
         [data-testid="stDataEditor"] svg,
         [data-testid="stTable"] svg {{
-            fill: #111827 !important;
+            fill: var(--ps-text) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"] *,
         [data-testid="stDataFrame"] [role="columnheader"] *,
         [data-testid="stDataEditor"] [role="gridcell"] *,
         [data-testid="stDataEditor"] [role="columnheader"] * {{
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            color: var(--ps-text) !important;
+            -webkit-text-fill-color: var(--ps-text) !important;
         }}
         [data-testid="stDataEditor"] input,
         [data-testid="stDataEditor"] textarea,
         [data-testid="stDataEditor"] [data-baseweb="select"] input {{
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
-            caret-color: #111827 !important;
+            color: var(--ps-text) !important;
+            -webkit-text-fill-color: var(--ps-text) !important;
+            caret-color: var(--ps-text) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"],
         [data-testid="stDataFrame"] [role="columnheader"],
@@ -6132,9 +6132,9 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [role="columnheader"],
         [data-testid="stTable"] th,
         [data-testid="stTable"] td {{
-            background-color: #ffffff !important;
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--ps-text) !important;
+            -webkit-text-fill-color: var(--ps-text) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"] span,
         [data-testid="stDataFrame"] [role="columnheader"] span,
@@ -6142,8 +6142,8 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [role="columnheader"] span,
         [data-testid="stTable"] th span,
         [data-testid="stTable"] td span {{
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            color: var(--ps-text) !important;
+            -webkit-text-fill-color: var(--ps-text) !important;
         }}
         [data-testid="stFileUploader"] section {{
             background-color: var(--ps-panel-bg) !important;

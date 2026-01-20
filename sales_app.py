@@ -2556,7 +2556,7 @@ def apply_theme_styles() -> None:
         [data-testid="stDataFrame"],
         [data-testid="stDataEditor"] {{
             background-color: var(--ps-panel-bg) !important;
-            color: #111827 !important;
+            color: var(--text-color) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
             color-scheme: light !important;
@@ -2566,20 +2566,20 @@ def apply_theme_styles() -> None:
         [data-testid="stDataFrame"] [role="grid"],
         [data-testid="stDataEditor"] [role="grid"] {{
             background-color: var(--ps-panel-bg) !important;
-            color: #111827 !important;
+            color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="columnheader"],
         [data-testid="stDataFrame"] [role="gridcell"],
         [data-testid="stDataEditor"] [role="columnheader"],
         [data-testid="stDataEditor"] [role="gridcell"] {{
             background-color: var(--ps-panel-bg) !important;
-            color: #111827 !important;
+            color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataEditor"] input,
         [data-testid="stDataEditor"] textarea {{
-            background-color: #ffffff !important;
-            color: #111827 !important;
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-baseweb="table"],
@@ -2588,7 +2588,7 @@ def apply_theme_styles() -> None:
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
             background-color: var(--ps-panel-bg) !important;
-            color: #111827 !important;
+            color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
             color-scheme: light !important;
         }}
@@ -2597,12 +2597,12 @@ def apply_theme_styles() -> None:
         [data-baseweb="table"] [role="gridcell"],
         [data-baseweb="table"] [role="columnheader"] {{
             background-color: var(--ps-panel-bg) !important;
-            color: #111827 !important;
+            color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
             color-scheme: light !important;
         }}
         [data-baseweb="table"] tr:nth-child(even) {{
-            background-color: #ffffff !important;
+            background-color: var(--ps-panel-bg) !important;
         }}
         [data-testid="stTable"] {{
             background-color: var(--ps-panel-bg) !important;
@@ -2614,14 +2614,14 @@ def apply_theme_styles() -> None:
         [data-testid="stTable"] th,
         [data-testid="stTable"] td {{
             background-color: var(--ps-panel-bg) !important;
-            color: #111827 !important;
+            color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stMarkdownContainer"] table,
         [data-testid="stMarkdownContainer"] th,
         [data-testid="stMarkdownContainer"] td {{
             background-color: var(--ps-panel-bg) !important;
-            color: #111827 !important;
+            color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataFrame"],
@@ -2629,9 +2629,9 @@ def apply_theme_styles() -> None:
         [data-testid="stTable"],
         [data-baseweb="table"],
         [data-baseweb="table"] * {{
-            background-color: #ffffff !important;
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             color-scheme: light !important;
         }}
         [data-baseweb="table"] [role="gridcell"] *,
@@ -2642,33 +2642,33 @@ def apply_theme_styles() -> None:
         [data-testid="stDataEditor"] [role="columnheader"] *,
         [data-testid="stTable"] th *,
         [data-testid="stTable"] td * {{
-            color: #111827 !important;
+            color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] *,
         [data-testid="stDataEditor"] *,
         [data-testid="stTable"] * {{
-            background-color: #ffffff !important;
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] svg,
         [data-testid="stDataEditor"] svg,
         [data-testid="stTable"] svg {{
-            fill: #111827 !important;
+            fill: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"] *,
         [data-testid="stDataFrame"] [role="columnheader"] *,
         [data-testid="stDataEditor"] [role="gridcell"] *,
         [data-testid="stDataEditor"] [role="columnheader"] * {{
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataEditor"] input,
         [data-testid="stDataEditor"] textarea,
         [data-testid="stDataEditor"] [data-baseweb="select"] input {{
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
-            caret-color: #111827 !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
+            caret-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"],
         [data-testid="stDataFrame"] [role="columnheader"],
@@ -2676,9 +2676,9 @@ def apply_theme_styles() -> None:
         [data-testid="stDataEditor"] [role="columnheader"],
         [data-testid="stTable"] th,
         [data-testid="stTable"] td {{
-            background-color: #ffffff !important;
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            background-color: var(--ps-panel-bg) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"] span,
         [data-testid="stDataFrame"] [role="columnheader"] span,
@@ -2686,8 +2686,8 @@ def apply_theme_styles() -> None:
         [data-testid="stDataEditor"] [role="columnheader"] span,
         [data-testid="stTable"] th span,
         [data-testid="stTable"] td span {{
-            color: #111827 !important;
-            -webkit-text-fill-color: #111827 !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         .ps-quick-nav {{
             position: sticky;
