@@ -4,6 +4,7 @@ import html
 import http.server
 import io
 import json
+import logging
 import math
 import threading
 import time
@@ -31,7 +32,7 @@ import pytesseract
 
 from openpyxl import load_workbook
 
-from backup_utils import ensure_monthly_backup, get_backup_status
+from backup_utils import ensure_monthly_backup, get_backup_status, enforce_backup_retention
 
 
 import streamlit as st
@@ -72,6 +73,13 @@ BACKUP_MIRROR_DIR = os.getenv("PS_CRM_BACKUP_MIRROR_DIR")
 BACKUP_MIRROR_PATH = (
     Path(BACKUP_MIRROR_DIR).expanduser() if BACKUP_MIRROR_DIR else None
 )
+LOG_PATH = BASE_DIR / "ps_crm.log"
+STRICT_REPORT_WINDOWS = os.getenv("PS_REPORT_STRICT_WINDOWS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 DELIVERY_ORDER_DIR = UPLOADS_DIR / "delivery_orders"
@@ -106,6 +114,29 @@ REPORT_PERIOD_OPTIONS = OrderedDict(
         ("monthly", "Monthly"),
     ]
 )
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("ps_crm")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        # Fall back to stdout-only logging.
+        pass
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    return logger
 
 SERVICE_REPORT_FIELDS = OrderedDict(
     [
@@ -4269,6 +4300,49 @@ def ensure_upload_dirs():
         path.mkdir(parents=True, exist_ok=True)
 
 
+def run_health_checks(conn: sqlite3.Connection) -> list[str]:
+    logger = _get_logger()
+    warnings: list[str] = []
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"Storage directory unavailable: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    try:
+        ensure_upload_dirs()
+    except OSError as exc:
+        message = f"Upload directories could not be created: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"Backup directory could not be created: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    db_path = Path(DB_PATH)
+    if not db_path.exists():
+        message = f"Database file missing at {db_path} (it will be created if possible)."
+        warnings.append(message)
+        logger.warning(message)
+    try:
+        conn.execute("SELECT 1")
+    except sqlite3.Error as exc:
+        message = f"Database connectivity check failed: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    retention_warning = enforce_backup_retention(
+        BACKUP_DIR,
+        BACKUP_RETENTION_COUNT,
+        "ps_crm_backup",
+    )
+    if retention_warning:
+        warnings.append(retention_warning)
+        logger.warning(retention_warning)
+    return warnings
+
+
 def _read_uploaded_bytes(uploaded_file) -> bytes:
     if uploaded_file is None:
         return b""
@@ -4479,10 +4553,16 @@ def store_report_import_file(
 def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
     if not path_str:
         return None
+    logger = _get_logger()
     path = Path(path_str)
-    if not path.is_absolute():
-        path = BASE_DIR / path
-    return path
+    if path.is_absolute():
+        resolved = path.resolve()
+    else:
+        resolved = (BASE_DIR / path).resolve()
+    if BASE_DIR not in resolved.parents and resolved != BASE_DIR:
+        logger.warning("Blocked upload path outside storage directory: %s", path_str)
+        return None
+    return resolved
 
 
 _ATTACHMENT_UNCHANGED = object()
@@ -9530,7 +9610,7 @@ def dashboard(conn):
             days_window = st.slider(
                 "Upcoming window (days)",
                 min_value=7,
-                max_value=180,
+                max_value=3650,
                 value=60,
                 step=1,
                 help="Adjust how far ahead to look for upcoming warranty expiries.",
@@ -9539,7 +9619,7 @@ def dashboard(conn):
             months_projection = st.slider(
                 "Projection window (months)",
                 min_value=1,
-                max_value=12,
+                max_value=120,
                 value=6,
                 help="Preview the workload trend for active warranties.",
             )
@@ -23103,7 +23183,7 @@ def reports_page(conn):
             icon="📝",
         )
         st.caption(
-            "Daily entries are limited to today. Weekly and monthly reports can be logged for any selected window."
+            "Daily, weekly, and monthly reports can be logged for any selected window."
         )
 
     def _date_or(value, fallback: date) -> date:
@@ -23526,7 +23606,11 @@ def reports_page(conn):
         )
         if period_choice == "daily":
             day_kwargs: dict[str, object] = {}
-            if not is_admin and not editing_record:
+            if (
+                STRICT_REPORT_WINDOWS
+                and not is_admin
+                and not editing_record
+            ):
                 day_kwargs["min_value"] = today
                 day_kwargs["max_value"] = today
             day_value = st.date_input(
@@ -23699,7 +23783,7 @@ def reports_page(conn):
                 allow_relaxed_edit = bool(
                     editing_record and template_key in {"service", "sales", "follow_up"}
                 )
-                if not allow_relaxed_edit:
+                if STRICT_REPORT_WINDOWS and not allow_relaxed_edit:
                     if normalized_key == "daily":
                         if normalized_start != today or normalized_end != today:
                             validation_error = "Daily reports can only be submitted for today."
@@ -24112,6 +24196,7 @@ def reports_page(conn):
 def main():
     st.session_state["_render_id"] = st.session_state.get("_render_id", 0) + 1
     render_id = st.session_state["_render_id"]
+    logger = _get_logger()
     init_ui()
     apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
     _ensure_quotation_editor_server()
@@ -24129,6 +24214,9 @@ def main():
         BACKUP_MIRROR_PATH,
     )
     st.session_state["auto_backup_error"] = backup_error
+    if backup_error:
+        logger.warning("Automatic backup failed: %s", backup_error)
+    st.session_state["health_warnings"] = run_health_checks(conn)
     _restore_user_session(conn)
     login_box(conn, render_id=render_id)
     # Auth gate: stop rendering any dashboard/navigation without a user session.
@@ -24141,6 +24229,11 @@ def main():
 
     user = st.session_state.user or {}
     role = user.get("role")
+    health_warnings = st.session_state.get("health_warnings") or []
+    if role == "admin" and health_warnings:
+        with st.expander("System health checks", expanded=False):
+            for warning in health_warnings:
+                st.warning(warning)
     if role == "admin":
         pages = [
             "Dashboard",

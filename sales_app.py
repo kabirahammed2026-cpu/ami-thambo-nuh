@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import hashlib
+import logging
 import os
 import re
 import sqlite3
@@ -35,7 +36,7 @@ from ps_sales import (
     Database,
     load_config,
 )
-from backup_utils import ensure_monthly_backup, get_backup_status
+from backup_utils import ensure_monthly_backup, get_backup_status, enforce_backup_retention
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,7 @@ BACKUP_MIRROR_DIR = os.getenv("PS_SALES_BACKUP_MIRROR_DIR")
 BACKUP_MIRROR_PATH = (
     Path(BACKUP_MIRROR_DIR).expanduser() if BACKUP_MIRROR_DIR else None
 )
+LOG_PATH = CONFIG.data_dir / "ps_sales.log"
 
 
 DEFAULT_QUOTATION_STATUSES: Tuple[str, ...] = (
@@ -84,6 +86,28 @@ FOLLOW_UP_SUGGESTIONS: Dict[str, Optional[int]] = {
     CUSTOM_FOLLOW_UP_CHOICE: None,
 }
 DEFAULT_FOLLOW_UP_CHOICE = "In 3 days"
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("ps_sales")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        pass
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    return logger
 
 
 class SafeFormatDict(dict):
@@ -1320,6 +1344,49 @@ def resolve_upload_path(relative_path: str) -> Path:
     if CONFIG.data_dir not in target.parents and target != CONFIG.data_dir:
         raise ValueError("Invalid upload path outside data directory")
     return target
+
+
+def run_health_checks() -> list[str]:
+    logger = _get_logger()
+    warnings: list[str] = []
+    try:
+        CONFIG.data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"Storage directory unavailable: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    try:
+        UPLOAD_MANAGER.base_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"Upload directory could not be created: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"Backup directory could not be created: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    if not DATABASE.db_path.exists():
+        message = f"Database file missing at {DATABASE.db_path} (it will be created if possible)."
+        warnings.append(message)
+        logger.warning(message)
+    try:
+        with DATABASE.raw_connection() as conn:
+            conn.execute("SELECT 1")
+    except sqlite3.Error as exc:
+        message = f"Database connectivity check failed: {exc}"
+        warnings.append(message)
+        logger.exception(message)
+    retention_warning = enforce_backup_retention(
+        BACKUP_DIR,
+        BACKUP_RETENTION_COUNT,
+        "ps_sales_backup",
+    )
+    if retention_warning:
+        warnings.append(retention_warning)
+        logger.warning(retention_warning)
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -4948,20 +5015,36 @@ def render_quotations(user: Dict) -> None:
     filters = st.expander("Filters", expanded=False)
     with filters:
         status_filter = st.multiselect("Status", available_statuses)
+        start_enabled = st.checkbox(
+            "Enable start date filter",
+            key="quotation_filter_start_enabled",
+        )
+        start_seed = min_quote_date.date() if pd.notna(min_quote_date) else date.today()
         start_date = st.date_input(
             "Start date",
-            value=None,
+            value=start_seed,
             key="quotation_filter_start_date",
             min_value=min_quote_date.date() if pd.notna(min_quote_date) else None,
             max_value=max_quote_date.date() if pd.notna(max_quote_date) else None,
+            disabled=not start_enabled,
         )
+        if not start_enabled:
+            start_date = None
+        end_enabled = st.checkbox(
+            "Enable end date filter",
+            key="quotation_filter_end_enabled",
+        )
+        end_seed = max_quote_date.date() if pd.notna(max_quote_date) else date.today()
         end_date = st.date_input(
             "End date",
-            value=None,
+            value=end_seed,
             key="quotation_filter_end_date",
             min_value=min_quote_date.date() if pd.notna(min_quote_date) else None,
             max_value=max_quote_date.date() if pd.notna(max_quote_date) else None,
+            disabled=not end_enabled,
         )
+        if not end_enabled:
+            end_date = None
         if start_date and end_date and start_date > end_date:
             st.error("Start date must be on or before end date.")
             return
@@ -5612,6 +5695,10 @@ def render_admin_filters() -> None:
     df["delivery_order_date"] = pd.to_datetime(df["delivery_order_date"], errors="coerce")
     df["payment_date"] = pd.to_datetime(df["payment_date"], errors="coerce")
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    quote_min = df["quote_date"].dropna().min()
+    quote_max = df["quote_date"].dropna().max()
+    follow_min = df["follow_up_date"].dropna().min()
+    follow_max = df["follow_up_date"].dropna().max()
 
     with st.expander("Filters", expanded=True):
         first_row = st.columns(3)
@@ -5680,12 +5767,72 @@ def render_admin_filters() -> None:
             )
         else:
             fourth_row[0].info("No quantity data available yet.")
-        quote_start = fourth_row[1].date_input("Quote start date", value=None)
-        quote_end = fourth_row[2].date_input("Quote end date", value=None)
+        quote_start_enabled = fourth_row[1].checkbox(
+            "Enable quote start date",
+            key="admin_quote_start_enabled",
+        )
+        quote_start_seed = (
+            quote_min.date() if pd.notna(quote_min) else date.today()
+        )
+        quote_start = fourth_row[1].date_input(
+            "Quote start date",
+            value=quote_start_seed,
+            key="admin_quote_start_date",
+            min_value=quote_min.date() if pd.notna(quote_min) else None,
+            max_value=quote_max.date() if pd.notna(quote_max) else None,
+            disabled=not quote_start_enabled,
+        )
+        if not quote_start_enabled:
+            quote_start = None
+        quote_end_enabled = fourth_row[2].checkbox(
+            "Enable quote end date",
+            key="admin_quote_end_enabled",
+        )
+        quote_end_seed = quote_max.date() if pd.notna(quote_max) else date.today()
+        quote_end = fourth_row[2].date_input(
+            "Quote end date",
+            value=quote_end_seed,
+            key="admin_quote_end_date",
+            min_value=quote_min.date() if pd.notna(quote_min) else None,
+            max_value=quote_max.date() if pd.notna(quote_max) else None,
+            disabled=not quote_end_enabled,
+        )
+        if not quote_end_enabled:
+            quote_end = None
 
         follow_row = st.columns(2)
-        follow_start = follow_row[0].date_input("Follow-up start", value=None)
-        follow_end = follow_row[1].date_input("Follow-up end", value=None)
+        follow_start_enabled = follow_row[0].checkbox(
+            "Enable follow-up start",
+            key="admin_follow_start_enabled",
+        )
+        follow_start_seed = (
+            follow_min.date() if pd.notna(follow_min) else date.today()
+        )
+        follow_start = follow_row[0].date_input(
+            "Follow-up start",
+            value=follow_start_seed,
+            key="admin_follow_start_date",
+            min_value=follow_min.date() if pd.notna(follow_min) else None,
+            max_value=follow_max.date() if pd.notna(follow_max) else None,
+            disabled=not follow_start_enabled,
+        )
+        if not follow_start_enabled:
+            follow_start = None
+        follow_end_enabled = follow_row[1].checkbox(
+            "Enable follow-up end",
+            key="admin_follow_end_enabled",
+        )
+        follow_end_seed = follow_max.date() if pd.notna(follow_max) else date.today()
+        follow_end = follow_row[1].date_input(
+            "Follow-up end",
+            value=follow_end_seed,
+            key="admin_follow_end_date",
+            min_value=follow_min.date() if pd.notna(follow_min) else None,
+            max_value=follow_max.date() if pd.notna(follow_max) else None,
+            disabled=not follow_end_enabled,
+        )
+        if not follow_end_enabled:
+            follow_end = None
 
         search_text = st.text_input(
             "Search text",
@@ -6108,6 +6255,7 @@ def render_settings() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="PS Business Suites by ZAD", layout="wide")
+    logger = _get_logger()
     _, backup_error = ensure_monthly_backup(
         BACKUP_DIR,
         "ps_sales_backup",
@@ -6116,6 +6264,9 @@ def main() -> None:
         BACKUP_MIRROR_PATH,
     )
     st.session_state["auto_backup_error"] = backup_error
+    if backup_error:
+        logger.warning("Automatic backup failed: %s", backup_error)
+    st.session_state["health_warnings"] = run_health_checks()
     if st.session_state.pop("logout_requested", False):
         st.session_state.pop("user", None)
         st.session_state.pop("active_page", None)
@@ -6127,6 +6278,12 @@ def main() -> None:
     apply_theme_styles()
 
     user = st.session_state["user"]
+    if user.get("role") == "admin":
+        health_warnings = st.session_state.get("health_warnings") or []
+        if health_warnings:
+            with st.expander("System health checks", expanded=False):
+                for warning in health_warnings:
+                    st.warning(warning)
     pages = _navigation_pages(user)
     labels = list(pages.keys())
     st.session_state.setdefault("active_page", pages[labels[0]])
