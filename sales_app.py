@@ -2628,6 +2628,16 @@ def apply_theme_styles() -> None:
             color: #111827 !important;
             color-scheme: light !important;
         }}
+        [data-baseweb="table"] [role="gridcell"] *,
+        [data-baseweb="table"] [role="columnheader"] *,
+        [data-testid="stDataFrame"] [role="gridcell"] *,
+        [data-testid="stDataFrame"] [role="columnheader"] *,
+        [data-testid="stDataEditor"] [role="gridcell"] *,
+        [data-testid="stDataEditor"] [role="columnheader"] *,
+        [data-testid="stTable"] th *,
+        [data-testid="stTable"] td * {{
+            color: #111827 !important;
+        }}
         [data-testid="stDataFrame"] *,
         [data-testid="stDataEditor"] *,
         [data-testid="stTable"] * {{

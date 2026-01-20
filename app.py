@@ -916,9 +916,6 @@ def _promote_lead_customer(
 
     cursor = conn.cursor()
 
-    def _fetch_existing(query: str, params: tuple[object, ...]):
-        return cursor.execute(query, params).fetchone()
-
     existing = None
     if phone_number:
         existing = _fetch_existing(
@@ -4985,7 +4982,7 @@ def merge_customer_records(conn, customer_ids) -> bool:
 
 
 def auto_merge_matching_customers(conn) -> bool:
-    """Automatically merge customers sharing the same name and address."""
+    """Automatically merge customers sharing the same phone number."""
 
     df = df_query(
         conn,
@@ -4994,27 +4991,24 @@ def auto_merge_matching_customers(conn) -> bool:
             SELECT customer_id, name, company_name, phone, address, delivery_address,
                    purchase_date, product_info, delivery_order_code, sales_person, remarks, created_at
             FROM customers
-            WHERE TRIM(COALESCE(name, '')) <> '' AND TRIM(COALESCE(address, '')) <> ''
+            WHERE TRIM(COALESCE(phone, '')) <> ''
             """
         ),
     )
     if df.empty:
         return False
 
-    def _normalize(value: object) -> str:
-        cleaned = clean_text(value) or ""
-        return " ".join(cleaned.lower().split())
-
-    df["_name_norm"] = df.get("name", pd.Series(dtype=object)).apply(_normalize)
-    df["_address_norm"] = df.get("address", pd.Series(dtype=object)).apply(_normalize)
+    df["_phone_norm"] = df.get("phone", pd.Series(dtype=object)).apply(_normalize_phone_key)
 
     merged_any = False
-    grouped = df.groupby(["_name_norm", "_address_norm"], dropna=False)
-    for _, group in grouped:
-        ids = [int(cid) for cid in group.get("customer_id", []) if int_or_none(cid) is not None]
-        if len(ids) < 2:
+    grouped = df.groupby(["_phone_norm"], dropna=False)
+    for phone_key, group in grouped:
+        if not phone_key:
             continue
-        if merge_customer_records(conn, ids):
+        phone_values = group.get("phone", pd.Series(dtype=object)).tolist()
+        if not phone_values:
+            continue
+        if merge_customers_by_phone(conn, phone_values[0]):
             merged_any = True
 
     return merged_any
@@ -5996,6 +5990,16 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             color: var(--ps-text) !important;
             color-scheme: light !important;
         }}
+        [data-baseweb="table"] [role="gridcell"] *,
+        [data-baseweb="table"] [role="columnheader"] *,
+        [data-testid="stDataFrame"] [role="gridcell"] *,
+        [data-testid="stDataFrame"] [role="columnheader"] *,
+        [data-testid="stDataEditor"] [role="gridcell"] *,
+        [data-testid="stDataEditor"] [role="columnheader"] *,
+        [data-testid="stTable"] th *,
+        [data-testid="stTable"] td * {{
+            color: var(--ps-text) !important;
+        }}
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
             background: var(--ps-panel-bg) !important;
@@ -6397,24 +6401,21 @@ def _build_admin_kpi_snapshot(conn: sqlite3.Connection) -> pd.DataFrame:
         momentum_boost = min((total_reports / months_active) * 2.5, 25.0)
         monthly_score = max(
             0.0,
-            min(100.0, monthly_completion - recency_penalty + 20.0 + momentum_boost),
+            monthly_completion - recency_penalty + 20.0 + momentum_boost,
         )
 
         lifetime_velocity = (total_reports / months_active) / 20.0
         lifetime_score = max(
             0.0,
-            min(
-                100.0,
-                (lifetime_velocity * 100.0) - min(days_since_last * 1.5, 40.0) + 20.0,
-            ),
+            (lifetime_velocity * 100.0) - min(days_since_last * 1.5, 40.0) + 20.0,
         )
 
         kpi_rows.append(
             {
                 "Team member": clean_text(row.get("Team member"))
                 or f"User #{int(row.get('user_id'))}",
-                "Monthly KPI": f"{monthly_score:,.0f}/100",
-                "Lifetime KPI": f"{lifetime_score:,.0f}/100",
+                "Monthly KPI": f"{monthly_score:,.0f}",
+                "Lifetime KPI": f"{lifetime_score:,.0f}",
             }
         )
 
@@ -6929,41 +6930,55 @@ def _bootstrap_streamlit_app() -> None:
         pass
 
 
+def _normalize_phone_key(value: Optional[str]) -> Optional[str]:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    match = re.search(r"\+?\d[\d\s\-()]{5,}\d", cleaned)
+    if not match:
+        return None
+    raw = match.group(0)
+    digits = re.sub(r"[^\d]", "", raw)
+    if not digits:
+        return None
+    if raw.strip().startswith("+"):
+        return f"+{digits}"
+    return digits
+
+
 def recalc_customer_duplicate_flag(conn, phone):
-    if not phone or str(phone).strip() == "":
+    phone_key = _normalize_phone_key(phone)
+    if not phone_key:
         return
     cur = conn.execute(
-        "SELECT customer_id, purchase_date FROM customers WHERE phone = ?",
-        (str(phone).strip(),),
+        """
+        SELECT customer_id, phone
+        FROM customers
+        WHERE phone IS NOT NULL AND TRIM(phone) != ''
+        """,
     )
     rows = cur.fetchall()
-    if not rows:
-        return
-
-    grouped: dict[Optional[str], list[int]] = {}
-    for cid, purchase_date in rows:
+    matching_ids: list[int] = []
+    for cid, phone_value in rows:
         try:
             cid_int = int(cid)
         except (TypeError, ValueError):
             continue
-        key = clean_text(purchase_date) or None
-        grouped.setdefault(key, []).append(cid_int)
-
-    updates: list[tuple[int, int]] = []
-    for cid_list in grouped.values():
-        dup_flag = 1 if len(cid_list) > 1 else 0
-        updates.extend((dup_flag, cid) for cid in cid_list)
-
-    if updates:
-        conn.executemany(
-            "UPDATE customers SET dup_flag=? WHERE customer_id=?",
-            updates,
-        )
+        if _normalize_phone_key(phone_value) == phone_key:
+            matching_ids.append(cid_int)
+    if not matching_ids:
+        return
+    dup_flag = 1 if len(matching_ids) > 1 else 0
+    conn.executemany(
+        "UPDATE customers SET dup_flag=? WHERE customer_id=?",
+        [(dup_flag, cid) for cid in matching_ids],
+    )
 
 
 def merge_customers_by_phone(conn, phone: Optional[str]) -> Optional[int]:
     phone_value = clean_text(phone)
-    if not phone_value:
+    phone_key = _normalize_phone_key(phone_value)
+    if not phone_value or not phone_key:
         return None
     customers_df = df_query(
         conn,
@@ -6982,11 +6997,15 @@ def merge_customers_by_phone(conn, phone: Optional[str]) -> Optional[int]:
                amount_spent,
                attachment_path
         FROM customers
-        WHERE phone = ?
+        WHERE phone IS NOT NULL AND TRIM(phone) != ''
         ORDER BY customer_id ASC
         """,
-        (phone_value,),
     )
+    if not customers_df.empty:
+        customers_df = customers_df[
+            customers_df["phone"]
+            .apply(lambda value: _normalize_phone_key(value) == phone_key)
+        ]
     if customers_df.empty:
         return None
     customer_ids = [
@@ -7825,24 +7844,21 @@ def _render_admin_kpi_panel(conn) -> None:
         momentum_boost = min((total_reports / months_active) * 2.5, 25.0)
         monthly_score = max(
             0.0,
-            min(100.0, monthly_completion - recency_penalty + 20.0 + momentum_boost),
+            monthly_completion - recency_penalty + 20.0 + momentum_boost,
         )
 
         lifetime_velocity = (total_reports / months_active) / 20.0
         lifetime_score = max(
             0.0,
-            min(
-                100.0,
-                (lifetime_velocity * 100.0) - min(days_since_last * 1.5, 40.0) + 20.0,
-            ),
+            (lifetime_velocity * 100.0) - min(days_since_last * 1.5, 40.0) + 20.0,
         )
 
         kpi_rows.append(
             {
                 "Team member": clean_text(row.get("Team member"))
                 or f"User #{int(row.get('user_id'))}",
-                "Monthly KPI": f"{monthly_score:,.0f}/100",
-                "Lifetime KPI": f"{lifetime_score:,.0f}/100",
+                "Monthly KPI": f"{monthly_score:,.0f}",
+                "Lifetime KPI": f"{lifetime_score:,.0f}",
             }
         )
 
@@ -15033,11 +15049,7 @@ def warranties_page(conn):
     )
 
     search_filter = "(? = '' OR c.name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')"
-    status_filter = (
-        "1=1"
-        if is_admin
-        else "(COALESCE(w.status, 'active') NOT IN ('deleted', 'completed'))"
-    )
+    status_filter = "COALESCE(w.status, 'active') NOT IN ('deleted', 'completed')"
     product_filter = "(p.name IS NOT NULL AND TRIM(p.name) != '')"
     scope_clause, scope_params = customer_scope_filter("c")
 
@@ -15092,7 +15104,7 @@ def warranties_page(conn):
     st.caption("Add remarks and schedule a reminder before a warranty expires.")
     scope_clause, scope_params = customer_scope_filter("c")
     scope_filter = f" AND {scope_clause}" if scope_clause else ""
-    status_condition = "1=1" if is_admin else "w.status = 'active'"
+    status_condition = "COALESCE(w.status, 'active') = 'active'"
     warranty_followups = df_query(
         conn,
         dedent(
@@ -16859,6 +16871,7 @@ def _upsert_customer_from_manual_quotation(
     customer_name = clean_text(name)
     company_name = clean_text(company)
     phone_number = clean_text(phone)
+    phone_key = _normalize_phone_key(phone_number)
     street_address = clean_text(address)
     district_label = clean_text(district)
     reference_label = clean_text(reference)
@@ -16868,43 +16881,20 @@ def _upsert_customer_from_manual_quotation(
 
     cursor = conn.cursor()
 
-    def _fetch_existing(query: str, params: tuple[object, ...]):
-        return cursor.execute(query, params).fetchone()
-
     existing = None
-    if phone_number:
-        existing = _fetch_existing(
+    if phone_number and phone_key:
+        existing_rows = cursor.execute(
             """
             SELECT customer_id, name, company_name, phone, address, delivery_address, remarks
             FROM customers
-            WHERE TRIM(IFNULL(phone, '')) = ?
+            WHERE phone IS NOT NULL AND TRIM(phone) != ''
             ORDER BY customer_id DESC
-            LIMIT 1
             """,
-            (phone_number,),
-        )
-    if existing is None and company_name:
-        existing = _fetch_existing(
-            """
-            SELECT customer_id, name, company_name, phone, address, delivery_address, remarks
-            FROM customers
-            WHERE LOWER(IFNULL(company_name, '')) = LOWER(?)
-            ORDER BY customer_id DESC
-            LIMIT 1
-            """,
-            (company_name,),
-        )
-    if existing is None and customer_name:
-        existing = _fetch_existing(
-            """
-            SELECT customer_id, name, company_name, phone, address, delivery_address, remarks
-            FROM customers
-            WHERE LOWER(IFNULL(name, '')) = LOWER(?)
-            ORDER BY customer_id DESC
-            LIMIT 1
-            """,
-            (customer_name,),
-        )
+        ).fetchall()
+        for row in existing_rows:
+            if _normalize_phone_key(row[3]) == phone_key:
+                existing = row
+                break
 
     if existing:
         (
@@ -16938,6 +16928,8 @@ def _upsert_customer_from_manual_quotation(
                 (*updates.values(), customer_id),
             )
             conn.commit()
+        if phone_number:
+            merge_customers_by_phone(conn, phone_number)
         return customer_id
 
     remark_parts = []
@@ -16966,6 +16958,8 @@ def _upsert_customer_from_manual_quotation(
         ),
     )
     conn.commit()
+    if phone_number:
+        merge_customers_by_phone(conn, phone_number)
     return cursor.lastrowid
 
 def _persist_quotation_pdf(
@@ -21478,7 +21472,7 @@ def duplicates_page(conn):
     st.subheader("⚠️ Possible Duplicates")
     if auto_merge_matching_customers(conn):
         st.info(
-            "Automatically merged customers sharing the same name and address.",
+            "Automatically merged customers sharing the same phone number.",
             icon="✅",
         )
         _safe_rerun()
