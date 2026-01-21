@@ -11,11 +11,14 @@ import time
 from reportlab.lib.utils import ImageReader
 import os
 import re
+import mimetypes
 import sqlite3
 import hashlib
 import secrets
 import uuid
 import zipfile
+import subprocess
+import tempfile
 from calendar import monthrange
 from datetime import datetime, timedelta, date
 from functools import partial
@@ -74,6 +77,8 @@ BACKUP_MIRROR_PATH = (
     Path(BACKUP_MIRROR_DIR).expanduser() if BACKUP_MIRROR_DIR else None
 )
 LOG_PATH = BASE_DIR / "ps_crm.log"
+DEBUG_DIAG = os.getenv("DEBUG_DIAG", "").strip().lower() in {"1", "true", "yes", "on"}
+MAX_UPLOAD_BYTES = int(float(os.getenv("PS_MAX_UPLOAD_MB", "25")) * 1024 * 1024)
 STRICT_REPORT_WINDOWS = os.getenv("PS_REPORT_STRICT_WINDOWS", "").strip().lower() in {
     "1",
     "true",
@@ -137,6 +142,36 @@ def _get_logger() -> logging.Logger:
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
     return logger
+
+
+def _debug_diag_enabled() -> bool:
+    return DEBUG_DIAG
+
+
+def _get_git_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _format_bytes(size: Optional[int]) -> str:
+    if size is None:
+        return "unknown"
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
 
 SERVICE_REPORT_FIELDS = OrderedDict(
     [
@@ -1398,6 +1433,53 @@ def ensure_schema_upgrades(conn):
     add_column("services", "deleted_by", "INTEGER")
     add_column("maintenance_records", "deleted_at", "TEXT")
     add_column("maintenance_records", "deleted_by", "INTEGER")
+    add_column("customer_documents", "file_size", "INTEGER")
+    add_column("customer_documents", "mime_type", "TEXT")
+    add_column("operations_other_documents", "file_size", "INTEGER")
+    add_column("operations_other_documents", "mime_type", "TEXT")
+    add_column("service_documents", "file_size", "INTEGER")
+    add_column("service_documents", "mime_type", "TEXT")
+    add_column("maintenance_documents", "file_size", "INTEGER")
+    add_column("maintenance_documents", "mime_type", "TEXT")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS data_versions (
+            key TEXT PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    for key in ("customers", "quotations", "operations"):
+        conn.execute(
+            "INSERT OR IGNORE INTO data_versions (key, version) VALUES (?, 0)",
+            (key,),
+        )
+
+    def ensure_data_version_trigger(table: str, key: str) -> None:
+        for action in ("INSERT", "UPDATE", "DELETE"):
+            trigger_name = f"bump_{table}_{action.lower()}_{key}"
+            ensure_trigger(
+                trigger_name,
+                dedent(
+                    f"""
+                    CREATE TRIGGER {trigger_name}
+                    AFTER {action} ON {table}
+                    BEGIN
+                        UPDATE data_versions
+                        SET version = version + 1,
+                            updated_at = datetime('now')
+                        WHERE key = '{key}';
+                    END;
+                    """
+                ),
+            )
+
+    ensure_data_version_trigger("customers", "customers")
+    ensure_data_version_trigger("quotations", "quotations")
+    for table in ("delivery_orders", "services", "maintenance_records"):
+        ensure_data_version_trigger(table, "operations")
     add_column("quotations", "payment_receipt_path", "TEXT")
     add_column("quotations", "items_payload", "TEXT")
     add_column("maintenance_records", "maintenance_start_date", "TEXT")
@@ -1787,6 +1869,51 @@ def filter_delivery_orders_for_view(
 
 def df_query(conn, q, params=()):
     return pd.read_sql_query(q, conn, params=params)
+
+
+def get_data_version(conn, key: str) -> int:
+    row = conn.execute(
+        "SELECT version FROM data_versions WHERE key=?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO data_versions (key, version) VALUES (?, 0)",
+            (key,),
+        )
+        conn.commit()
+        return 0
+    return int(row[0] or 0)
+
+
+@st.cache_data(show_spinner=False)
+def _load_customer_group_rows(
+    db_path: str,
+    where_clause: str,
+    params: tuple,
+    version: int,
+) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    try:
+        return pd.read_sql_query(
+            f"SELECT customer_id, TRIM(name) AS name FROM customers {where_clause}",
+            conn,
+            params=params,
+        )
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def _count_cached(db_path: str, query: str, params: tuple, version: int) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(query, conn, params=params)
+    finally:
+        conn.close()
+    if df.empty:
+        return 0
+    return int(df.iloc[0].get("c") or 0)
 
 def fmt_dates(df: pd.DataFrame, cols):
     df = df.copy()
@@ -4337,7 +4464,54 @@ def run_health_checks(conn: sqlite3.Connection) -> list[str]:
     if retention_warning:
         warnings.append(retention_warning)
         logger.warning(retention_warning)
+    for path in (BASE_DIR, BACKUP_DIR, UPLOADS_DIR):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            message = f"Storage path not writable: {path} ({exc})"
+            warnings.append(message)
+            logger.warning(message)
     return warnings
+
+
+def _guess_upload_mime(filename: str) -> str:
+    if not filename:
+        return "application/octet-stream"
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or "application/octet-stream"
+
+
+def _validate_upload(
+    uploaded_file,
+    *,
+    allowed_extensions: Optional[set[str]] = None,
+    max_bytes: Optional[int] = None,
+) -> Optional[str]:
+    if uploaded_file is None:
+        return "No file provided."
+    filename = getattr(uploaded_file, "name", "") or ""
+    ext = Path(filename).suffix.lower()
+    if allowed_extensions:
+        normalized = {item.lower() for item in allowed_extensions}
+        if ext not in normalized:
+            return f"Unsupported file type {ext or '(unknown)'}."
+    if max_bytes:
+        size = getattr(uploaded_file, "size", None)
+        if isinstance(size, (int, float)) and size > max_bytes:
+            return f"File exceeds {_format_bytes(max_bytes)} size limit."
+    return None
+
+
+def _extract_upload_metadata(uploaded_file, saved_path: Optional[Path]) -> dict[str, object]:
+    filename = getattr(uploaded_file, "name", "") or ""
+    mime_type = _guess_upload_mime(filename)
+    size = getattr(uploaded_file, "size", None)
+    if size is None and saved_path and saved_path.exists():
+        try:
+            size = saved_path.stat().st_size
+        except OSError:
+            size = None
+    return {"mime_type": mime_type, "file_size": size}
 
 
 def _read_uploaded_bytes(uploaded_file) -> bytes:
@@ -4372,6 +4546,14 @@ def save_uploaded_file(
 ) -> Optional[Path]:
     if uploaded_file is None:
         return None
+    validation_error = _validate_upload(
+        uploaded_file,
+        allowed_extensions=allowed_extensions,
+        max_bytes=MAX_UPLOAD_BYTES,
+    )
+    if validation_error:
+        _get_logger().warning("Upload rejected: %s", validation_error)
+        return None
     ensure_upload_dirs()
     raw_name = filename or uploaded_file.name or "upload"
     raw_name = "".join(ch for ch in raw_name if ch.isalnum() or ch in (".", "_", "-"))
@@ -4381,7 +4563,7 @@ def save_uploaded_file(
     if allowed_extensions is not None:
         normalized_allowed = {val.lower() for val in allowed_extensions}
         if ext not in normalized_allowed:
-            ext = default_extension if default_extension.startswith(".") else f".{default_extension}"
+            return None
         safe_name = f"{stem}{ext}"
     else:
         if not ext:
@@ -4562,6 +4744,34 @@ def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
     return resolved
 
 
+def render_upload_preview(path: Path, *, label: str, key_prefix: str) -> None:
+    suffix = path.suffix.lower()
+    preview_key = f"{key_prefix}_preview"
+    with st.expander(f"Preview: {label}", expanded=False):
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            st.warning("Unable to read file for preview.")
+            return
+        if suffix == ".pdf":
+            encoded = base64.b64encode(payload).decode("utf-8")
+            iframe = (
+                f"<iframe src='data:application/pdf;base64,{encoded}' "
+                "width='100%' height='520px' style='border: none;'></iframe>"
+            )
+            st_components_html(iframe, height=540, scrolling=True)
+        elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+            st.image(payload, caption=label, use_column_width=True)
+        else:
+            st.info("Preview not available for this file type.")
+        st.download_button(
+            "Download file",
+            data=payload,
+            file_name=path.name,
+            key=f"{preview_key}_download",
+        )
+
+
 _ATTACHMENT_UNCHANGED = object()
 
 
@@ -4657,11 +4867,8 @@ def build_customer_groups(conn, only_complete: bool = True):
         criteria.append(scope_clause)
         params.extend(scope_params)
     where_clause = f"WHERE {' AND '.join(criteria)}" if criteria else ""
-    df = df_query(
-        conn,
-        f"SELECT customer_id, TRIM(name) AS name FROM customers {where_clause}",
-        tuple(params),
-    )
+    version = get_data_version(conn, "customers")
+    df = _load_customer_group_rows(DB_PATH, where_clause, tuple(params), version)
     if df.empty:
         return [], {}
     df["name"] = df["name"].fillna("")
@@ -4708,6 +4915,23 @@ def fetch_customer_choices(conn, *, only_complete: bool = True):
     return options, labels, group_map, label_by_id
 
 
+def get_customer_counts(conn) -> tuple[int, int]:
+    version = get_data_version(conn, "customers")
+    complete = _count_cached(
+        DB_PATH,
+        f"SELECT COUNT(*) c FROM customers WHERE {customer_complete_clause()}",
+        (),
+        version,
+    )
+    scrap = _count_cached(
+        DB_PATH,
+        f"SELECT COUNT(*) c FROM customers WHERE {customer_incomplete_clause()}",
+        (),
+        version,
+    )
+    return complete, scrap
+
+
 def attach_documents(
     conn,
     table: str,
@@ -4728,6 +4952,7 @@ def attach_documents(
     except Exception:
         cols = set()
     include_uploader = "uploaded_by" in cols
+    include_meta = "file_size" in cols and "mime_type" in cols
     uploader_id = current_user_id()
     for idx, uploaded in enumerate(files, start=1):
         if uploaded is None:
@@ -4753,16 +4978,19 @@ def attach_documents(
             stored_path = store_uploaded_pdf(uploaded, target_dir, filename=filename)
         if not stored_path:
             continue
+        meta = _extract_upload_metadata(uploaded, resolve_upload_path(stored_path))
+        columns = [fk_column, "file_path", "original_name"]
+        values: list[object] = [int(record_id), stored_path, safe_original]
         if include_uploader:
-            conn.execute(
-                f"INSERT INTO {table} ({fk_column}, file_path, original_name, uploaded_by) VALUES (?, ?, ?, ?)",
-                (int(record_id), stored_path, safe_original, uploader_id),
-            )
-        else:
-            conn.execute(
-                f"INSERT INTO {table} ({fk_column}, file_path, original_name) VALUES (?, ?, ?)",
-                (int(record_id), stored_path, safe_original),
-            )
+            columns.append("uploaded_by")
+            values.append(uploader_id)
+        if include_meta:
+            columns.extend(["file_size", "mime_type"])
+            values.extend([meta.get("file_size"), meta.get("mime_type")])
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(['?'] * len(columns))})",
+            tuple(values),
+        )
         saved += 1
     return saved
 
@@ -5897,16 +6125,18 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         }}
         [data-testid="stDataFrame"],
         [data-testid="stDataEditor"] {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
             color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-testid="stDataFrameContainer"],
         [data-testid="stDataFrameResizable"] {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stTable"],
         .stDataFrame,
@@ -5917,8 +6147,9 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataFrame"] [data-testid="stDataFrameResizable"],
         [data-testid="stDataFrame"] [data-testid="stDataFrameScrollable"],
         [data-testid="stDataEditor"] > div {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [data-baseweb="table"] > div,
         [data-testid="stDataFrame"] [data-baseweb="table"] [role="rowgroup"],
@@ -5926,42 +6157,48 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [data-baseweb="table"] > div,
         [data-testid="stDataEditor"] [data-baseweb="table"] [role="rowgroup"],
         [data-testid="stDataEditor"] [data-baseweb="table"] [role="grid"] {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [data-baseweb="table"] div,
         [data-testid="stDataEditor"] [data-baseweb="table"] div,
         .stDataFrame [data-baseweb="table"] div {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-baseweb="table"] > div,
         [data-baseweb="table"] [role="row"] > div,
         [data-baseweb="table"] [role="columnheader"] > div {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] table,
         [data-testid="stDataEditor"] table,
         [data-testid="stDataFrame"] [role="grid"],
         [data-testid="stDataEditor"] [role="grid"] {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] th,
         [data-testid="stDataFrame"] td,
         [data-testid="stDataEditor"] th,
         [data-testid="stDataEditor"] td {{
             border-color: var(--ps-panel-border) !important;
-            color: var(--ps-text) !important;
-            background-color: var(--ps-panel-bg) !important;
+            color: var(--text-color) !important;
+            background-color: var(--secondary-background-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="columnheader"],
         [data-testid="stDataFrame"] [role="gridcell"],
         [data-testid="stDataEditor"] [role="columnheader"],
         [data-testid="stDataEditor"] [role="gridcell"] {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataFrame"] [role="row"],
@@ -5970,22 +6207,25 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [role="row"],
         [data-testid="stDataEditor"] [role="row"] > div,
         [data-testid="stDataEditor"] [role="cell"] {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataEditor"] [data-baseweb="table"] [role="row"],
         [data-testid="stDataEditor"] [data-baseweb="table"] [role="row"] > div,
         [data-testid="stDataEditor"] [data-baseweb="table"] [role="gridcell"] {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-baseweb="table"] [role="rowgroup"],
         [data-baseweb="table"] [role="row"],
         [data-baseweb="table"] [role="gridcell"],
         [data-baseweb="table"] [role="columnheader"] {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         .stDataFrame [role="columnheader"],
         .stDataFrame [role="gridcell"],
@@ -5993,8 +6233,9 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         .stDataFrame [data-baseweb="table"],
         .stDataFrame [data-baseweb="table"] th,
         .stDataFrame [data-baseweb="table"] td {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataFrame"] [data-baseweb="table"],
@@ -6003,22 +6244,26 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [data-baseweb="table"] tbody,
         [data-testid="stDataFrame"] [data-baseweb="table"] thead,
         [data-testid="stDataEditor"] [data-baseweb="table"] thead {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataEditor"] input,
         [data-testid="stDataEditor"] textarea {{
-            background-color: var(--ps-input-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-input-border) !important;
         }}
         [data-testid="stDataEditor"] [data-baseweb="select"] > div {{
             background-color: var(--ps-input-bg) !important;
             border-color: var(--ps-input-border) !important;
-            color: var(--ps-text) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataEditor"] [data-baseweb="select"] input {{
-            color: var(--ps-text) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataEditor"] [data-baseweb="select"] svg {{
             color: var(--ps-muted) !important;
@@ -6026,14 +6271,16 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         }}
         [data-testid="stDataEditor"] [role="listbox"],
         [data-testid="stDataEditor"] [data-baseweb="menu"] {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataEditor"] [role="option"],
         [data-testid="stDataEditor"] [role="menuitem"] {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataEditor"] [role="option"][aria-selected="true"],
         [data-testid="stDataEditor"] [role="menuitem"][aria-selected="true"] {{
@@ -6046,14 +6293,15 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             border-color: var(--ps-panel-border) !important;
         }}
         [data-baseweb="table"] {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-baseweb="table"] * {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
-            -webkit-text-fill-color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-baseweb="table"] [role="gridcell"] *,
@@ -6064,12 +6312,14 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [role="columnheader"] *,
         [data-testid="stTable"] th *,
         [data-testid="stTable"] td * {{
-            color: var(--ps-text) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
             color-scheme: var(--ps-color-scheme) !important;
         }}
@@ -6077,12 +6327,13 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-table-header-bg) !important;
         }}
         [data-baseweb="table"] [role="row"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
         }}
         [data-baseweb="table"] thead,
         [data-baseweb="table"] tbody {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-baseweb="table"] [role="row"]:nth-child(even) {{
             background-color: var(--ps-table-row-alt-bg) !important;
@@ -6095,20 +6346,22 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-table-header-bg) !important;
         }}
         [data-testid="stTable"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
             overflow: hidden;
         }}
         [data-testid="stTable"] table {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stTable"] th,
         [data-testid="stTable"] td {{
             border-color: var(--ps-panel-border) !important;
-            color: var(--ps-text) !important;
-            background: var(--ps-panel-bg) !important;
+            color: var(--text-color) !important;
+            background: var(--secondary-background-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stTable"] th {{
             background-color: var(--ps-table-header-bg) !important;
@@ -6117,32 +6370,36 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-table-row-alt-bg) !important;
         }}
         [data-testid="stMarkdownContainer"] table {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stMarkdownContainer"] th,
         [data-testid="stMarkdownContainer"] td {{
-            background: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stMarkdownContainer"] th {{
             background-color: var(--ps-table-header-bg) !important;
         }}
         table {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         table th,
         table td {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         table tbody tr {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
         }}
         table thead th {{
             background-color: var(--ps-table-header-bg) !important;
@@ -6155,36 +6412,36 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stTable"],
         [data-baseweb="table"],
         [data-baseweb="table"] * {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
-            -webkit-text-fill-color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             color-scheme: var(--ps-color-scheme) !important;
         }}
         [data-testid="stDataFrame"] *,
         [data-testid="stDataEditor"] *,
         [data-testid="stTable"] * {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
-            -webkit-text-fill-color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] svg,
         [data-testid="stDataEditor"] svg,
         [data-testid="stTable"] svg {{
-            fill: var(--ps-text) !important;
+            fill: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"] *,
         [data-testid="stDataFrame"] [role="columnheader"] *,
         [data-testid="stDataEditor"] [role="gridcell"] *,
         [data-testid="stDataEditor"] [role="columnheader"] * {{
-            color: var(--ps-text) !important;
-            -webkit-text-fill-color: var(--ps-text) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataEditor"] input,
         [data-testid="stDataEditor"] textarea,
         [data-testid="stDataEditor"] [data-baseweb="select"] input {{
-            color: var(--ps-text) !important;
-            -webkit-text-fill-color: var(--ps-text) !important;
-            caret-color: var(--ps-text) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
+            caret-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"],
         [data-testid="stDataFrame"] [role="columnheader"],
@@ -6192,9 +6449,9 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [role="columnheader"],
         [data-testid="stTable"] th,
         [data-testid="stTable"] td {{
-            background-color: var(--ps-panel-bg) !important;
-            color: var(--ps-text) !important;
-            -webkit-text-fill-color: var(--ps-text) !important;
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"] span,
         [data-testid="stDataFrame"] [role="columnheader"] span,
@@ -6202,8 +6459,8 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stDataEditor"] [role="columnheader"] span,
         [data-testid="stTable"] th span,
         [data-testid="stTable"] td span {{
-            color: var(--ps-text) !important;
-            -webkit-text-fill-color: var(--ps-text) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stFileUploader"] section {{
             background-color: var(--ps-panel-bg) !important;
@@ -7564,6 +7821,44 @@ def _clear_session_for_logout(conn) -> None:
         del st.session_state[k]
 
 
+def _ensure_debug_user(conn) -> Optional[dict[str, object]]:
+    if not _debug_diag_enabled():
+        return None
+    user = st.session_state.get("user")
+    if user:
+        return user
+    debug_username = os.getenv("DEBUG_DIAG_USER", "diagnostic")
+    row = df_query(
+        conn,
+        "SELECT user_id, username, role, phone, title, email FROM users WHERE username=?",
+        (debug_username,),
+    )
+    if row.empty:
+        temp_pass = secrets.token_urlsafe(16)
+        hashed = hashlib.sha256(temp_pass.encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO users (username, pass_hash, role) VALUES (?, ?, 'admin')",
+            (debug_username, hashed),
+        )
+        conn.commit()
+        row = df_query(
+            conn,
+            "SELECT user_id, username, role, phone, title, email FROM users WHERE username=?",
+            (debug_username,),
+        )
+    payload = {
+        "user_id": int(row.iloc[0]["user_id"]),
+        "username": row.iloc[0]["username"],
+        "role": row.iloc[0]["role"],
+        "phone": clean_text(row.iloc[0].get("phone")),
+        "title": clean_text(row.iloc[0].get("title")),
+        "email": clean_text(row.iloc[0].get("email")),
+    }
+    st.session_state.user = payload
+    st.session_state["debug_diag"] = True
+    return payload
+
+
 def _request_logout() -> None:
     st.session_state["logout_requested"] = True
 
@@ -8328,12 +8623,7 @@ def dashboard(conn):
 
     if is_admin:
         col1, col2, col3, col4 = st.columns(4)
-        complete_count = int(
-            df_query(conn, f"SELECT COUNT(*) c FROM customers WHERE {customer_complete_clause()}").iloc[0]["c"]
-        )
-        scrap_count = int(
-            df_query(conn, f"SELECT COUNT(*) c FROM customers WHERE {customer_incomplete_clause()}").iloc[0]["c"]
-        )
+        complete_count, scrap_count = get_customer_counts(conn)
         with col1:
             st.metric("Customers", complete_count)
         with col2:
@@ -11867,6 +12157,14 @@ def _save_customer_document_upload(
     doc_type_slug = _sanitize_path_component(doc_type.lower().replace(" ", "_")) or "document"
     original_name = upload_file.name or f"{doc_type_slug}_{customer_id}.pdf"
     safe_original = Path(original_name).name
+    validation_error = _validate_upload(
+        upload_file,
+        allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
+        max_bytes=MAX_UPLOAD_BYTES,
+    )
+    if validation_error:
+        st.error(f"Upload failed: {validation_error}")
+        return False
     filename = f"{doc_type_slug}_{customer_id}_{safe_original}"
     saved_path = save_uploaded_file(
         upload_file,
@@ -11876,7 +12174,7 @@ def _save_customer_document_upload(
         default_extension=".pdf",
     )
     if not saved_path:
-        st.error("Unable to save the uploaded file.")
+        st.error("Unable to save the uploaded file. Ensure the file type and size are supported.")
         return False
     try:
         stored_path = str(saved_path.relative_to(BASE_DIR))
@@ -11884,11 +12182,12 @@ def _save_customer_document_upload(
         stored_path = str(saved_path)
 
     uploader_id = current_user_id()
-    conn.execute(
+    upload_meta = _extract_upload_metadata(upload_file, saved_path)
+    cur = conn.execute(
         """
         INSERT INTO customer_documents (
-            customer_id, doc_type, file_path, original_name, uploaded_by
-        ) VALUES (?, ?, ?, ?, ?)
+            customer_id, doc_type, file_path, original_name, uploaded_by, file_size, mime_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(customer_id),
@@ -11896,7 +12195,19 @@ def _save_customer_document_upload(
             stored_path,
             safe_original,
             uploader_id,
+            upload_meta.get("file_size"),
+            upload_meta.get("mime_type"),
         ),
+    )
+    document_id = cur.lastrowid
+    size_label = _format_bytes(upload_meta.get("file_size"))
+    log_activity(
+        conn,
+        event_type="document_uploaded",
+        description=f"{doc_type} upload: {safe_original} ({size_label}, {upload_meta.get('mime_type')})",
+        entity_type="customer_document",
+        entity_id=document_id,
+        user_id=uploader_id,
     )
 
     new_product_labels: list[str] = []
@@ -11904,6 +12215,14 @@ def _save_customer_document_upload(
         receipt_path = None
         receipt_upload = details.get("receipt_upload")
         if receipt_upload is not None:
+            receipt_error = _validate_upload(
+                receipt_upload,
+                allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
+                max_bytes=MAX_UPLOAD_BYTES,
+            )
+            if receipt_error:
+                st.error(f"Receipt upload failed: {receipt_error}")
+                return False
             safe_ref = _sanitize_path_component(
                 clean_text(details.get("reference")) or f"quotation_{customer_id}"
             )
@@ -11943,12 +12262,28 @@ def _save_customer_document_upload(
         if status_value == "advanced" and advance_receipt_upload is not None:
             receipt_upload = advance_receipt_upload
         if receipt_upload is not None:
+            receipt_error = _validate_upload(
+                receipt_upload,
+                allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
+                max_bytes=MAX_UPLOAD_BYTES,
+            )
+            if receipt_error:
+                st.error(f"Receipt upload failed: {receipt_error}")
+                return False
             receipt_path = store_payment_receipt(
                 receipt_upload,
                 identifier=f"{_sanitize_path_component(do_number)}_receipt",
                 target_dir=DELIVERY_RECEIPT_DIR,
             )
         if advance_receipt_upload is not None:
+            advance_error = _validate_upload(
+                advance_receipt_upload,
+                allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
+                max_bytes=MAX_UPLOAD_BYTES,
+            )
+            if advance_error:
+                st.error(f"Advance receipt upload failed: {advance_error}")
+                return False
             advance_path = store_payment_receipt(
                 advance_receipt_upload,
                 identifier=f"{_sanitize_path_component(do_number)}_advance_receipt",
@@ -11958,8 +12293,8 @@ def _save_customer_document_upload(
                 conn.execute(
                     """
                     INSERT INTO customer_documents (
-                        customer_id, doc_type, file_path, original_name, uploaded_by
-                    ) VALUES (?, ?, ?, ?, ?)
+                        customer_id, doc_type, file_path, original_name, uploaded_by, file_size, mime_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         int(customer_id),
@@ -11967,6 +12302,8 @@ def _save_customer_document_upload(
                         advance_path,
                         Path(advance_receipt_upload.name).name,
                         uploader_id,
+                        getattr(advance_receipt_upload, "size", None),
+                        _guess_upload_mime(Path(advance_receipt_upload.name).name),
                     ),
                 )
         items_clean, total_amount = normalize_simple_items(details.get("items") or [])
@@ -12013,6 +12350,14 @@ def _save_customer_document_upload(
         receipt_path = None
         receipt_upload = details.get("receipt_upload")
         if receipt_upload is not None:
+            receipt_error = _validate_upload(
+                receipt_upload,
+                allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
+                max_bytes=MAX_UPLOAD_BYTES,
+            )
+            if receipt_error:
+                st.error(f"Receipt upload failed: {receipt_error}")
+                return False
             receipt_path = store_payment_receipt(
                 receipt_upload,
                 identifier=f"{_sanitize_path_component(str(customer_id))}_service_receipt",
@@ -12044,10 +12389,16 @@ def _save_customer_document_upload(
         service_id = cur.lastrowid
         conn.execute(
             """
-            INSERT INTO service_documents (service_id, file_path, original_name)
-            VALUES (?, ?, ?)
+            INSERT INTO service_documents (service_id, file_path, original_name, file_size, mime_type)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (service_id, stored_path, safe_original),
+            (
+                service_id,
+                stored_path,
+                safe_original,
+                upload_meta.get("file_size"),
+                upload_meta.get("mime_type"),
+            ),
         )
     elif doc_type == "Maintenance":
         items_clean, total_amount = normalize_simple_items(details.get("items") or [])
@@ -12057,6 +12408,14 @@ def _save_customer_document_upload(
         receipt_path = None
         receipt_upload = details.get("receipt_upload")
         if receipt_upload is not None:
+            receipt_error = _validate_upload(
+                receipt_upload,
+                allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
+                max_bytes=MAX_UPLOAD_BYTES,
+            )
+            if receipt_error:
+                st.error(f"Receipt upload failed: {receipt_error}")
+                return False
             receipt_path = store_payment_receipt(
                 receipt_upload,
                 identifier=f"{_sanitize_path_component(str(customer_id))}_maintenance_receipt",
@@ -12088,10 +12447,16 @@ def _save_customer_document_upload(
         maintenance_id = cur.lastrowid
         conn.execute(
             """
-            INSERT INTO maintenance_documents (maintenance_id, file_path, original_name)
-            VALUES (?, ?, ?)
+            INSERT INTO maintenance_documents (maintenance_id, file_path, original_name, file_size, mime_type)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (maintenance_id, stored_path, safe_original),
+            (
+                maintenance_id,
+                stored_path,
+                safe_original,
+                upload_meta.get("file_size"),
+                upload_meta.get("mime_type"),
+            ),
         )
     elif doc_type == "Other":
         items_clean = details.get("items") or []
@@ -12099,8 +12464,8 @@ def _save_customer_document_upload(
         conn.execute(
             """
             INSERT INTO operations_other_documents (
-                customer_id, description, items_payload, file_path, original_name, uploaded_by
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                customer_id, description, items_payload, file_path, original_name, uploaded_by, file_size, mime_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(customer_id),
@@ -12109,6 +12474,8 @@ def _save_customer_document_upload(
                 stored_path,
                 safe_original,
                 uploader_id,
+                upload_meta.get("file_size"),
+                upload_meta.get("mime_type"),
             ),
         )
 
@@ -12366,11 +12733,21 @@ def render_customer_document_uploader(
         uploaded_at = pd.to_datetime(row.get("uploaded_at"), errors="coerce")
         suffix = f" ({uploaded_at.strftime('%d-%m-%Y')})" if pd.notna(uploaded_at) else ""
         if path and path.exists():
-            st.download_button(
-                f"{doc_type}: {label}{suffix}",
-                data=path.read_bytes(),
-                file_name=path.name,
-                key=f"{key_prefix}_download_{int(row['document_id'])}",
+            file_label = f"{doc_type}: {label}{suffix}"
+            cols = st.columns([0.75, 0.25])
+            with cols[0]:
+                st.download_button(
+                    file_label,
+                    data=path.read_bytes(),
+                    file_name=path.name,
+                    key=f"{key_prefix}_download_{int(row['document_id'])}",
+                )
+            with cols[1]:
+                st.caption(_format_bytes(path.stat().st_size))
+            render_upload_preview(
+                path,
+                label=file_label,
+                key_prefix=f"{key_prefix}_preview_{int(row['document_id'])}",
             )
         else:
             st.caption(f"{doc_type}: {label}{suffix} (file missing)")
@@ -13101,6 +13478,11 @@ def render_operations_document_uploader(
                         data=path.read_bytes(),
                         file_name=path.name,
                         key=f"{key_prefix}_other_download_{int(row['document_id'])}",
+                    )
+                    render_upload_preview(
+                        path,
+                        label=label,
+                        key_prefix=f"{key_prefix}_other_preview_{int(row['document_id'])}",
                     )
         st.markdown("#### Edit or delete other uploads")
         other_records = other_df.to_dict("records")
@@ -19605,8 +19987,8 @@ def delivery_orders_page(
                     conn.execute(
                         """
                         INSERT INTO customer_documents (
-                            customer_id, doc_type, file_path, original_name, uploaded_by
-                        ) VALUES (?, ?, ?, ?, ?)
+                            customer_id, doc_type, file_path, original_name, uploaded_by, file_size, mime_type
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             int(selected_customer),
@@ -19614,6 +19996,8 @@ def delivery_orders_page(
                             advance_receipt_path,
                             resolved_advance.name,
                             current_user_id(),
+                            resolved_advance.stat().st_size if resolved_advance.exists() else None,
+                            _guess_upload_mime(resolved_advance.name),
                         ),
                     )
             if receipt_only_update:
@@ -24275,6 +24659,182 @@ def reports_page(conn):
                 )
                 st.caption(f"Logged on {created_label} • Last updated {updated_label}")
 
+
+def _path_status(path: Path) -> dict[str, object]:
+    exists = path.exists()
+    writable = False
+    last_modified = ""
+    if exists:
+        try:
+            test_file = path / ".write_test" if path.is_dir() else path
+            if path.is_dir():
+                test_file.write_text("ok", encoding="utf-8")
+                test_file.unlink(missing_ok=True)
+            writable = True
+        except OSError:
+            writable = False
+        try:
+            ts = path.stat().st_mtime
+            last_modified = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except OSError:
+            last_modified = ""
+    return {
+        "path": str(path),
+        "exists": exists,
+        "writable": writable,
+        "last_modified": last_modified or "n/a",
+    }
+
+
+def render_system_diagnostics(conn) -> None:
+    st.title("System Diagnostics")
+    st.caption("DEBUG_DIAG is enabled. Diagnostics run without login.")
+
+    system_info = {
+        "cwd": os.getcwd(),
+        "project_root": str(PROJECT_ROOT),
+        "db_path": str(DB_PATH),
+        "storage_dir": str(BASE_DIR),
+        "git_commit": _get_git_commit(),
+        "debug_diag": str(_debug_diag_enabled()),
+    }
+    st.subheader("System info")
+    st.json(system_info)
+
+    env_keys = [
+        "APP_STORAGE_DIR",
+        "DB_PATH",
+        "PS_CRM_BACKUP_RETENTION",
+        "PS_CRM_BACKUP_MIRROR_DIR",
+        "PS_MAX_UPLOAD_MB",
+        "DEBUG_DIAG",
+    ]
+    env_rows = [{"key": key, "value": os.getenv(key, "")} for key in env_keys]
+    st.subheader("Environment variables")
+    st.table(env_rows)
+
+    st.subheader("Streamlit theme")
+    st.json(
+        {
+            "theme.base": st.get_option("theme.base"),
+            "theme.textColor": st.get_option("theme.textColor"),
+            "theme.backgroundColor": st.get_option("theme.backgroundColor"),
+            "theme.secondaryBackgroundColor": st.get_option("theme.secondaryBackgroundColor"),
+        }
+    )
+
+    st.subheader("Storage paths")
+    paths = [
+        _path_status(BASE_DIR),
+        _path_status(BACKUP_DIR),
+        _path_status(UPLOADS_DIR),
+        _path_status(Path(DB_PATH)),
+    ]
+    st.table(paths)
+
+    st.subheader("Data version counters")
+    version_rows = []
+    for key in ("customers", "quotations", "operations"):
+        version_rows.append({"key": key, "version": get_data_version(conn, key)})
+    st.table(version_rows)
+
+    st.subheader("Database integrity checks")
+    check_cols = st.columns(2)
+    if check_cols[0].button("Run read checks", use_container_width=True):
+        try:
+            customer_count = int(
+                df_query(conn, "SELECT COUNT(*) c FROM customers").iloc[0]["c"]
+            )
+            quote_count = int(
+                df_query(conn, "SELECT COUNT(*) c FROM quotations").iloc[0]["c"]
+            )
+            st.success(
+                f"Read check OK • customers={customer_count} • quotations={quote_count}"
+            )
+        except Exception as exc:
+            st.error(f"Read check failed: {exc}")
+    if check_cols[1].button("Run write dry-run", use_container_width=True):
+        temp_name = f"diag-{uuid.uuid4().hex[:8]}"
+        try:
+            conn.execute("SAVEPOINT diag")
+            conn.execute(
+                "INSERT INTO customers (name, phone, address, dup_flag) VALUES (?, ?, ?, 0)",
+                (temp_name, f"000-{temp_name}", "Diagnostics"),
+            )
+            conn.execute("ROLLBACK TO diag")
+            conn.execute("RELEASE diag")
+            st.success("Write dry-run OK (inserted + rolled back).")
+        except Exception as exc:
+            st.error(f"Write dry-run failed: {exc}")
+
+    st.subheader("Upload diagnostics")
+    st.caption(f"Max upload size: {_format_bytes(MAX_UPLOAD_BYTES)}")
+    diag_upload = st.file_uploader(
+        "Upload a PDF or image to verify preview/download",
+        type=["pdf", "png", "jpg", "jpeg", "webp", "gif"],
+        key="diag_upload_file",
+    )
+    if diag_upload is not None:
+        if st.button("Save diagnostic upload", key="diag_upload_save"):
+            validation_error = _validate_upload(
+                diag_upload,
+                allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"},
+                max_bytes=MAX_UPLOAD_BYTES,
+            )
+            if validation_error:
+                st.error(validation_error)
+            else:
+                diag_dir = UPLOADS_DIR / "diagnostics"
+                diag_dir.mkdir(parents=True, exist_ok=True)
+                saved_path = save_uploaded_file(
+                    diag_upload,
+                    diag_dir,
+                    filename=diag_upload.name,
+                    allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"},
+                    default_extension=".pdf",
+                )
+                if saved_path:
+                    st.success(f"Saved to {saved_path}")
+                    render_upload_preview(
+                        saved_path,
+                        label=saved_path.name,
+                        key_prefix="diag_upload_preview",
+                    )
+                else:
+                    st.error("Failed to save diagnostic upload.")
+
+    st.subheader("Backup diagnostics")
+    backup_cols = st.columns(2)
+    if backup_cols[0].button("Create diagnostic backup", use_container_width=True):
+        try:
+            archive_bytes = export_full_archive(conn)
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
+                contents = zf.namelist()
+                has_database = any(item.startswith("database/") for item in contents)
+            st.success(
+                f"Backup created with {len(contents)} entries. "
+                f"Database included: {has_database}"
+            )
+        except Exception as exc:
+            st.error(f"Backup failed: {exc}")
+    if backup_cols[1].button("Dry-run restore latest backup", use_container_width=True):
+        backups = sorted(BACKUP_DIR.glob("ps_crm_backup_*.zip"), key=lambda p: p.stat().st_mtime)
+        if not backups:
+            st.warning("No backups found.")
+        else:
+            latest = backups[-1]
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with zipfile.ZipFile(latest, "r") as zf:
+                        zf.extractall(tmpdir)
+                    db_candidates = list(Path(tmpdir).rglob("*.db"))
+                st.success(
+                    f"Dry-run restore OK • extracted {latest.name} • "
+                    f"db files found: {len(db_candidates)}"
+                )
+            except Exception as exc:
+                st.error(f"Dry-run restore failed: {exc}")
+
 # ---------- Main ----------
 def main():
     st.session_state["_render_id"] = st.session_state.get("_render_id", 0) + 1
@@ -24301,10 +24861,13 @@ def main():
         logger.warning("Automatic backup failed: %s", backup_error)
     st.session_state["health_warnings"] = run_health_checks(conn)
     _restore_user_session(conn)
-    login_box(conn, render_id=render_id)
-    # Auth gate: stop rendering any dashboard/navigation without a user session.
-    if not st.session_state.get("user"):
-        st.stop()
+    if _debug_diag_enabled():
+        _ensure_debug_user(conn)
+    else:
+        login_box(conn, render_id=render_id)
+        # Auth gate: stop rendering any dashboard/navigation without a user session.
+        if not st.session_state.get("user"):
+            st.stop()
     _touch_session(conn, st.session_state.get("session_token"))
 
     if "page" not in st.session_state:
@@ -24337,6 +24900,8 @@ def main():
             "Warranties",
             "Reports",
         ]
+    if _debug_diag_enabled():
+        pages.append("System Diagnostics")
 
     if "nav_page" not in st.session_state:
         st.session_state["nav_page"] = st.session_state.get("page", pages[0])
@@ -24390,6 +24955,8 @@ def main():
     with st.sidebar:
         apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
         st.markdown("### Navigation")
+        if _debug_diag_enabled():
+            st.warning("DEBUG_DIAG enabled: login bypassed.")
         if st.button("Hide menu", key="sidebar_hide_menu", use_container_width=True):
             st.session_state["sidebar_hidden"] = True
             st.rerun()
@@ -24433,6 +25000,8 @@ def main():
         reports_page(conn)
     elif page == "Users (Admin)":
         users_admin_page(conn)
+    elif page == "System Diagnostics":
+        render_system_diagnostics(conn)
 
 if __name__ == "__main__":
     if _streamlit_runtime_active():

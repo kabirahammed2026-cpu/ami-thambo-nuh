@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import os
 import sqlite3
+import mimetypes
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
@@ -34,6 +35,7 @@ class AppConfig:
     login_max_attempts: int
     login_lockout_minutes: int
     pre_due_warning_days: int
+    max_upload_bytes: int
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +83,18 @@ def load_config() -> AppConfig:
     except ValueError:
         retention = None
 
-    allowed_mime_types = os.getenv("PS_SALES_ALLOWED_MIME", "application/pdf")
+    allowed_mime_types = os.getenv(
+        "PS_SALES_ALLOWED_MIME",
+        "application/pdf,image/png,image/jpeg,image/webp",
+    )
     mime_tuple: Sequence[str] = tuple(
         m.strip() for m in allowed_mime_types.split(",") if m.strip()
     )
+    max_upload_env = os.getenv("PS_SALES_MAX_UPLOAD_MB", "25")
+    try:
+        max_upload_bytes = int(float(max_upload_env) * 1024 * 1024)
+    except ValueError:
+        max_upload_bytes = 25 * 1024 * 1024
 
     return AppConfig(
         data_dir=data_dir,
@@ -95,6 +105,7 @@ def load_config() -> AppConfig:
         login_max_attempts=_int_env("PS_SALES_LOGIN_MAX_ATTEMPTS", 5),
         login_lockout_minutes=_int_env("PS_SALES_LOGIN_LOCKOUT_MINUTES", 15),
         pre_due_warning_days=_int_env("PS_SALES_PRE_DUE_WARNING_DAYS", 3),
+        max_upload_bytes=max_upload_bytes,
     )
 
 
@@ -281,6 +292,16 @@ class UploadManager:
         filename = self._safe_name(getattr(uploaded_file, "name", "upload"))
         target_path = target_dir / filename
         data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        size = len(data)
+        if size > self.config.max_upload_bytes:
+            raise ValueError(
+                f"File exceeds {self.config.max_upload_bytes} bytes size limit."
+            )
+        mime_type, _ = mimetypes.guess_type(filename)
+        if self.config.allowed_mime_types:
+            allowed = {m.strip() for m in self.config.allowed_mime_types if m.strip()}
+            if mime_type not in allowed:
+                raise ValueError(f"Unsupported MIME type: {mime_type or 'unknown'}")
         with open(target_path, "wb") as f:
             f.write(data)
         return str(target_path.relative_to(self.config.data_dir))
