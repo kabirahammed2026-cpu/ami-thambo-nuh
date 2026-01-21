@@ -22300,6 +22300,22 @@ def import_page(conn):
     for column in preview_text_columns:
         if column in preview.columns:
             preview[column] = preview[column].fillna("").astype(str)
+    def format_date_for_editor(value):
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        if isinstance(value, (pd.Timestamp, datetime, date)):
+            return value.strftime("%Y-%m-%d")
+        return str(value)
+
+    date_columns = ["date", "purchase_date", "follow_up_date"]
+    for column in date_columns:
+        if column in preview.columns:
+            preview[column] = preview[column].apply(format_date_for_editor)
     _debug_dataframe_probe(preview, "Import review editor")
     editor = st.data_editor(
         preview,

@@ -2912,13 +2912,15 @@ def apply_theme_styles() -> None:
             -webkit-text-fill-color: var(--text-color) !important;
         }}
         .ps-quick-nav {{
+            position: -webkit-sticky;
             position: sticky;
             top: 0.5rem;
-            z-index: 1000;
+            z-index: 2200;
             display: flex;
             justify-content: flex-end;
             padding: 0.25rem 0;
-            background-color: #ffffff;
+            width: 100%;
+            background-color: var(--secondary-background-color);
         }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
