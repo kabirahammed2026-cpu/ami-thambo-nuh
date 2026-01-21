@@ -324,6 +324,22 @@ SERVICE_REPORT_FIELDS = OrderedDict(
             },
         ),
         (
+            "company_name",
+            {
+                "label": "Company Name",
+                "type": "text",
+                "help": "Company or organization for the customer.",
+            },
+        ),
+        (
+            "address",
+            {
+                "label": "Address",
+                "type": "text",
+                "help": "Customer location or delivery address.",
+            },
+        ),
+        (
             "reported_complaints",
             {
                 "label": "Reported Complaints",
@@ -636,6 +652,7 @@ def _normalize_header(value: str) -> str:
 
 REPORT_COLUMN_ALIASES = {
     "customer_name": ["customer", "client", "client_name", "company", "name"],
+    "company_name": ["company_name", "company name", "organization", "business"],
     "reported_complaints": ["complaints", "issues", "issue", "problem"],
     "product_details": [
         "product",
@@ -1509,26 +1526,43 @@ END;
 
 # ---------- Helpers ----------
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=60)
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA busy_timeout = 30000;")
+    conn.execute("PRAGMA busy_timeout = 60000;")
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA temp_store = MEMORY;")
     conn.execute("PRAGMA cache_size = -20000;")
     return conn
 
+
+def _begin_immediate_with_retry(
+    conn: sqlite3.Connection, *, attempts: int = 6, base_delay: float = 0.5
+) -> None:
+    for attempt in range(attempts):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            time.sleep(base_delay * (attempt + 1))
+
+
 def init_schema(conn):
     ensure_upload_dirs()
     for attempt in range(5):
         try:
             conn.executescript(SCHEMA_SQL)
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_immediate_with_retry(conn)
             ensure_schema_upgrades(conn)
             conn.commit()
             break
         except sqlite3.OperationalError as exc:
-            conn.rollback()
+            if conn.in_transaction:
+                conn.rollback()
             if "locked" not in str(exc).lower() or attempt == 4:
                 raise
             time.sleep(0.5 * (attempt + 1))
@@ -15839,7 +15873,11 @@ def warranties_page(conn):
                    p.model,
                    w.serial,
                    w.expiry_date,
-                   w.remarks
+                   w.remarks,
+                   w.follow_up_status,
+                   w.follow_up_notes,
+                   w.follow_up_date,
+                   w.follow_up_history
             FROM warranties w
             LEFT JOIN customers c ON c.customer_id = w.customer_id
             LEFT JOIN products p ON p.product_id = w.product_id
@@ -15944,6 +15982,18 @@ def warranties_page(conn):
                 combined_remarks = f"{existing_remarks}\n{note_value}"
             else:
                 combined_remarks = existing_remarks or note_value
+            follow_up_status = "pending" if reminder_iso else "done"
+            follow_up_history = clean_text(selected_record.get("follow_up_history")) or ""
+            history_entry = _build_follow_up_history_entry(
+                follow_up_date=reminder_iso,
+                follow_up_notes=note_value,
+            )
+            if history_entry:
+                follow_up_history = (
+                    f"{follow_up_history}\n{history_entry}"
+                    if follow_up_history
+                    else history_entry
+                )
             cur = conn.execute(
                 "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
                 (int(selected_record["customer_id"]), tagged_note, reminder_iso),
@@ -15965,8 +16015,23 @@ def warranties_page(conn):
                     message=message,
                 )
             conn.execute(
-                "UPDATE warranties SET remarks=? WHERE warranty_id=?",
-                (combined_remarks, int(selected_warranty)),
+                """
+                UPDATE warranties
+                SET remarks=?,
+                    follow_up_status=?,
+                    follow_up_notes=?,
+                    follow_up_date=?,
+                    follow_up_history=?
+                WHERE warranty_id=?
+                """,
+                (
+                    combined_remarks,
+                    follow_up_status,
+                    note_value,
+                    reminder_iso,
+                    follow_up_history or None,
+                    int(selected_warranty),
+                ),
             )
             conn.commit()
             st.success("Warranty reminder saved.")
