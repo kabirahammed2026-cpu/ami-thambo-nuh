@@ -4261,7 +4261,6 @@ def _reset_new_customer_form_state() -> None:
         "new_customer_address",
         "new_customer_delivery_address",
         "new_customer_purchase_date",
-        "new_customer_purchase_date_enabled",
         "new_customer_do_code",
         "new_customer_sales_person",
         "new_customer_remarks",
@@ -11387,6 +11386,7 @@ def render_customer_quick_edit_section(
             key=purchase_key,
             label_visibility="collapsed",
             disabled=not is_admin,
+            placeholder="Leave blank if no purchase date is needed.",
             help="Only admins can edit the purchase date.",
         )
         row_cols[row_idx + 7].text_input(
@@ -14403,21 +14403,14 @@ def customers_page(conn):
                 purchase_default = purchase_default.date()
             if not isinstance(purchase_default, date):
                 purchase_default = None
-            purchase_date_enabled = st.checkbox(
-                "Set purchase date",
-                value=bool(purchase_default),
-                key="new_customer_purchase_date_enabled",
-                help="Enable this if the customer has already purchased.",
+            purchase_date = render_flexible_date_input(
+                "Purchase date",
+                value=purchase_default,
+                key="new_customer_purchase_date",
+                help="Used as the warranty issue date when creating new warranty records.",
+                placeholder="Leave blank if no purchase date is needed.",
             )
-            purchase_date = None
-            if purchase_date_enabled:
-                purchase_date = render_flexible_date_input(
-                    "Purchase date",
-                    value=purchase_default or datetime.now().date(),
-                    key="new_customer_purchase_date",
-                    help="Used as the warranty issue date when creating new warranty records.",
-                )
-            else:
+            if not clean_text(st.session_state.get("new_customer_purchase_date__raw")):
                 st.session_state["new_customer_purchase_date"] = None
             remarks = st.text_area(
                 "Remarks",
@@ -15335,7 +15328,9 @@ def customers_page(conn):
                     value=clean_text(selected_raw.get("remarks")) or "",
                 )
                 purchase_edit = st.text_input(
-                    "Purchase date (YYYY-MM-DD)", value=clean_text(selected_fmt.get("purchase_date")) or ""
+                    "Purchase date (YYYY-MM-DD)",
+                    value=clean_text(selected_fmt.get("purchase_date")) or "",
+                    placeholder="Leave blank if no purchase date is needed.",
                 )
                 product_edit = st.text_input("Product", value=clean_text(selected_raw.get("product_info")) or "")
                 do_edit = st.text_input(
@@ -21663,7 +21658,11 @@ def scraps_page(conn):
             name = st.text_input("Name", existing_value("name"))
             phone = st.text_input("Phone", existing_value("phone"))
             address = st.text_area("Address", existing_value("address"))
-            purchase = st.text_input("Purchase date (YYYY-MM-DD)", existing_value("purchase_date"))
+            purchase = st.text_input(
+                "Purchase date (YYYY-MM-DD)",
+                existing_value("purchase_date"),
+                placeholder="Leave blank if no purchase date is needed.",
+            )
             product = st.text_input("Product", existing_value("product_info"))
             do_code = st.text_input("Delivery order code", existing_value("delivery_order_code"))
             remarks_text = st.text_area("Remarks", existing_value("remarks"))
@@ -21923,15 +21922,15 @@ def _has_time_component(text: str) -> bool:
 def parse_human_date(value: object) -> Optional[datetime]:
     if value is None:
         return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, date):
-        return datetime.combine(value, dt_time.min)
     try:
         if pd.isna(value):
             return None
     except Exception:
         pass
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, dt_time.min)
     if isinstance(value, str):
         cleaned = value.strip()
         if not cleaned:
@@ -22809,6 +22808,7 @@ def duplicates_page(conn):
                     value=purchase_date_label,
                     key=purchase_key,
                     label_visibility="collapsed",
+                    placeholder="Leave blank if no purchase date is needed.",
                 )
                 row_cols[8].text_input(
                     "Product",
@@ -24098,7 +24098,11 @@ def manage_import_history(conn):
         delivery_address_input = st.text_area(
             "Delivery address", value=current_delivery_address
         )
-        purchase_input = st.text_input("Purchase date (YYYY-MM-DD)", value=purchase_str)
+        purchase_input = st.text_input(
+            "Purchase date (YYYY-MM-DD)",
+            value=purchase_str,
+            placeholder="Leave blank if no purchase date is needed.",
+        )
         product_input = st.text_input("Product", value=current_product)
         do_input = st.text_input("Delivery order code", value=current_do)
         remarks_input = st.text_area(
