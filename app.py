@@ -20,7 +20,7 @@ import zipfile
 import subprocess
 import tempfile
 from calendar import monthrange
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dt_time
 from functools import partial
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
@@ -29,6 +29,7 @@ import urllib.parse
 from dotenv import load_dotenv
 from textwrap import dedent
 import pandas as pd
+import dateparser
 from PIL import Image, ImageOps, ImageEnhance
 from pypdf import PdfReader
 import pytesseract
@@ -69,6 +70,9 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "ps_crm.db"))
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATE_FMT = "%d-%m-%Y"
+INPUT_DATE_FMT = "%Y-%m-%d"
+DATE_INPUT_PLACEHOLDER = "YYYY-MM-DD or 'tomorrow', 'next friday', 'in 3 days'"
+DEFAULT_REMINDER_TIME = dt_time(9, 0)
 CURRENCY_SYMBOL = os.getenv("APP_CURRENCY_SYMBOL", "৳")
 BACKUP_DIR = BASE_DIR / "backups"
 BACKUP_RETENTION_COUNT = int(os.getenv("PS_CRM_BACKUP_RETENTION", "12"))
@@ -790,7 +794,7 @@ def _build_report_column_config(
         elif config.get("type") == "date":
             column_config[key] = st.column_config.TextColumn(
                 label,
-                help=help_text or "Enter any date format; we'll standardize to DD-MM-YYYY.",
+                help=help_text or "Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
             )
         elif config.get("type") == "select":
             column_config[key] = st.column_config.SelectboxColumn(
@@ -1205,6 +1209,19 @@ CREATE TABLE IF NOT EXISTS customer_notes (
 );
 CREATE INDEX IF NOT EXISTS idx_customer_notes_customer ON customer_notes(customer_id);
 CREATE INDEX IF NOT EXISTS idx_customer_notes_remind ON customer_notes(remind_on, is_done);
+CREATE TABLE IF NOT EXISTS reminders (
+    reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id INTEGER NOT NULL,
+    remind_at TEXT NOT NULL,
+    message TEXT,
+    status TEXT DEFAULT 'pending',
+    source_text TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_reminders_entity ON reminders(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_reminders_remind_at ON reminders(remind_at, status);
 CREATE TABLE IF NOT EXISTS customer_documents (
     document_id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER NOT NULL,
@@ -3279,6 +3296,9 @@ def to_iso_date(value) -> Optional[str]:
         if not stripped:
             return None
         value = stripped
+    parsed = parse_human_date(value)
+    if parsed is not None:
+        return parsed.date().strftime("%Y-%m-%d")
     try:
         if pd.isna(value):
             return None
@@ -3308,10 +3328,14 @@ def render_flexible_date_input(
     key: Optional[str] = None,
     help: Optional[str] = None,
     disabled: bool = False,
-    placeholder: str = "DD-MM-YYYY",
+    placeholder: str = DATE_INPUT_PLACEHOLDER,
 ) -> Optional[date]:
     parsed_seed = parse_date_value(value)
-    default_text = parsed_seed.strftime(DATE_FMT) if parsed_seed is not None else (clean_text(value) or "")
+    default_text = (
+        parsed_seed.strftime(INPUT_DATE_FMT)
+        if parsed_seed is not None
+        else (clean_text(value) or "")
+    )
     existing = st.session_state.get(key) if key else None
     text_value = existing if existing is not None else default_text
     text_value = "" if text_value is None else str(text_value)
@@ -3324,14 +3348,19 @@ def render_flexible_date_input(
         disabled=disabled,
         placeholder=placeholder,
     )
-    parsed = parse_date_value(text)
-    if parsed is not None:
-        normalized = parsed.strftime(DATE_FMT)
-        if text != normalized:
-            if key:
-                st.session_state[key] = normalized
-            text = normalized
-    return parsed.date() if parsed is not None else None
+    if key:
+        st.session_state[f"{key}__raw"] = text
+    parsed = parse_human_date(text)
+    if parsed is None:
+        if text:
+            st.error(
+                "Enter a valid date such as YYYY-MM-DD, 'tomorrow', 'next friday', or 'in 3 days'."
+            )
+        return None
+    normalized = parsed.strftime(INPUT_DATE_FMT)
+    if text != normalized and key:
+        st.session_state[key] = normalized
+    return parsed.date()
 
 
 def render_flexible_date_range(
@@ -5978,8 +6007,15 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         [data-testid="stNumberInput"] input,
         [data-testid="stTimeInput"] input {{
             background-color: var(--ps-input-bg);
-            border-color: var(--ps-input-border);
+            border: 1px solid var(--ps-input-border);
             color: var(--ps-text);
+            padding: 0.55rem 0.75rem;
+            border-radius: 0.5rem;
+        }}
+        [data-testid="stTextArea"] textarea::placeholder,
+        [data-testid="stTextInput"] input::placeholder {{
+            color: var(--ps-muted);
+            opacity: 1;
         }}
         [data-testid="stSelectbox"] [data-baseweb="select"] > div,
         [data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
@@ -10807,10 +10843,14 @@ def _render_notification_section(
 def _render_notification_body(
     alerts: list[dict[str, object]],
     activity: list[dict[str, object]],
+    reminders: list[dict[str, object]],
 ) -> None:
-    if not alerts and not activity:
+    if not alerts and not activity and not reminders:
         st.caption("No notifications yet. Updates will appear here as your team works.")
         return
+    _render_notification_section(reminders, heading="Reminders")
+    if reminders and (alerts or activity):
+        st.divider()
     _render_notification_section(alerts, heading="Alerts")
     if alerts and activity:
         st.divider()
@@ -10827,8 +10867,9 @@ def render_notification_bell(conn) -> None:
     user_id = current_user_id()
     alerts.extend(_build_staff_alerts(conn, user_id=user_id))
     activity = fetch_activity_feed(conn, limit=ACTIVITY_FEED_LIMIT) if is_admin else []
+    reminders = _build_reminder_alerts(conn)
 
-    total = len(alerts) + len(activity)
+    total = len(alerts) + len(activity) + len(reminders)
     label = "🔔" if total == 0 else f"🔔 {total}"
     container = st.container()
     with container:
@@ -10841,10 +10882,10 @@ def render_notification_bell(conn) -> None:
         popover = getattr(st, "popover", None)
         if callable(popover):
             with popover(label, help="View alerts and staff activity", use_container_width=True):
-                _render_notification_body(alerts, activity)
+                _render_notification_body(alerts, activity, reminders)
         else:
             with st.expander(f"{label} Notifications", expanded=False):
-                _render_notification_body(alerts, activity)
+                _render_notification_body(alerts, activity, reminders)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -11801,7 +11842,7 @@ def _render_doc_detail_inputs(
             "Quotation date",
             value=default_purchase_date or date.today(),
             key=f"{key_prefix}_quotation_date",
-            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
         )
         details["payment_status"] = st.selectbox(
             "Payment status",
@@ -11951,7 +11992,7 @@ def _render_doc_detail_inputs(
             "Service date",
             value=date.today(),
             key=f"{key_prefix}_service_date",
-            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
         )
         details["description"] = st.text_area(
             "Service description",
@@ -12023,7 +12064,7 @@ def _render_doc_detail_inputs(
             "Maintenance date",
             value=date.today(),
             key=f"{key_prefix}_maintenance_date",
-            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
         )
         details["description"] = st.text_area(
             "Maintenance description",
@@ -14576,7 +14617,7 @@ def customers_page(conn):
                             "Service date",
                             value=service_date_default,
                             key="new_customer_service_date",
-                            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
                         )
                     service_description = service_cols[1].text_area(
                         "Service description",
@@ -14609,7 +14650,7 @@ def customers_page(conn):
                             "Maintenance date",
                             value=maintenance_date_default,
                             key="new_customer_maintenance_date",
-                            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
                         )
                     maintenance_description = maintenance_cols[1].text_area(
                         "Maintenance description",
@@ -15285,7 +15326,7 @@ def customers_page(conn):
                     value=clean_text(selected_raw.get("remarks")) or "",
                 )
                 purchase_edit = st.text_input(
-                    "Purchase date (DD-MM-YYYY)", value=clean_text(selected_fmt.get("purchase_date")) or ""
+                    "Purchase date (YYYY-MM-DD)", value=clean_text(selected_fmt.get("purchase_date")) or ""
                 )
                 product_edit = st.text_input("Product", value=clean_text(selected_raw.get("product_info")) or "")
                 do_edit = st.text_input(
@@ -15420,7 +15461,7 @@ def customers_page(conn):
                     value=default_date,
                     key=f"customer_note_reminder_{selected_customer_id}",
                     disabled=not enable_follow_up,
-                    help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                    help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
                 )
                 add_note = st.form_submit_button("Add remark", type="primary")
             if add_note:
@@ -15429,10 +15470,26 @@ def customers_page(conn):
                     st.error("Remark text is required.")
                 else:
                     reminder_value = to_iso_date(reminder_date) if enable_follow_up else None
-                    conn.execute(
+                    cur = conn.execute(
                         "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
                         (int(selected_customer_id), note_value, reminder_value),
                     )
+                    note_id = cur.lastrowid
+                    if note_id:
+                        follow_up_source = st.session_state.get(
+                            f"customer_note_reminder_{selected_customer_id}__raw"
+                        )
+                        message = f"Customer #{selected_customer_id} follow-up"
+                        if note_value:
+                            message = f"{message}: {note_value}"
+                        sync_follow_up_reminder(
+                            conn,
+                            entity_type="customer_note",
+                            entity_id=int(note_id),
+                            follow_up_text=follow_up_source,
+                            fallback_date=reminder_value,
+                            message=message,
+                        )
                     conn.commit()
                     st.success("Remark added.")
                     _safe_rerun()
@@ -15455,7 +15512,7 @@ def customers_page(conn):
                 }
                 editor_df = notes_df.copy()
                 editor_df["remind_on"] = editor_df["remind_on"].apply(
-                    lambda value: parse_date_value(value).strftime(DATE_FMT)
+                    lambda value: parse_date_value(value).strftime(INPUT_DATE_FMT)
                     if parse_date_value(value) is not None
                     else ""
                 )
@@ -15487,7 +15544,7 @@ def customers_page(conn):
                         "note": st.column_config.TextColumn("Remark"),
                         "remind_on": st.column_config.TextColumn(
                             "Reminder date",
-                            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
                         ),
                         "Done": st.column_config.CheckboxColumn("Completed"),
                         "created_at": st.column_config.DatetimeColumn(
@@ -15526,13 +15583,25 @@ def customers_page(conn):
                                     "DELETE FROM customer_notes WHERE note_id = ? AND customer_id = ?",
                                     (note_id, int(selected_customer_id)),
                                 )
+                                upsert_reminder(
+                                    conn,
+                                    entity_type="customer_note",
+                                    entity_id=note_id,
+                                    remind_at=None,
+                                )
                                 changes = True
                                 continue
                             new_note_text = clean_text(row.get("note"))
                             if not new_note_text:
                                 errors.append(f"Remark #{note_id} cannot be empty.")
                                 continue
-                            reminder_iso = to_iso_date(row.get("remind_on"))
+                            reminder_text = clean_text(row.get("remind_on"))
+                            if reminder_text and parse_human_date(reminder_text) is None:
+                                errors.append(
+                                    f"Remark #{note_id} has an invalid reminder date. Use YYYY-MM-DD or 'tomorrow'."
+                                )
+                                continue
+                            reminder_iso = to_iso_date(reminder_text)
                             completed_flag = bool(row.get("Done"))
                             original = notes_original[note_id]
                             original_note = clean_text(original.get("note"))
@@ -15557,6 +15626,15 @@ def customers_page(conn):
                                     note_id,
                                     int(selected_customer_id),
                                 ),
+                            )
+                            sync_follow_up_reminder(
+                                conn,
+                                entity_type="customer_note",
+                                entity_id=note_id,
+                                follow_up_text=clean_text(row.get("remind_on")),
+                                fallback_date=reminder_iso,
+                                message=f"Customer #{selected_customer_id} follow-up: {new_note_text}",
+                                status="done" if completed_flag else "pending",
                             )
                             changes = True
                         if errors:
@@ -15787,7 +15865,7 @@ def warranties_page(conn):
         reminder_date = render_flexible_date_input(
             "Reminder date",
             value=reminder_default,
-            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
             key=f"warranty_followup_reminder_{selected_warranty}",
         )
         submit_followup = st.form_submit_button("Save reminder", type="primary")
@@ -15804,10 +15882,26 @@ def warranties_page(conn):
                 combined_remarks = f"{existing_remarks}\n{note_value}"
             else:
                 combined_remarks = existing_remarks or note_value
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
                 (int(selected_record["customer_id"]), tagged_note, reminder_iso),
             )
+            note_id = cur.lastrowid
+            if note_id:
+                follow_up_source = st.session_state.get(
+                    f"warranty_followup_reminder_{selected_warranty}__raw"
+                )
+                message = f"Warranty #{selected_warranty} follow-up"
+                if note_value:
+                    message = f"{message}: {note_value}"
+                sync_follow_up_reminder(
+                    conn,
+                    entity_type="customer_note",
+                    entity_id=int(note_id),
+                    follow_up_text=follow_up_source,
+                    fallback_date=reminder_iso,
+                    message=message,
+                )
             conn.execute(
                 "UPDATE warranties SET remarks=? WHERE warranty_id=?",
                 (combined_remarks, int(selected_warranty)),
@@ -15838,6 +15932,7 @@ def warranties_page(conn):
     else:
         followup_rows: list[dict[str, object]] = []
         warranty_note_map: dict[int, list[int]] = {}
+        note_remind_on_map: dict[int, Optional[str]] = {}
         grouped_followups: dict[int, dict[str, object]] = {}
         for row in saved_followups.to_dict("records"):
             warranty_id, note_text = _parse_warranty_followup_note(row.get("note"))
@@ -15868,6 +15963,7 @@ def warranties_page(conn):
                 group["has_pending"] = True
             if note_id is not None:
                 warranty_note_map.setdefault(warranty_id, []).append(int(note_id))
+                note_remind_on_map[int(note_id)] = clean_text(row.get("remind_on"))
         for group in grouped_followups.values():
             history_entries = [entry for entry in group.get("Remarks history", []) if entry]
             group["Remarks history"] = "\n".join(history_entries)
@@ -15905,6 +16001,17 @@ def warranties_page(conn):
                 "UPDATE customer_notes SET is_done=? WHERE note_id=?",
                 updates,
             )
+            for is_done_value, note_id_value in updates:
+                remind_on_value = note_remind_on_map.get(int(note_id_value))
+                sync_follow_up_reminder(
+                    conn,
+                    entity_type="customer_note",
+                    entity_id=int(note_id_value),
+                    follow_up_text=remind_on_value,
+                    fallback_date=remind_on_value,
+                    message=None,
+                    status="done" if is_done_value else "pending",
+                )
         if warranty_updates:
             conn.executemany(
                 "UPDATE warranties SET status=? WHERE warranty_id=?",
@@ -16018,7 +16125,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 start_value=today,
                 end_value=today,
                 key_prefix="service_new_period_completed",
-                help="Enter start and end dates (any format). We'll standardize to DD-MM-YYYY.",
+                help="Enter start and end dates (any format). We'll standardize to YYYY-MM-DD.",
             )
         elif status_choice == "In progress":
             service_period_value = render_flexible_date_input(
@@ -17655,8 +17762,27 @@ def _update_quotation_records(
                 quotation_id,
             ),
         )
-        updated.append(quotation_id)
         reference_label = clean_text(current_reference) or f"Quotation #{quotation_id}"
+        if status_value == "paid":
+            sync_follow_up_reminder(
+                conn,
+                entity_type="quotation",
+                entity_id=quotation_id,
+                follow_up_text=None,
+                fallback_date=None,
+                message=None,
+                status="done",
+            )
+        else:
+            sync_follow_up_reminder(
+                conn,
+                entity_type="quotation",
+                entity_id=quotation_id,
+                follow_up_text=clean_text(entry.get("follow_up_date")),
+                fallback_date=follow_up_date,
+                message=f"{reference_label} follow-up",
+            )
+        updated.append(quotation_id)
         if status_value != current_status:
             receipt_note = " with receipt" if receipt_path and status_value == "paid" else ""
             log_activity(
@@ -17812,7 +17938,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 "Quotation date",
                 value=st.session_state.get("quotation_date") or default_date,
                 key="quotation_date",
-                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
             )
             customer_company = st.text_input(
                 "Customer name",
@@ -17845,6 +17971,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             "Delivery location / address",
             value=st.session_state.get("quotation_customer_address", ""),
             key="quotation_customer_address",
+            placeholder="Enter delivery location or full address",
         )
 
         quote_type = st.selectbox(
@@ -17901,6 +18028,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             "Special notes / terms & conditions",
             value=st.session_state.get("quotation_terms", ""),
             key="quotation_terms",
+            placeholder="Add terms, special notes, or delivery conditions",
         )
 
         st.markdown("#### Admin follow-up")
@@ -17935,13 +18063,13 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 )
                 if not isinstance(follow_up_raw, (date, datetime)):
                     st.session_state["quotation_follow_up_date"] = follow_up_default.strftime(
-                        DATE_FMT
+                        INPUT_DATE_FMT
                     )
                 follow_up_date_value = render_flexible_date_input(
                     "Next follow-up date",
                     value=follow_up_default,
                     key="quotation_follow_up_date",
-                    help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                    help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
                 )
             else:
                 st.session_state["quotation_follow_up_date"] = None
@@ -17951,6 +18079,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             value=st.session_state.get("quotation_follow_up_notes", ""),
             key="quotation_follow_up_notes",
             help="Internal notes that help admins continue the conversation.",
+            placeholder="Add follow-up notes, next steps, or reminders",
         )
 
         form_actions = st.columns((1, 1))
@@ -18121,6 +18250,23 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             "created_by": current_user_id(),
         }
         record_id = _save_quotation_record(conn, payload)
+        if record_id:
+            follow_up_source = st.session_state.get("quotation_follow_up_date__raw")
+            customer_label = clean_text(customer_company) or clean_text(customer_contact_name)
+            reference_label = clean_text(reference_value) or f"Quotation #{record_id}"
+            message = (
+                f"{reference_label} follow-up"
+                if not customer_label
+                else f"{reference_label} follow-up for {customer_label}"
+            )
+            sync_follow_up_reminder(
+                conn,
+                entity_type="quotation",
+                entity_id=int(record_id),
+                follow_up_text=follow_up_source,
+                fallback_date=follow_up_iso,
+                message=message,
+            )
         if any(
             clean_text(value)
             for value in (
@@ -18295,7 +18441,7 @@ def _render_quotation_management(conn):
         parsed = parse_date_value(value)
         if parsed is None:
             return None
-        return parsed.strftime(DATE_FMT)
+        return parsed.strftime(INPUT_DATE_FMT)
 
     quotes_df = quotes_df.copy()
     quotes_df["follow_up_date"] = quotes_df.get("follow_up_date", pd.Series(dtype=object)).apply(
@@ -18355,7 +18501,7 @@ def _render_quotation_management(conn):
         "follow_up_notes": st.column_config.TextColumn("Follow-up notes"),
         "follow_up_date": st.column_config.TextColumn(
             "Follow-up date",
-            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
         ),
         "reminder_label": st.column_config.TextColumn("Reminder"),
         "reference": st.column_config.TextColumn("Reference"),
@@ -18397,6 +18543,17 @@ def _render_quotation_management(conn):
         sanitized_records: list[dict[str, object]] = []
         for record in edited_records:
             sanitized_records.append(dict(record))
+        invalid_rows = [
+            record
+            for record in sanitized_records
+            if clean_text(record.get("follow_up_date"))
+            and parse_human_date(record.get("follow_up_date")) is None
+        ]
+        if invalid_rows:
+            st.error(
+                "Some follow-up dates are invalid. Use formats like YYYY-MM-DD, 'tomorrow', or 'next friday'."
+            )
+            return
         result = _update_quotation_records(
             conn,
             sanitized_records,
@@ -18490,13 +18647,14 @@ def _render_quotation_management(conn):
                 "Follow-up date",
                 value=follow_up_date_seed or date.today(),
                 key="quotation_detail_follow_up_date",
-                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
             )
     with col_right:
         follow_up_notes_input = st.text_area(
             "Follow-up notes",
             value=follow_up_notes_value,
             key="quotation_detail_follow_up_notes",
+            placeholder="Add follow-up notes or next steps",
         )
         receipt_upload = None
         if selected_status == "paid":
@@ -18549,6 +18707,20 @@ def _render_quotation_management(conn):
                 receipt_path,
                 selected_detail_id,
             ),
+        )
+        follow_up_source = st.session_state.get("quotation_detail_follow_up_date__raw")
+        if follow_up_iso:
+            message = f"Quotation #{selected_detail_id} follow-up"
+        else:
+            message = None
+        sync_follow_up_reminder(
+            conn,
+            entity_type="quotation",
+            entity_id=int(selected_detail_id),
+            follow_up_text=follow_up_source,
+            fallback_date=follow_up_iso,
+            message=message,
+            status="pending" if follow_up_iso else "done",
         )
         conn.commit()
         log_activity(
@@ -21399,7 +21571,7 @@ def scraps_page(conn):
             name = st.text_input("Name", existing_value("name"))
             phone = st.text_input("Phone", existing_value("phone"))
             address = st.text_area("Address", existing_value("address"))
-            purchase = st.text_input("Purchase date (DD-MM-YYYY)", existing_value("purchase_date"))
+            purchase = st.text_input("Purchase date (YYYY-MM-DD)", existing_value("purchase_date"))
             product = st.text_input("Product", existing_value("product_info"))
             do_code = st.text_input("Delivery order code", existing_value("delivery_order_code"))
             remarks_text = st.text_area("Remarks", existing_value("remarks"))
@@ -21649,20 +21821,202 @@ def split_product_label(label: Optional[str]) -> tuple[Optional[str], Optional[s
     return text, None
 
 
-def parse_date_value(value) -> Optional[pd.Timestamp]:
+_TIME_TOKEN = re.compile(r"(?i)\\b(\\d{1,2}:\\d{2}|\\d{1,2}\\s?(am|pm)|noon|midnight)\\b")
+
+
+def _has_time_component(text: str) -> bool:
+    return bool(_TIME_TOKEN.search(text))
+
+
+def parse_human_date(value: object) -> Optional[datetime]:
     if value is None:
         return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, dt_time.min)
     try:
         if pd.isna(value):
             return None
     except Exception:
         pass
-    dt = pd.to_datetime(value, errors="coerce", dayfirst=True)
-    if pd.isna(dt):
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        parsed = dateparser.parse(
+            cleaned,
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
+        )
+        if parsed:
+            return parsed
+        try:
+            parsed_fallback = pd.to_datetime(cleaned, errors="coerce", dayfirst=True)
+        except Exception:
+            return None
+    else:
+        try:
+            parsed_fallback = pd.to_datetime(value, errors="coerce", dayfirst=True)
+        except Exception:
+            return None
+    if pd.isna(parsed_fallback):
         return None
-    if isinstance(dt, pd.DatetimeIndex):
-        dt = dt[0]
-    return dt.normalize()
+    if isinstance(parsed_fallback, pd.DatetimeIndex):
+        parsed_fallback = parsed_fallback[0]
+    return pd.Timestamp(parsed_fallback).to_pydatetime()
+
+
+def parse_human_reminder(value: object) -> Optional[datetime]:
+    parsed = parse_human_date(value)
+    if parsed is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned and not _has_time_component(cleaned):
+            return datetime.combine(parsed.date(), DEFAULT_REMINDER_TIME)
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, DEFAULT_REMINDER_TIME)
+    return parsed
+
+
+def parse_date_value(value) -> Optional[pd.Timestamp]:
+    parsed_dt = parse_human_date(value)
+    if parsed_dt is None:
+        return None
+    return pd.Timestamp(parsed_dt).normalize()
+
+
+def _format_reminder_datetime(value: object) -> str:
+    parsed = parse_human_date(value)
+    if parsed is None:
+        return ""
+    return parsed.strftime("%d %b %Y %I:%M %p").lstrip("0")
+
+
+def upsert_reminder(
+    conn: sqlite3.Connection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    remind_at: Optional[datetime],
+    message: Optional[str] = None,
+    status: str = "pending",
+    source_text: Optional[str] = None,
+) -> None:
+    if not entity_type or entity_id is None:
+        return
+    if remind_at is None:
+        conn.execute(
+            "DELETE FROM reminders WHERE entity_type=? AND entity_id=?",
+            (entity_type, int(entity_id)),
+        )
+        return
+    remind_at_iso = remind_at.isoformat(sep=" ", timespec="minutes")
+    existing = conn.execute(
+        "SELECT reminder_id FROM reminders WHERE entity_type=? AND entity_id=?",
+        (entity_type, int(entity_id)),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE reminders
+            SET remind_at=?,
+                message=?,
+                status=?,
+                source_text=?,
+                updated_at=datetime('now')
+            WHERE entity_type=? AND entity_id=?
+            """,
+            (
+                remind_at_iso,
+                message,
+                status,
+                source_text,
+                entity_type,
+                int(entity_id),
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO reminders (entity_type, entity_id, remind_at, message, status, source_text)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entity_type,
+                int(entity_id),
+                remind_at_iso,
+                message,
+                status,
+                source_text,
+            ),
+        )
+
+
+def _build_reminder_alerts(
+    conn: sqlite3.Connection, *, limit: int = 8
+) -> list[dict[str, object]]:
+    df = df_query(
+        conn,
+        """
+        SELECT reminder_id, entity_type, entity_id, remind_at, message, status
+        FROM reminders
+        WHERE COALESCE(status, 'pending') != 'done'
+        ORDER BY datetime(remind_at) ASC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    if df.empty:
+        return []
+    now = datetime.now()
+    alerts: list[dict[str, object]] = []
+    for record in df.to_dict("records"):
+        remind_at = clean_text(record.get("remind_at"))
+        remind_dt = parse_human_date(remind_at)
+        due = False
+        if remind_dt:
+            due = remind_dt <= now
+        message = clean_text(record.get("message"))
+        entity_label = f"{record.get('entity_type')} #{record.get('entity_id')}"
+        title = "Reminder due" if due else "Upcoming reminder"
+        alerts.append(
+            {
+                "title": title,
+                "message": message or entity_label,
+                "severity": "warning" if due else "info",
+                "details": [f"Due {_format_reminder_datetime(remind_at)}"]
+                if remind_at
+                else [],
+            }
+        )
+    return alerts
+
+
+def sync_follow_up_reminder(
+    conn: sqlite3.Connection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    follow_up_text: Optional[str],
+    fallback_date: Optional[str] = None,
+    message: Optional[str] = None,
+    status: str = "pending",
+) -> None:
+    source_text = clean_text(follow_up_text) or clean_text(fallback_date)
+    remind_at = parse_human_reminder(source_text) if source_text else None
+    upsert_reminder(
+        conn,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        remind_at=remind_at,
+        message=message,
+        status=status,
+        source_text=source_text,
+    )
 
 
 def date_strings_from_input(value) -> tuple[Optional[str], Optional[str]]:
@@ -21699,7 +22053,7 @@ def coerce_excel_date(series):
 
 def import_page(conn):
     st.subheader("⬆️ Import from Excel/CSV (append)")
-    st.caption("We’ll auto-detect columns; you can override mapping. Dates accept DD-MM-YYYY or Excel serials.")
+    st.caption("We’ll auto-detect columns; you can override mapping. Dates accept YYYY-MM-DD or Excel serials.")
     f = st.file_uploader("Upload .xlsx or .csv", type=["xlsx","csv"])
     if f is None:
         st.markdown("---")
@@ -21862,13 +22216,13 @@ def import_page(conn):
         num_rows="dynamic",
         column_config={
             "date": st.column_config.TextColumn(
-                "Date", help="Enter any date format; we'll standardize to DD-MM-YYYY."
+                "Date", help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'."
             ),
             "purchase_date": st.column_config.TextColumn(
-                "Purchase date", help="Enter any date format; we'll standardize to DD-MM-YYYY."
+                "Purchase date", help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'."
             ),
             "follow_up_date": st.column_config.TextColumn(
-                "Follow-up date", help="Enter any date format; we'll standardize to DD-MM-YYYY."
+                "Follow-up date", help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'."
             ),
             "work_done_code": st.column_config.TextColumn(
                 "Work done code", required=False
@@ -23636,7 +23990,7 @@ def manage_import_history(conn):
         delivery_address_input = st.text_area(
             "Delivery address", value=current_delivery_address
         )
-        purchase_input = st.text_input("Purchase date (DD-MM-YYYY)", value=purchase_str)
+        purchase_input = st.text_input("Purchase date (YYYY-MM-DD)", value=purchase_str)
         product_input = st.text_input("Product", value=current_product)
         do_input = st.text_input("Delivery order code", value=current_do)
         remarks_input = st.text_area(
@@ -24184,7 +24538,7 @@ def reports_page(conn):
                 "Report date",
                 value=default_start,
                 key="report_period_daily",
-                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
             )
             if (
                 STRICT_REPORT_WINDOWS
@@ -24206,7 +24560,7 @@ def reports_page(conn):
                 start_value=base_start,
                 end_value=base_end,
                 key_prefix="report_period_weekly",
-                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
             )
             if isinstance(week_value, (list, tuple)) and len(week_value) == 2:
                 start_date, end_date = week_value
@@ -24226,7 +24580,7 @@ def reports_page(conn):
                 "Month",
                 value=month_seed,
                 key="report_period_monthly",
-                help="Enter any date in the month; we'll standardize to DD-MM-YYYY.",
+                help="Enter any date in the month; we'll standardize to YYYY-MM-DD.",
             )
             month_seed = month_value or month_seed
             if not isinstance(month_seed, date):
@@ -24509,7 +24863,7 @@ def reports_page(conn):
         start_value=default_history_start,
         end_value=today,
         key_prefix="report_history_range",
-        help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+        help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
     )
     range_start = range_end = None
     if isinstance(history_range, (list, tuple)) and len(history_range) == 2:
