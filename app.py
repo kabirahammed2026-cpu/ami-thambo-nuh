@@ -196,34 +196,56 @@ def _looks_like_date_column(column_name: str) -> bool:
     return "date" in lowered or lowered.endswith("_at") or lowered.endswith("_on")
 
 
-def normalize_editor_df(df: pd.DataFrame) -> tuple[pd.DataFrame, set[str]]:
+def normalize_editor_df(
+    df: pd.DataFrame,
+    *,
+    numeric_columns: Optional[set[str]] = None,
+    date_columns: Optional[set[str]] = None,
+) -> tuple[pd.DataFrame, set[str]]:
     if not isinstance(df, pd.DataFrame):
         return pd.DataFrame(), set()
     normalized = df.copy()
-    date_columns: set[str] = set()
+    normalized_date_columns: set[str] = set()
+    numeric_columns = numeric_columns or set()
+    date_columns = date_columns or set()
     for col in normalized.columns:
         series = normalized[col]
+        if col in numeric_columns:
+            normalized[col] = pd.to_numeric(series, errors="coerce")
+            continue
+        if col in date_columns:
+            normalized[col] = pd.to_datetime(series, errors="coerce").dt.date
+            normalized_date_columns.add(col)
+            continue
         if pd.api.types.is_datetime64_any_dtype(series):
             normalized[col] = pd.to_datetime(series, errors="coerce").dt.date
-            date_columns.add(col)
+            normalized_date_columns.add(col)
+            continue
+        if pd.api.types.is_numeric_dtype(series):
             continue
         try:
             parsed = pd.to_datetime(series, errors="coerce")
         except Exception:
             parsed = pd.Series([pd.NaT] * len(series))
+        numeric_like_ratio = (
+            pd.to_numeric(series, errors="coerce").notna().mean() if len(series) else 0.0
+        )
         non_null_ratio = parsed.notna().mean() if len(parsed) else 0.0
-        if _looks_like_date_column(col) or non_null_ratio >= 0.6:
+        if _looks_like_date_column(col) or (
+            non_null_ratio >= 0.6 and numeric_like_ratio < 0.6
+        ):
             normalized[col] = parsed.dt.date
-            date_columns.add(col)
-    return normalized, date_columns
+            normalized_date_columns.add(col)
+    return normalized, normalized_date_columns
 
 
 def build_column_config(
-    df: pd.DataFrame, date_columns: set[str]
+    df: pd.DataFrame, date_columns: set[str], forced_date_columns: Optional[set[str]] = None
 ) -> tuple[dict[str, object], list[str], list[str]]:
     column_config: dict[str, object] = {}
     disabled_columns: list[str] = []
     warnings: list[str] = []
+    forced_date_columns = forced_date_columns or set()
     for col in df.columns:
         lowered = str(col).lower()
         if lowered in {"id", "doc_id"} or lowered.endswith("_id"):
@@ -233,15 +255,15 @@ def build_column_config(
             column_config[col] = st.column_config.DateColumn(
                 col, format="YYYY-MM-DD"
             )
+            if col not in forced_date_columns and series.notna().sum() == 0:
+                warnings.append(f"{col} has no valid dates; editing is disabled.")
+                disabled_columns.append(col)
         elif pd.api.types.is_bool_dtype(series):
             column_config[col] = st.column_config.CheckboxColumn(col)
         elif pd.api.types.is_numeric_dtype(series):
             column_config[col] = st.column_config.NumberColumn(col)
         else:
             column_config[col] = st.column_config.TextColumn(col)
-        if col in date_columns and series.notna().sum() == 0:
-            warnings.append(f"{col} has no valid dates; editing is disabled.")
-            disabled_columns.append(col)
     return column_config, disabled_columns, warnings
 
 
@@ -253,9 +275,22 @@ def safe_data_editor(
     disabled: Optional[list[str]] = None,
     **kwargs,
 ) -> pd.DataFrame:
-    normalized, date_columns = normalize_editor_df(df)
+    explicit_number_columns: set[str] = set()
+    explicit_date_columns: set[str] = set()
+    if column_config:
+        for col, config in column_config.items():
+            type_name = type(config).__name__
+            if type_name == "NumberColumn":
+                explicit_number_columns.add(col)
+            elif type_name == "DateColumn":
+                explicit_date_columns.add(col)
+    normalized, date_columns = normalize_editor_df(
+        df,
+        numeric_columns=explicit_number_columns,
+        date_columns=explicit_date_columns,
+    )
     auto_config, auto_disabled, warnings = build_column_config(
-        normalized, date_columns
+        normalized, date_columns, forced_date_columns=explicit_date_columns
     )
     merged_config = {**auto_config, **(column_config or {})}
     disabled_columns = sorted(set(auto_disabled) | set(disabled or []))
@@ -13962,19 +13997,20 @@ def operations_page(conn):
             }
         )
         state_key = "operations_customer_table_state"
-        if (
-            state_key not in st.session_state
-            or not isinstance(st.session_state.get(state_key), pd.DataFrame)
-        ):
+        previous_table = st.session_state.get(state_key)
+        if not isinstance(previous_table, pd.DataFrame):
+            previous_table = None
+        if previous_table is None:
             st.session_state[state_key] = table_df
         else:
-            previous_table = st.session_state[state_key]
             previous_ids = previous_table.get("ID") if "ID" in previous_table else None
             current_ids = table_df.get("ID")
             previous_list = (
                 previous_ids.tolist() if isinstance(previous_ids, pd.Series) else []
             )
-            current_list = current_ids.tolist() if isinstance(current_ids, pd.Series) else []
+            current_list = (
+                current_ids.tolist() if isinstance(current_ids, pd.Series) else []
+            )
             if previous_list != current_list:
                 selected_ids = set()
                 if "Select" in previous_table and "ID" in previous_table:
@@ -13985,7 +14021,14 @@ def operations_page(conn):
                 if selected_ids:
                     refreshed_table["Select"] = refreshed_table["ID"].isin(selected_ids)
                 st.session_state[state_key] = refreshed_table
-        table_source = st.session_state.get(state_key, table_df)
+        table_source = table_df.copy()
+        if previous_table is not None and "Select" in previous_table:
+            table_source["Select"] = (
+                previous_table["Select"]
+                .reindex(table_df.index)
+                .fillna(False)
+                .astype(bool)
+            )
         edited_table = safe_data_editor(
             table_source,
             hide_index=True,
@@ -15614,12 +15657,13 @@ def warranties_page(conn):
             note_default = f"{note_default} Serial: {serial_label}."
         note_key = f"warranty_followup_note_{selected_warranty}"
         if note_key not in st.session_state:
-            st.session_state[note_key] = note_default
+            st.session_state[note_key] = ""
         note_input = st.text_area(
             "Remark",
             value=st.session_state[note_key],
             key=note_key,
             help="Store remarks that will show up in follow-up reminders.",
+            placeholder=note_default,
         )
         reminder_date = render_flexible_date_input(
             "Reminder date",
@@ -24269,29 +24313,36 @@ def reports_page(conn):
                 uploaded_df.columns, template_key=template_key
             )
             mapping_seed = st.session_state.get("report_grid_mapping_choices", {})
+            mapping_saved = st.session_state.get("report_grid_mapping_saved", False)
             map_options = ["(Do not import)"] + list(uploaded_df.columns)
             selected_mapping: dict[str, str] = {}
             load_clicked = False
-            with st.form("report_grid_import_mapper"):
-                st.caption(
-                    "Align columns from the uploaded file to the report grid fields. Skipped columns will be ignored."
+            if mapping_saved:
+                st.success(
+                    "Mapping applied. Upload another file to remap columns.",
+                    icon="✅",
                 )
-                for key, config in _get_report_grid_fields(template_key).items():
-                    default_choice = mapping_seed.get(key) or suggestions.get(key)
-                    if default_choice not in map_options:
-                        default_choice = "(Do not import)"
-                    choice = st.selectbox(
-                        config["label"],
-                        options=map_options,
-                        index=map_options.index(default_choice)
-                        if default_choice in map_options
-                        else 0,
-                        key=f"report_map_{key}",
-                        help=f"Select the column that represents '{config['label']}'.",
+            else:
+                with st.form("report_grid_import_mapper"):
+                    st.caption(
+                        "Align columns from the uploaded file to the report grid fields. Skipped columns will be ignored."
                     )
-                    if choice != "(Do not import)":
-                        selected_mapping[choice] = key
-                load_clicked = st.form_submit_button("Load mapped rows into grid")
+                    for key, config in _get_report_grid_fields(template_key).items():
+                        default_choice = mapping_seed.get(key) or suggestions.get(key)
+                        if default_choice not in map_options:
+                            default_choice = "(Do not import)"
+                        choice = st.selectbox(
+                            config["label"],
+                            options=map_options,
+                            index=map_options.index(default_choice)
+                            if default_choice in map_options
+                            else 0,
+                            key=f"report_map_{key}",
+                            help=f"Select the column that represents '{config['label']}'.",
+                        )
+                        if choice != "(Do not import)":
+                            selected_mapping[choice] = key
+                    load_clicked = st.form_submit_button("Load mapped rows into grid")
 
             if load_clicked:
                 st.session_state["report_grid_mapping_choices"] = {
@@ -24308,7 +24359,7 @@ def reports_page(conn):
                     )
                     st.session_state.pop("report_grid_import_payload", None)
                     st.session_state.pop("report_grid_mapping_choices", None)
-                    st.session_state.pop("report_grid_mapping_saved", None)
+                    st.session_state["report_grid_mapping_saved"] = True
                     st.session_state["report_grid_importer_reset"] = True
                     _safe_rerun()
                 else:
