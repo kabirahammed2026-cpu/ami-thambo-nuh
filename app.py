@@ -13042,6 +13042,265 @@ def render_operations_document_uploader(
         st.info("No customers available for documents yet.")
         return
 
+    selected_customer = None
+    if show_customer_select:
+        default_customer = (
+            selected_customer_id if selected_customer_id in customer_choices else None
+        )
+        selected_customer = st.selectbox(
+            "Customer",
+            customer_choices,
+            index=customer_choices.index(default_customer)
+            if default_customer in customer_choices
+            else 0,
+            format_func=lambda cid: customer_labels.get(cid, f"Customer #{cid}"),
+            key=f"{key_prefix}_upload_customer",
+        )
+    else:
+        selected_customer = (
+            selected_customer_id if selected_customer_id in customer_choices else None
+        )
+        if selected_customer:
+            label = selected_customer_label or customer_labels.get(
+                selected_customer, f"Customer #{selected_customer}"
+            )
+            if label:
+                st.caption(f"Uploading for: {label}")
+        else:
+            st.info("Select a customer above to upload operations documents.")
+
+    if selected_customer:
+        customer_seed = df_query(
+            conn,
+            """
+            SELECT name, company_name, phone, address, delivery_address, sales_person
+            FROM customers
+            WHERE customer_id=?
+            """,
+            (int(selected_customer),),
+        )
+        customer_record = (
+            customer_seed.iloc[0].to_dict() if not customer_seed.empty else {}
+        )
+        upload_container = getattr(st, "popover", None)
+        if callable(upload_container):
+            container = upload_container("Upload operations documents", use_container_width=True)
+        else:
+            container = st.expander("Upload operations documents", expanded=True)
+
+        with container:
+            upload_tabs = st.tabs(
+                ["Delivery order", "Work done", "Service", "Maintenance", "Other uploads"]
+            )
+            with upload_tabs[0]:
+                with st.form(key=f"{key_prefix}_do_form", clear_on_submit=False):
+                    do_file = st.file_uploader(
+                        "Delivery order upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_do_file",
+                        help="Upload the delivery order PDF or image.",
+                    )
+                    _apply_ocr_autofill(
+                        upload=do_file,
+                        ocr_key_prefix=f"{key_prefix}_do_file",
+                        doc_type="Delivery order",
+                        details_key_prefix=f"{key_prefix}_do_details",
+                    )
+                    do_details = _render_doc_detail_inputs(
+                        "Delivery order",
+                        key_prefix=f"{key_prefix}_do_details",
+                        defaults=customer_record,
+                    )
+                    submit_do = st.form_submit_button("Save delivery order")
+                if _guard_double_submit(f"{key_prefix}_do_save", submit_do):
+                    if do_file is None:
+                        st.error("Select a delivery order document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
+                            doc_type="Delivery order",
+                            upload_file=do_file,
+                            details=do_details,
+                        )
+                        if saved:
+                            st.success("Delivery order uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_do_file",
+                                details_key_prefix=f"{key_prefix}_do_details",
+                                doc_type="Delivery order",
+                            )
+
+            with upload_tabs[1]:
+                with st.form(key=f"{key_prefix}_work_done_form", clear_on_submit=False):
+                    work_done_file = st.file_uploader(
+                        "Work done upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_work_done_file",
+                        help="Upload completed work slips or PDFs.",
+                    )
+                    _apply_ocr_autofill(
+                        upload=work_done_file,
+                        ocr_key_prefix=f"{key_prefix}_work_done_file",
+                        doc_type="Work done",
+                        details_key_prefix=f"{key_prefix}_work_done_details",
+                    )
+                    work_done_details = _render_doc_detail_inputs(
+                        "Work done",
+                        key_prefix=f"{key_prefix}_work_done_details",
+                        defaults=customer_record,
+                    )
+                    submit_work_done = st.form_submit_button("Save work done")
+                if _guard_double_submit(
+                    f"{key_prefix}_work_done_save", submit_work_done
+                ):
+                    if work_done_file is None:
+                        st.error("Select a work done document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
+                            doc_type="Work done",
+                            upload_file=work_done_file,
+                            details=work_done_details,
+                        )
+                        if saved:
+                            st.success("Work done uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_work_done_file",
+                                details_key_prefix=f"{key_prefix}_work_done_details",
+                                doc_type="Work done",
+                            )
+
+            with upload_tabs[2]:
+                with st.form(key=f"{key_prefix}_service_form", clear_on_submit=False):
+                    service_file = st.file_uploader(
+                        "Service upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_service_file",
+                        help="Upload service documents.",
+                    )
+                    _apply_ocr_autofill(
+                        upload=service_file,
+                        ocr_key_prefix=f"{key_prefix}_service_file",
+                        doc_type="Service",
+                        details_key_prefix=f"{key_prefix}_service_details",
+                    )
+                    service_details = _render_doc_detail_inputs(
+                        "Service",
+                        key_prefix=f"{key_prefix}_service_details",
+                        defaults=customer_record,
+                    )
+                    submit_service = st.form_submit_button("Save service")
+                if _guard_double_submit(f"{key_prefix}_service_save", submit_service):
+                    if service_file is None:
+                        st.error("Select a service document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
+                            doc_type="Service",
+                            upload_file=service_file,
+                            details=service_details,
+                        )
+                        if saved:
+                            st.success("Service uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_service_file",
+                                details_key_prefix=f"{key_prefix}_service_details",
+                                doc_type="Service",
+                            )
+
+            with upload_tabs[3]:
+                with st.form(key=f"{key_prefix}_maintenance_form", clear_on_submit=False):
+                    maintenance_file = st.file_uploader(
+                        "Maintenance upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_maintenance_file",
+                        help="Upload maintenance documents.",
+                    )
+                    _apply_ocr_autofill(
+                        upload=maintenance_file,
+                        ocr_key_prefix=f"{key_prefix}_maintenance_file",
+                        doc_type="Maintenance",
+                        details_key_prefix=f"{key_prefix}_maintenance_details",
+                    )
+                    maintenance_details = _render_doc_detail_inputs(
+                        "Maintenance",
+                        key_prefix=f"{key_prefix}_maintenance_details",
+                        defaults=customer_record,
+                    )
+                    submit_maintenance = st.form_submit_button("Save maintenance")
+                if _guard_double_submit(
+                    f"{key_prefix}_maintenance_save", submit_maintenance
+                ):
+                    if maintenance_file is None:
+                        st.error("Select a maintenance document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
+                            doc_type="Maintenance",
+                            upload_file=maintenance_file,
+                            details=maintenance_details,
+                        )
+                        if saved:
+                            st.success("Maintenance uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_maintenance_file",
+                                details_key_prefix=f"{key_prefix}_maintenance_details",
+                                doc_type="Maintenance",
+                            )
+
+            with upload_tabs[4]:
+                with st.form(key=f"{key_prefix}_other_form", clear_on_submit=False):
+                    other_file = st.file_uploader(
+                        "Other upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_other_file",
+                        help="Upload any other operational documents.",
+                    )
+                    _apply_ocr_autofill(
+                        upload=other_file,
+                        ocr_key_prefix=f"{key_prefix}_other_file",
+                        doc_type="Other",
+                        details_key_prefix=f"{key_prefix}_other_details",
+                    )
+                    other_details = _render_doc_detail_inputs(
+                        "Other",
+                        key_prefix=f"{key_prefix}_other_details",
+                        defaults=customer_record,
+                    )
+                    submit_other = st.form_submit_button("Save other upload")
+                if _guard_double_submit(f"{key_prefix}_other_save", submit_other):
+                    if other_file is None:
+                        st.error("Select a document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
+                            doc_type="Other",
+                            upload_file=other_file,
+                            details=other_details,
+                        )
+                        if saved:
+                            st.success("Other upload saved.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_other_file",
+                                details_key_prefix=f"{key_prefix}_other_details",
+                                doc_type="Other",
+                            )
+
     doc_type_options = ["Delivery order", "Work done", "Service", "Maintenance", "Other"]
     filter_cols = st.columns((1.6, 1.2, 1.1, 1.1))
     with filter_cols[0]:
