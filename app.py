@@ -148,6 +148,19 @@ def _debug_diag_enabled() -> bool:
     return DEBUG_DIAG
 
 
+def _debug_dataframe_probe(df: pd.DataFrame, label: str) -> None:
+    if os.getenv("DEBUG_DIAG") != "1":
+        return
+    st.markdown(f"**DEBUG_DIAG • {label}**")
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame()
+    st.write("DF shape:", df.shape)
+    st.code(df.head(5).to_dict("records"))
+    sample_df = pd.DataFrame([{"Name": "VISIBLE_TEXT", "Role": "TEST_ROLE"}])
+    st.caption("Sample dataframe (visibility probe)")
+    st.dataframe(sample_df, use_container_width=True)
+
+
 def _get_git_commit() -> str:
     try:
         result = subprocess.run(
@@ -5768,6 +5781,10 @@ def _render_theme_debug_panel(*, sidebar_hidden: bool) -> None:
 
 
 def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
+    render_id = st.session_state.get("_render_id")
+    if st.session_state.get("_theme_css_render") == (render_id, sidebar_hidden):
+        return
+    st.session_state["_theme_css_render"] = (render_id, sidebar_hidden)
     theme = get_theme()
     sidebar_display = "none" if sidebar_hidden else "block"
     content_offset = "0rem" if sidebar_hidden else "var(--ps-sidebar-width)"
@@ -6125,12 +6142,41 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         }}
         [data-testid="stDataFrame"],
         [data-testid="stDataEditor"] {{
+            --gdg-bg-cell: var(--secondary-background-color) !important;
+            --gdg-bg-cell-medium: var(--secondary-background-color) !important;
+            --gdg-bg-header: var(--ps-table-header-bg) !important;
+            --gdg-bg-header-hovered: var(--ps-table-header-bg) !important;
+            --gdg-border-color: var(--ps-panel-border) !important;
+            --gdg-text-dark: var(--text-color) !important;
+            --gdg-text-medium: var(--text-color) !important;
+            --gdg-text-light: var(--text-color) !important;
+            --gdg-text-header: var(--text-color) !important;
+            --gdg-accent-color: var(--primary-color) !important;
             background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
             -webkit-text-fill-color: var(--text-color) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
             color-scheme: var(--ps-color-scheme) !important;
+        }}
+        [data-testid="stDataFrame"] .stDataFrameGlideDataEditor,
+        [data-testid="stDataEditor"] .stDataFrameGlideDataEditor {{
+            --gdg-bg-cell: var(--secondary-background-color) !important;
+            --gdg-bg-cell-medium: var(--secondary-background-color) !important;
+            --gdg-bg-header: var(--ps-table-header-bg) !important;
+            --gdg-bg-header-hovered: var(--ps-table-header-bg) !important;
+            --gdg-border-color: var(--ps-panel-border) !important;
+            --gdg-text-dark: var(--text-color) !important;
+            --gdg-text-medium: var(--text-color) !important;
+            --gdg-text-light: var(--text-color) !important;
+            --gdg-text-header: var(--text-color) !important;
+            --gdg-accent-color: var(--primary-color) !important;
+            color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
+        }}
+        [data-testid="stDataFrame"] .stDataFrameGlideDataEditor > div,
+        [data-testid="stDataEditor"] .stDataFrameGlideDataEditor > div {{
+            background-color: transparent !important;
         }}
         [data-testid="stDataFrameContainer"],
         [data-testid="stDataFrameResizable"] {{
@@ -6407,27 +6453,14 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         table tbody tr:nth-child(even) {{
             background-color: var(--ps-table-row-alt-bg) !important;
         }}
-        [data-testid="stDataFrame"],
-        [data-testid="stDataEditor"],
-        [data-testid="stTable"],
-        [data-baseweb="table"],
-        [data-baseweb="table"] * {{
-            background-color: var(--secondary-background-color) !important;
-            color: var(--text-color) !important;
-            -webkit-text-fill-color: var(--text-color) !important;
-            color-scheme: var(--ps-color-scheme) !important;
-        }}
-        [data-testid="stDataFrame"] *,
-        [data-testid="stDataEditor"] *,
-        [data-testid="stTable"] * {{
-            background-color: var(--secondary-background-color) !important;
-            color: var(--text-color) !important;
-            -webkit-text-fill-color: var(--text-color) !important;
-        }}
         [data-testid="stDataFrame"] svg,
         [data-testid="stDataEditor"] svg,
         [data-testid="stTable"] svg {{
             fill: var(--text-color) !important;
+        }}
+        [data-testid="stDataFrame"] canvas,
+        [data-testid="stDataEditor"] canvas {{
+            background-color: transparent !important;
         }}
         [data-testid="stDataFrame"] [role="gridcell"] *,
         [data-testid="stDataFrame"] [role="columnheader"] *,
@@ -21751,6 +21784,7 @@ def import_page(conn):
     for column in preview_text_columns:
         if column in preview.columns:
             preview[column] = preview[column].fillna("").astype(str)
+    _debug_dataframe_probe(preview, "Import review editor")
     editor = st.data_editor(
         preview,
         key="import_editor",
@@ -22468,6 +22502,7 @@ def users_admin_page(conn):
         """,
     )
     users = users.assign(created_at=pd.to_datetime(users["created_at"], errors="coerce").dt.strftime(DATE_FMT))
+    _debug_dataframe_probe(users, "Users (Admin) table")
     st.dataframe(users.drop(columns=["id"], errors="ignore"))
 
     with st.expander("Add user"):
@@ -23476,6 +23511,7 @@ def manage_import_history(conn):
         },
         inplace=True,
     )
+    _debug_dataframe_probe(display, "Import history table")
     st.dataframe(display, use_container_width=True)
 
     ids = hist["import_id"].astype(int).tolist()
