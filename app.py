@@ -3338,20 +3338,24 @@ def render_flexible_date_input(
         if parsed_seed is not None
         else (clean_text(value) or "")
     )
-    existing = st.session_state.get(key) if key else None
+    widget_key = f"{key}__input" if key else None
+    normalized_key = key
+    existing = st.session_state.get(widget_key) if widget_key else None
+    if existing is None and normalized_key:
+        existing = st.session_state.get(normalized_key)
     text_value = existing if existing is not None else default_text
     text_value = "" if text_value is None else str(text_value)
     text_value = text_value.strip()
     text = st.text_input(
         label,
         value=text_value,
-        key=key,
+        key=widget_key,
         help=help,
         disabled=disabled,
         placeholder=placeholder,
     )
-    if key:
-        st.session_state[f"{key}__raw"] = text
+    if normalized_key:
+        st.session_state[f"{normalized_key}__raw"] = text
     parsed = parse_human_date(text)
     if parsed is None:
         if text:
@@ -3360,8 +3364,8 @@ def render_flexible_date_input(
             )
         return None
     normalized = parsed.strftime(INPUT_DATE_FMT)
-    if text != normalized and key:
-        st.session_state[key] = normalized
+    if normalized_key:
+        st.session_state[normalized_key] = normalized
     return parsed.date()
 
 
