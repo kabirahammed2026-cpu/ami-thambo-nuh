@@ -1327,6 +1327,7 @@ CREATE TABLE IF NOT EXISTS quotations (
     follow_up_status TEXT,
     follow_up_notes TEXT,
     follow_up_date TEXT,
+    follow_up_history TEXT,
     reminder_label TEXT,
     letter_template TEXT,
     salesperson_name TEXT,
@@ -1443,6 +1444,7 @@ def ensure_schema_upgrades(conn):
     add_column("users", "email", "TEXT")
     add_column("users", "title", "TEXT")
     add_column("services", "status", "TEXT DEFAULT 'In progress'")
+    add_column("quotations", "follow_up_history", "TEXT")
     add_column("services", "service_start_date", "TEXT")
     add_column("services", "service_end_date", "TEXT")
     add_column("services", "service_product_info", "TEXT")
@@ -4457,7 +4459,6 @@ def _reset_quotation_form_state() -> None:
         "quotation_follow_up_status",
         "quotation_follow_up_notes",
         "quotation_follow_up_date",
-        "quotation_follow_up_date_toggle",
         "quotation_follow_up_choice",
         "quotation_salesperson_title",
         "quotation_salesperson_contact",
@@ -12383,6 +12384,10 @@ def _save_customer_document_upload(
             "payment_receipt_path": receipt_path,
             "follow_up_status": "Pending",
             "follow_up_notes": clean_text(details.get("follow_up_notes")),
+            "follow_up_history": _build_follow_up_history_entry(
+                follow_up_date=None,
+                follow_up_notes=clean_text(details.get("follow_up_notes")),
+            ),
             "salesperson_name": clean_text(details.get("person_in_charge")),
             "document_path": stored_path,
             "items_payload": items_payload,
@@ -17497,6 +17502,20 @@ def _quotation_scope_filter() -> tuple[str, tuple[object, ...]]:
     return "WHERE created_by = ? AND deleted_at IS NULL", (uid,)
 
 
+def _build_follow_up_history_entry(
+    *, follow_up_date: Optional[str], follow_up_notes: Optional[str]
+) -> Optional[str]:
+    parts: list[str] = []
+    if clean_text(follow_up_date):
+        parts.append(f"Next follow-up: {follow_up_date}")
+    if clean_text(follow_up_notes):
+        parts.append(clean_text(follow_up_notes))
+    if not parts:
+        return None
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"{timestamp} — " + " | ".join(parts)
+
+
 def _save_quotation_record(conn, payload: dict) -> Optional[int]:
     columns = [
         "reference",
@@ -17520,6 +17539,7 @@ def _save_quotation_record(conn, payload: dict) -> Optional[int]:
         "follow_up_status",
         "follow_up_notes",
         "follow_up_date",
+        "follow_up_history",
         "reminder_label",
         "letter_template",
         "salesperson_name",
@@ -17692,7 +17712,7 @@ def _update_quotation_records(
             continue
         cur = conn.execute(
             """
-            SELECT status, follow_up_status, follow_up_notes, follow_up_date, reminder_label,
+            SELECT status, follow_up_status, follow_up_notes, follow_up_date, follow_up_history, reminder_label,
                    payment_receipt_path, reference, customer_name, customer_company, customer_contact
             FROM quotations
             WHERE quotation_id=? AND deleted_at IS NULL
@@ -17707,6 +17727,7 @@ def _update_quotation_records(
             current_follow_up_status,
             current_follow_up_notes,
             current_follow_up_date,
+            current_follow_up_history,
             current_reminder_label,
             current_receipt_path,
             current_reference,
@@ -17726,14 +17747,53 @@ def _update_quotation_records(
             current_follow_up_notes
         )
         follow_up_date = None
+        follow_up_date_raw = entry.get("follow_up_date")
+        has_follow_up_date = "follow_up_date" in entry
         if status_value != "paid":
-            follow_up_date = to_iso_date(entry.get("follow_up_date") or current_follow_up_date)
+            if has_follow_up_date:
+                if clean_text(follow_up_date_raw) == "":
+                    follow_up_date = None
+                else:
+                    follow_up_date = (
+                        to_iso_date(follow_up_date_raw)
+                        if follow_up_date_raw is not None
+                        else None
+                    )
+            else:
+                follow_up_date = to_iso_date(current_follow_up_date)
+        current_follow_up_date_iso = (
+            to_iso_date(current_follow_up_date) if current_follow_up_date else None
+        )
+        follow_up_changed = follow_up_date != current_follow_up_date_iso
+        notes_changed = clean_text(follow_up_notes) != clean_text(current_follow_up_notes)
+        history_entry = None
+        if follow_up_changed or notes_changed:
+            history_notes = follow_up_notes if notes_changed else None
+            if follow_up_changed and follow_up_date is None:
+                history_entry = _build_follow_up_history_entry(
+                    follow_up_date="Cleared",
+                    follow_up_notes=history_notes,
+                )
+            else:
+                history_entry = _build_follow_up_history_entry(
+                    follow_up_date=follow_up_date,
+                    follow_up_notes=history_notes,
+                )
+        follow_up_history = clean_text(current_follow_up_history) or ""
+        if history_entry:
+            follow_up_history = (
+                f"{follow_up_history}\n{history_entry}"
+                if follow_up_history
+                else history_entry
+            )
         reminder_label = (
             "Payment marked as received; follow-up reminders disabled."
             if status_value == "paid"
             else clean_text(entry.get("reminder_label"))
             or clean_text(current_reminder_label)
         )
+        if status_value != "paid" and follow_up_date is None:
+            reminder_label = None
         receipt_path = clean_text(entry.get("payment_receipt_path")) or clean_text(
             current_receipt_path
         )
@@ -17747,6 +17807,7 @@ def _update_quotation_records(
                 follow_up_status=?,
                 follow_up_notes=?,
                 follow_up_date=?,
+                follow_up_history=?,
                 reminder_label=?,
                 payment_receipt_path=COALESCE(?, payment_receipt_path),
                 updated_at=datetime('now')
@@ -17757,6 +17818,7 @@ def _update_quotation_records(
                 follow_up_status,
                 follow_up_notes,
                 follow_up_date,
+                follow_up_history or None,
                 reminder_label,
                 receipt_path,
                 quotation_id,
@@ -17781,6 +17843,7 @@ def _update_quotation_records(
                 follow_up_text=clean_text(entry.get("follow_up_date")),
                 fallback_date=follow_up_date,
                 message=f"{reference_label} follow-up",
+                status="pending" if follow_up_date else "done",
             )
         updated.append(quotation_id)
         if status_value != current_status:
@@ -18048,32 +18111,16 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 help="Visible to admins for tracking next steps.",
             )
         with follow_cols[1]:
-            enable_follow_date = st.checkbox(
-                "Set follow-up date",
-                value=bool(st.session_state.get("quotation_follow_up_date"))
-                or False,
-                key="quotation_follow_up_date_toggle",
-                disabled=False,
+            follow_up_raw = st.session_state.get("quotation_follow_up_date")
+            follow_up_seed = parse_date_value(follow_up_raw)
+            follow_up_default = follow_up_seed.date() if follow_up_seed else None
+            follow_up_date_value = render_flexible_date_input(
+                "Next follow-up date",
+                value=follow_up_default,
+                key="quotation_follow_up_date",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                placeholder="Leave blank if no follow-up date is needed.",
             )
-            if enable_follow_date:
-                follow_up_raw = st.session_state.get("quotation_follow_up_date")
-                follow_up_seed = parse_date_value(follow_up_raw)
-                follow_up_default = (
-                    follow_up_seed.date() if follow_up_seed else datetime.now().date()
-                )
-                if not isinstance(follow_up_raw, (date, datetime)):
-                    st.session_state["quotation_follow_up_date"] = follow_up_default.strftime(
-                        INPUT_DATE_FMT
-                    )
-                follow_up_date_value = render_flexible_date_input(
-                    "Next follow-up date",
-                    value=follow_up_default,
-                    key="quotation_follow_up_date",
-                    help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
-                )
-            else:
-                st.session_state["quotation_follow_up_date"] = None
-                follow_up_date_value = None
         follow_up_notes = st.text_area(
             "Follow-up remarks for admins",
             value=st.session_state.get("quotation_follow_up_notes", ""),
@@ -18128,6 +18175,10 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
         reminder_label = None
         if follow_up_label:
             reminder_label = f"Reminder scheduled for {follow_up_label}."
+        follow_up_history = _build_follow_up_history_entry(
+            follow_up_date=follow_up_iso,
+            follow_up_notes=follow_up_notes,
+        )
         manual_total_override = max(
             _coerce_float(manual_total_value, 0.0),
             0.0,
@@ -18238,6 +18289,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             "follow_up_status": follow_up_status,
             "follow_up_notes": follow_up_notes,
             "follow_up_date": follow_up_iso,
+            "follow_up_history": follow_up_history,
             "reminder_label": reminder_label,
             "letter_template": template_choice,
             "salesperson_name": prepared_by,
@@ -18341,6 +18393,7 @@ def _render_quotation_management(conn):
             f"""
             SELECT q.quotation_id, q.reference, q.quote_date, q.customer_company, q.customer_name, q.customer_contact,
                    q.total_amount, q.status, q.follow_up_status, q.follow_up_notes, q.follow_up_date,
+                   q.follow_up_history,
                    q.reminder_label, q.payment_receipt_path, q.items_payload, q.document_path,
                    q.created_by, COALESCE(u.username, '(user)') AS created_by_name
             FROM quotations q
@@ -18465,6 +18518,12 @@ def _render_quotation_management(conn):
         insert_at = columns.index("customer_company") + 1
         columns.insert(insert_at, "products")
         tracker_source = tracker_source[columns]
+    if "follow_up_history" in tracker_source.columns and "follow_up_notes" in tracker_source.columns:
+        columns = list(tracker_source.columns)
+        columns.remove("follow_up_history")
+        insert_at = columns.index("follow_up_notes") + 1
+        columns.insert(insert_at, "follow_up_history")
+        tracker_source = tracker_source[columns]
     editable_df = tracker_source.copy()
 
     tracker_state_key = "quotation_tracker_rows"
@@ -18499,6 +18558,10 @@ def _render_quotation_management(conn):
 
     edit_config = {
         "follow_up_notes": st.column_config.TextColumn("Follow-up notes"),
+        "follow_up_history": st.column_config.TextColumn(
+            "Follow-up history",
+            disabled=True,
+        ),
         "follow_up_date": st.column_config.TextColumn(
             "Follow-up date",
             help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
@@ -18636,25 +18699,27 @@ def _render_quotation_management(conn):
             value=follow_up_status_value,
             key="quotation_detail_follow_up_status",
         )
-        clear_follow_up_date = st.checkbox(
-            "No follow-up date",
-            value=follow_up_date_seed is None,
-            key="quotation_detail_clear_date",
+        follow_up_date_input = render_flexible_date_input(
+            "Follow-up date",
+            value=follow_up_date_seed,
+            key="quotation_detail_follow_up_date",
+            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            placeholder="Leave blank if no follow-up date is needed.",
         )
-        follow_up_date_input: Optional[date] = None
-        if not clear_follow_up_date:
-            follow_up_date_input = render_flexible_date_input(
-                "Follow-up date",
-                value=follow_up_date_seed or date.today(),
-                key="quotation_detail_follow_up_date",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
-            )
     with col_right:
         follow_up_notes_input = st.text_area(
             "Follow-up notes",
             value=follow_up_notes_value,
             key="quotation_detail_follow_up_notes",
             placeholder="Add follow-up notes or next steps",
+        )
+        follow_up_history_display = clean_text(selected_row.get("follow_up_history")) or ""
+        st.text_area(
+            "Follow-up history",
+            value=follow_up_history_display,
+            key="quotation_detail_follow_up_history",
+            disabled=True,
+            placeholder="No follow-up history yet.",
         )
         receipt_upload = None
         if selected_status == "paid":
@@ -18683,10 +18748,31 @@ def _render_quotation_management(conn):
 
         follow_up_iso = to_iso_date(follow_up_date_input) if follow_up_date_input else None
         reminder_label = (
-            format_period_range(follow_up_iso, follow_up_iso)
-            if follow_up_iso
-            else clean_text(selected_row.get("reminder_label"))
+            format_period_range(follow_up_iso, follow_up_iso) if follow_up_iso else None
         )
+        follow_up_history_value = clean_text(selected_row.get("follow_up_history")) or ""
+        follow_up_history_entry = None
+        current_follow_up_date_iso = to_iso_date(selected_row.get("follow_up_date"))
+        follow_up_changed = follow_up_iso != current_follow_up_date_iso
+        notes_changed = clean_text(follow_up_notes_input) != clean_text(follow_up_notes_value)
+        if follow_up_changed or notes_changed:
+            history_notes = follow_up_notes_input if notes_changed else None
+            if follow_up_changed and follow_up_iso is None:
+                follow_up_history_entry = _build_follow_up_history_entry(
+                    follow_up_date="Cleared",
+                    follow_up_notes=history_notes,
+                )
+            else:
+                follow_up_history_entry = _build_follow_up_history_entry(
+                    follow_up_date=follow_up_iso,
+                    follow_up_notes=history_notes,
+                )
+        if follow_up_history_entry:
+            follow_up_history_value = (
+                f"{follow_up_history_value}\n{follow_up_history_entry}"
+                if follow_up_history_value
+                else follow_up_history_entry
+            )
 
         conn.execute(
             """
@@ -18694,6 +18780,7 @@ def _render_quotation_management(conn):
                SET follow_up_status=?,
                    follow_up_notes=?,
                    follow_up_date=?,
+                   follow_up_history=?,
                    reminder_label=?,
                    payment_receipt_path=COALESCE(?, payment_receipt_path),
                    updated_at=datetime('now')
@@ -18703,6 +18790,7 @@ def _render_quotation_management(conn):
                 clean_text(follow_up_status_input) or None,
                 clean_text(follow_up_notes_input) or None,
                 follow_up_iso,
+                follow_up_history_value or None,
                 reminder_label,
                 receipt_path,
                 selected_detail_id,
