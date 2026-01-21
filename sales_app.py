@@ -15,13 +15,14 @@ import tempfile
 import secrets
 import zipfile
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time as dt_time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import html
 
 import pandas as pd
+import dateparser
 import streamlit as st
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -91,6 +92,9 @@ FOLLOW_UP_SUGGESTIONS: Dict[str, Optional[int]] = {
     CUSTOM_FOLLOW_UP_CHOICE: None,
 }
 DEFAULT_FOLLOW_UP_CHOICE = "In 3 days"
+INPUT_DATE_FMT = "%Y-%m-%d"
+DATE_INPUT_PLACEHOLDER = "YYYY-MM-DD or 'tomorrow', 'next friday', 'in 3 days'"
+DEFAULT_REMINDER_TIME = dt_time(9, 0)
 
 
 def _get_logger() -> logging.Logger:
@@ -587,18 +591,104 @@ def get_letter_form_state() -> Dict[str, Any]:
 
 
 def _coerce_date(value: Any) -> Optional[date]:
+    parsed = parse_human_date(value)
+    return parsed.date() if parsed else None
+
+
+_TIME_TOKEN = re.compile(r"(?i)\\b(\\d{1,2}:\\d{2}|\\d{1,2}\\s?(am|pm)|noon|midnight)\\b")
+
+
+def _has_time_component(text: str) -> bool:
+    return bool(_TIME_TOKEN.search(text))
+
+
+def parse_human_date(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
     if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
         return value
-    if isinstance(value, str) and value:
-        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
-        if pd.isna(parsed):
+    if isinstance(value, date):
+        return datetime.combine(value, dt_time.min)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
             return None
-        if isinstance(parsed, pd.DatetimeIndex):
-            parsed = parsed[0]
-        return parsed.date()
-    return None
+        parsed = dateparser.parse(
+            cleaned,
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
+        )
+        if parsed:
+            return parsed
+        parsed_fallback = pd.to_datetime(cleaned, errors="coerce", dayfirst=True)
+        if pd.isna(parsed_fallback):
+            return None
+        if isinstance(parsed_fallback, pd.DatetimeIndex):
+            parsed_fallback = parsed_fallback[0]
+        return pd.Timestamp(parsed_fallback).to_pydatetime()
+    parsed_fallback = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if pd.isna(parsed_fallback):
+        return None
+    if isinstance(parsed_fallback, pd.DatetimeIndex):
+        parsed_fallback = parsed_fallback[0]
+    return pd.Timestamp(parsed_fallback).to_pydatetime()
+
+
+def parse_human_reminder(value: Any) -> Optional[datetime]:
+    parsed = parse_human_date(value)
+    if parsed is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned and not _has_time_component(cleaned):
+            return datetime.combine(parsed.date(), DEFAULT_REMINDER_TIME)
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, DEFAULT_REMINDER_TIME)
+    return parsed
+
+
+def render_human_date_input(
+    label: str,
+    *,
+    value: Any = None,
+    key: Optional[str] = None,
+    help: Optional[str] = None,
+    disabled: bool = False,
+    placeholder: str = DATE_INPUT_PLACEHOLDER,
+) -> Optional[date]:
+    parsed_seed = parse_human_date(value)
+    default_text = (
+        parsed_seed.strftime(INPUT_DATE_FMT)
+        if parsed_seed is not None
+        else (_clean_text(value) if value is not None else "")
+    )
+    existing = st.session_state.get(key) if key else None
+    text_value = existing if existing is not None else default_text
+    text_value = "" if text_value is None else str(text_value)
+    text_value = text_value.strip()
+    text = st.text_input(
+        label,
+        value=text_value,
+        key=key,
+        help=help,
+        disabled=disabled,
+        placeholder=placeholder,
+    )
+    if key:
+        st.session_state[f"{key}__raw"] = text
+    parsed = parse_human_date(text)
+    if parsed is None:
+        if text:
+            st.error(
+                "Enter a valid date such as YYYY-MM-DD, 'tomorrow', 'next friday', or 'in 3 days'."
+            )
+        return None
+    normalized = parsed.strftime(INPUT_DATE_FMT)
+    if text != normalized and key:
+        st.session_state[key] = normalized
+    return parsed.date()
 
 
 def _clean_text(value: Any, fallback: str = "") -> str:
@@ -2415,7 +2505,43 @@ def get_user_notifications(user_id: int, include_read: bool = False) -> pd.DataF
 
 
 def schedule_follow_up_notifications(quotation_id: int) -> None:
-    NOTIFICATION_SCHEDULER.notify_follow_up(quotation_id)
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT q.follow_up_date, q.salesperson_id, c.name AS company
+            FROM quotations q
+            LEFT JOIN companies c ON c.company_id = q.company_id
+            WHERE q.quotation_id=?
+            """,
+            (int(quotation_id),),
+        ).fetchone()
+    if not row:
+        return
+    salesperson_id = row["salesperson_id"]
+    if salesperson_id:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM notifications
+                WHERE user_id=?
+                  AND (message LIKE ? OR message LIKE ?)
+                """,
+                (
+                    int(salesperson_id),
+                    f"Follow-up reminder for quotation #{quotation_id}%",
+                    f"Upcoming follow-up for quotation #{quotation_id}%",
+                ),
+            )
+    follow_up = row["follow_up_date"]
+    if not follow_up:
+        return
+    due = parse_human_date(follow_up)
+    if due is None:
+        return
+    label = row["company"] or "quotation"
+    message = f"Follow-up reminder for quotation #{quotation_id} ({label})"
+    if salesperson_id:
+        create_notification(int(salesperson_id), message, due.date())
 
 
 def generate_system_notifications() -> None:
@@ -2618,6 +2744,19 @@ def apply_theme_styles() -> None:
             background-color: {button_hover} !important;
             border-color: {button_border} !important;
             color: {button_text} !important;
+        }}
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stTextInput"] input {{
+            background-color: #ffffff !important;
+            border: 1px solid #d1d5db !important;
+            color: #111827 !important;
+            padding: 0.55rem 0.75rem !important;
+            border-radius: 0.5rem !important;
+        }}
+        [data-testid="stTextArea"] textarea::placeholder,
+        [data-testid="stTextInput"] input::placeholder {{
+            color: #6b7280 !important;
+            opacity: 1 !important;
         }}
         button[data-testid="baseButton-primary"] {{
             background-color: var(--ps-primary-color) !important;
@@ -3000,6 +3139,8 @@ def sidebar(user: Dict, pages: dict[str, str]) -> None:
         key="navigation_choice_sidebar",
         on_change=lambda: _sync_sales_nav("navigation_choice_sidebar", pages),
     )
+    st.sidebar.write("---")
+    render_sidebar_reminders(user)
     st.sidebar.write("---")
     st.sidebar.write(f"Logged in as **{user['username']}** ({user['role']})")
     if st.sidebar.button("Logout"):
@@ -4488,10 +4629,10 @@ def render_quotation_letter_page(user: Dict) -> None:
             key=letter_form_key("reference_no"),
             help="Official reference number for this quotation.",
         )
-        st.date_input(
+        render_human_date_input(
             "Date",
             key=letter_form_key("quote_date"),
-            help="Quotation issue date.",
+            help="Enter a date like YYYY-MM-DD or 'tomorrow'.",
         )
         st.text_input(
             "Customer contact name",
@@ -4507,6 +4648,7 @@ def render_quotation_letter_page(user: Dict) -> None:
             "Customer address",
             key=letter_form_key("customer_address"),
             help="Mailing address shown beneath the recipient.",
+            placeholder="Enter the full mailing address",
         )
         with get_conn() as conn:
             district_rows = conn.execute(
@@ -4553,11 +4695,13 @@ def render_quotation_letter_page(user: Dict) -> None:
             "Introduction / cover paragraph",
             key=letter_form_key("body_intro"),
             help="Opening paragraph placed after the salutation.",
+            placeholder="Add a brief opening paragraph",
         )
         st.text_area(
             "Product details",
             key=letter_form_key("product_details"),
             help="Technical specification, pricing breakdown or bullet points.",
+            placeholder="Summarize product specs, pricing, and inclusions",
         )
         st.text_input(
             "Tracked products",
@@ -4581,6 +4725,7 @@ def render_quotation_letter_page(user: Dict) -> None:
             "Closing / thanks",
             key=letter_form_key("closing_text"),
             help="Closing paragraph before the signature block.",
+            placeholder="Add closing remarks or thanks",
         )
         st.text_input(
             "Salesperson name",
@@ -4602,6 +4747,7 @@ def render_quotation_letter_page(user: Dict) -> None:
             "Quotation remarks for admin",
             key=letter_form_key("quotation_remark"),
             help="Notes about this quotation visible to admins.",
+            placeholder="Add internal remarks for admins",
         )
         st.selectbox(
             "Salesperson follow-up status",
@@ -4614,6 +4760,7 @@ def render_quotation_letter_page(user: Dict) -> None:
             "Salesperson follow-up notes",
             key=letter_form_key("follow_up_note"),
             help="Explain the follow-up status for admin review.",
+            placeholder="Add follow-up notes for admins",
         )
 
         follow_status_value = st.session_state.get(
@@ -4630,26 +4777,15 @@ def render_quotation_letter_page(user: Dict) -> None:
             if quick_choice != previous_choice:
                 set_follow_up_choice(quick_choice)
             follow_up_key = letter_form_key("follow_up_date")
-            if quick_choice == CUSTOM_FOLLOW_UP_CHOICE:
-                follow_up_value = st.session_state.get(follow_up_key)
-                if isinstance(follow_up_value, (date, datetime)):
-                    st.session_state[follow_up_key] = follow_up_value.strftime("%d-%m-%Y")
-                st.text_input(
-                    "Follow-up date",
-                    key=follow_up_key,
-                    help="Enter any date format; we will standardise it later.",
-                    placeholder="e.g. 12-03-2025 or March 12, 2025",
-                )
-            else:
-                follow_up_value = _coerce_date(st.session_state.get(follow_up_key)) or date.today()
+            follow_up_value = _coerce_date(st.session_state.get(follow_up_key))
+            if quick_choice != CUSTOM_FOLLOW_UP_CHOICE and not follow_up_value:
+                follow_up_value = date.today()
                 st.session_state[follow_up_key] = follow_up_value
-                st.date_input(
-                    "Follow-up date",
-                    key=follow_up_key,
-                    min_value=date.today(),
-                    value=follow_up_value,
-                    help="Choose when to receive a reminder while the opportunity is possible.",
-                )
+            render_human_date_input(
+                "Follow-up date",
+                key=follow_up_key,
+                help="Enter a date like YYYY-MM-DD or 'next friday'.",
+            )
             scheduled_date = _coerce_date(
                 st.session_state.get(follow_up_key)
             )
@@ -4757,10 +4893,7 @@ def render_quotation_letter_page(user: Dict) -> None:
                         f"Updated quotation letter #{letter_id} for {customer_label}",
                         user,
                     )
-                if (
-                    payload["follow_up_status"] == "possible"
-                    and payload.get("follow_up_date")
-                ):
+                if quotation_id:
                     schedule_follow_up_notifications(quotation_id)
                 if (
                     payload["payment_status"] == "paid"
@@ -5006,8 +5139,14 @@ def render_quotations(user: Dict) -> None:
                     if districts
                     else ""
                 )
-            address = st.text_area("Company address")
-            delivery_address = st.text_area("Delivery address")
+            address = st.text_area(
+                "Company address",
+                placeholder="Enter the company address",
+            )
+            delivery_address = st.text_area(
+                "Delivery address",
+                placeholder="Enter the delivery location or address",
+            )
     elif selected_company[1]:
         company_id = int(selected_company[1])
 
@@ -5074,9 +5213,10 @@ def render_quotations(user: Dict) -> None:
         if status == "inform_later":
             if follow_up_key not in st.session_state:
                 st.session_state[follow_up_key] = default_follow_up
-            follow_up_date_value = st.date_input(
+            follow_up_date_value = render_human_date_input(
                 "Follow-up date (required)",
                 key=follow_up_key,
+                help="Enter a date like YYYY-MM-DD or 'next friday'.",
             )
         else:
             st.session_state.pop(follow_up_key, None)
@@ -5121,9 +5261,10 @@ def render_quotations(user: Dict) -> None:
                 ["retail", "wholesale"],
                 index=["retail", "wholesale"].index(existing["quote_type"]) if existing else 0,
             )
-            quote_date = st.date_input(
+            quote_date = render_human_date_input(
                 "Quote date",
                 value=datetime.fromisoformat(existing["quote_date"]).date() if existing else date.today(),
+                help="Enter a date like YYYY-MM-DD or 'today'.",
             )
         with detail_cols[1]:
             payment_status_options = ["pending", "paid", "declined"]
@@ -5151,7 +5292,11 @@ def render_quotations(user: Dict) -> None:
             elif existing_receipt_path:
                 st.caption("Stored receipt available for download below.")
 
-        notes = st.text_area("Notes", value=existing["notes"] if existing else "")
+        notes = st.text_area(
+            "Notes",
+            value=existing["notes"] if existing else "",
+            placeholder="Add special terms, delivery details, or internal notes",
+        )
         pdf_upload = st.file_uploader("Quotation PDF", type=["pdf"])
         if existing_receipt_path and (payment_status != "paid" or not receipt_upload):
             st.markdown("**Stored receipt**")
@@ -5287,7 +5432,7 @@ def render_quotations(user: Dict) -> None:
                 f"{verb} quotation #{quotation_id} for {company_label}",
                 user,
             )
-            if status == "inform_later" and follow_up_date:
+            if quotation_id:
                 schedule_follow_up_notifications(quotation_id)
             if payment_status == "paid" and (
                 not existing or existing.get("payment_status") != "paid"
@@ -5324,13 +5469,12 @@ def render_quotations(user: Dict) -> None:
             key="quotation_filter_start_enabled",
         )
         start_seed = min_quote_date.date() if pd.notna(min_quote_date) else date.today()
-        start_date = st.date_input(
+        start_date = render_human_date_input(
             "Start date",
             value=start_seed,
             key="quotation_filter_start_date",
-            min_value=min_quote_date.date() if pd.notna(min_quote_date) else None,
-            max_value=max_quote_date.date() if pd.notna(max_quote_date) else None,
             disabled=not start_enabled,
+            help="Enter a date like YYYY-MM-DD.",
         )
         if not start_enabled:
             start_date = None
@@ -5339,13 +5483,12 @@ def render_quotations(user: Dict) -> None:
             key="quotation_filter_end_enabled",
         )
         end_seed = max_quote_date.date() if pd.notna(max_quote_date) else date.today()
-        end_date = st.date_input(
+        end_date = render_human_date_input(
             "End date",
             value=end_seed,
             key="quotation_filter_end_date",
-            min_value=min_quote_date.date() if pd.notna(min_quote_date) else None,
-            max_value=max_quote_date.date() if pd.notna(max_quote_date) else None,
             disabled=not end_enabled,
+            help="Enter a date like YYYY-MM-DD.",
         )
         if not end_enabled:
             end_date = None
@@ -5524,15 +5667,20 @@ def render_work_orders(user: Dict) -> None:
         selected_quotation_id = dict(quotation_options)[quotation_label]
         if not any(value is not None for _, value in quotation_options):
             st.info("No quotations available yet. Create a quotation first.")
-        upload_date = st.date_input(
+        upload_date = render_human_date_input(
             "Upload date",
             value=(
                 datetime.fromisoformat(existing["upload_date"]).date()
                 if existing
                 else date.today()
             ),
+            help="Enter a date like YYYY-MM-DD.",
         )
-        notes = st.text_area("Notes", value=existing["notes"] if existing else "")
+        notes = st.text_area(
+            "Notes",
+            value=existing["notes"] if existing else "",
+            placeholder="Add delivery instructions, scope, or internal notes",
+        )
         pdf_upload = st.file_uploader("Work order PDF", type=["pdf"], key="wo_pdf")
         submitted = st.form_submit_button("Save work order")
 
@@ -5763,13 +5911,14 @@ def render_delivery_orders(user: Dict) -> None:
         do_number = st.text_input(
             "Delivery order number", value=existing["do_number"] if existing else ""
         )
-        upload_date = st.date_input(
+        upload_date = render_human_date_input(
             "Upload date",
             value=(
                 datetime.fromisoformat(existing["upload_date"]).date()
                 if existing
                 else date.today()
             ),
+            help="Enter a date like YYYY-MM-DD.",
         )
         price = st.number_input(
             "Price", min_value=0.0, value=float(existing["price"]) if existing else 0.0
@@ -5779,13 +5928,14 @@ def render_delivery_orders(user: Dict) -> None:
         )
         payment_date = None
         if payment_received:
-            payment_date = st.date_input(
+            payment_date = render_human_date_input(
                 "Payment date",
                 value=(
                     datetime.fromisoformat(existing["payment_date"]).date()
                     if existing and existing["payment_date"]
                     else date.today()
                 ),
+                help="Enter a date like YYYY-MM-DD.",
             )
         receipt_upload = None
         if payment_received:
@@ -5799,7 +5949,11 @@ def render_delivery_orders(user: Dict) -> None:
                 st.caption("A receipt is already stored for this delivery order.")
         elif existing_receipt_path:
             st.caption("Stored receipt available for download below.")
-        notes = st.text_area("Notes", value=existing["notes"] if existing else "")
+        notes = st.text_area(
+            "Notes",
+            value=existing["notes"] if existing else "",
+            placeholder="Add delivery notes, contact details, or special handling instructions",
+        )
         pdf_upload = st.file_uploader("Delivery order PDF", type=["pdf"], key="do_pdf")
         if existing_receipt_path and (not payment_received or not receipt_upload):
             st.markdown("**Stored receipt**")
@@ -6078,14 +6232,14 @@ def render_admin_filters() -> None:
         quote_start_seed = (
             quote_min.date() if pd.notna(quote_min) else date.today()
         )
-        quote_start = fourth_row[1].date_input(
-            "Quote start date",
-            value=quote_start_seed,
-            key="admin_quote_start_date",
-            min_value=quote_min.date() if pd.notna(quote_min) else None,
-            max_value=quote_max.date() if pd.notna(quote_max) else None,
-            disabled=not quote_start_enabled,
-        )
+        with fourth_row[1]:
+            quote_start = render_human_date_input(
+                "Quote start date",
+                value=quote_start_seed,
+                key="admin_quote_start_date",
+                disabled=not quote_start_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
         if not quote_start_enabled:
             quote_start = None
         quote_end_enabled = fourth_row[2].checkbox(
@@ -6093,14 +6247,14 @@ def render_admin_filters() -> None:
             key="admin_quote_end_enabled",
         )
         quote_end_seed = quote_max.date() if pd.notna(quote_max) else date.today()
-        quote_end = fourth_row[2].date_input(
-            "Quote end date",
-            value=quote_end_seed,
-            key="admin_quote_end_date",
-            min_value=quote_min.date() if pd.notna(quote_min) else None,
-            max_value=quote_max.date() if pd.notna(quote_max) else None,
-            disabled=not quote_end_enabled,
-        )
+        with fourth_row[2]:
+            quote_end = render_human_date_input(
+                "Quote end date",
+                value=quote_end_seed,
+                key="admin_quote_end_date",
+                disabled=not quote_end_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
         if not quote_end_enabled:
             quote_end = None
 
@@ -6112,14 +6266,14 @@ def render_admin_filters() -> None:
         follow_start_seed = (
             follow_min.date() if pd.notna(follow_min) else date.today()
         )
-        follow_start = follow_row[0].date_input(
-            "Follow-up start",
-            value=follow_start_seed,
-            key="admin_follow_start_date",
-            min_value=follow_min.date() if pd.notna(follow_min) else None,
-            max_value=follow_max.date() if pd.notna(follow_max) else None,
-            disabled=not follow_start_enabled,
-        )
+        with follow_row[0]:
+            follow_start = render_human_date_input(
+                "Follow-up start",
+                value=follow_start_seed,
+                key="admin_follow_start_date",
+                disabled=not follow_start_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
         if not follow_start_enabled:
             follow_start = None
         follow_end_enabled = follow_row[1].checkbox(
@@ -6127,14 +6281,14 @@ def render_admin_filters() -> None:
             key="admin_follow_end_enabled",
         )
         follow_end_seed = follow_max.date() if pd.notna(follow_max) else date.today()
-        follow_end = follow_row[1].date_input(
-            "Follow-up end",
-            value=follow_end_seed,
-            key="admin_follow_end_date",
-            min_value=follow_min.date() if pd.notna(follow_min) else None,
-            max_value=follow_max.date() if pd.notna(follow_max) else None,
-            disabled=not follow_end_enabled,
-        )
+        with follow_row[1]:
+            follow_end = render_human_date_input(
+                "Follow-up end",
+                value=follow_end_seed,
+                key="admin_follow_end_date",
+                disabled=not follow_end_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
         if not follow_end_enabled:
             follow_end = None
 
@@ -6303,10 +6457,12 @@ def render_companies() -> None:
         address = st.text_area(
             "Company address",
             value=(selected_company["address"] or "") if selected_company else "",
+            placeholder="Enter the company address",
         )
         delivery_address = st.text_area(
             "Delivery address",
             value=(selected_company["delivery_address"] or "") if selected_company else "",
+            placeholder="Enter the delivery location or address",
         )
         district_choice = st.selectbox(
             "District",
@@ -6528,7 +6684,27 @@ def render_notifications(user: Dict) -> None:
             for notif_id in to_mark:
                 mark_notification_read(int(notif_id))
             st.success("Notifications updated")
-            rerun()
+        rerun()
+
+
+def render_sidebar_reminders(user: Dict) -> None:
+    st.sidebar.subheader("Reminders")
+    notifications = get_user_notifications(user["user_id"], include_read=False)
+    if notifications.empty:
+        st.sidebar.caption("No upcoming reminders.")
+        return
+    notifications = notifications.copy()
+    notifications["due_date"] = pd.to_datetime(
+        notifications["due_date"], errors="coerce"
+    )
+    notifications = notifications.sort_values(by="due_date")
+    for _, row in notifications.head(5).iterrows():
+        due_date = row.get("due_date")
+        due_label = (
+            due_date.strftime("%d %b %Y") if pd.notna(due_date) else "Date pending"
+        )
+        prefix = "⚠️" if pd.notna(due_date) and due_date.date() <= date.today() else "🔔"
+        st.sidebar.write(f"{prefix} {row.get('message')} ({due_label})")
 
 
 def render_settings() -> None:
