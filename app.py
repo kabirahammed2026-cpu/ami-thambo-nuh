@@ -788,10 +788,9 @@ def _build_report_column_config(
                 step=config.get("step"),
             )
         elif config.get("type") == "date":
-            column_config[key] = st.column_config.DateColumn(
+            column_config[key] = st.column_config.TextColumn(
                 label,
-                help=help_text,
-                format=config.get("format", "DD-MM-YYYY"),
+                help=help_text or "Enter any date format; we'll standardize to DD-MM-YYYY.",
             )
         elif config.get("type") == "select":
             column_config[key] = st.column_config.SelectboxColumn(
@@ -3300,6 +3299,69 @@ def to_iso_date(value) -> Optional[str]:
             return None
         parsed = parsed[0]
     return pd.Timestamp(parsed).normalize().strftime("%Y-%m-%d")
+
+
+def render_flexible_date_input(
+    label: str,
+    *,
+    value: object = None,
+    key: Optional[str] = None,
+    help: Optional[str] = None,
+    disabled: bool = False,
+    placeholder: str = "DD-MM-YYYY",
+) -> Optional[date]:
+    parsed_seed = parse_date_value(value)
+    default_text = parsed_seed.strftime(DATE_FMT) if parsed_seed is not None else (clean_text(value) or "")
+    existing = st.session_state.get(key) if key else None
+    text_value = existing if existing is not None else default_text
+    text_value = "" if text_value is None else str(text_value)
+    text_value = text_value.strip()
+    text = st.text_input(
+        label,
+        value=text_value,
+        key=key,
+        help=help,
+        disabled=disabled,
+        placeholder=placeholder,
+    )
+    parsed = parse_date_value(text)
+    if parsed is not None:
+        normalized = parsed.strftime(DATE_FMT)
+        if text != normalized:
+            if key:
+                st.session_state[key] = normalized
+            text = normalized
+    return parsed.date() if parsed is not None else None
+
+
+def render_flexible_date_range(
+    label: str,
+    *,
+    start_value: object = None,
+    end_value: object = None,
+    key_prefix: str,
+    help: Optional[str] = None,
+    disabled: bool = False,
+) -> tuple[Optional[date], Optional[date]]:
+    st.markdown(f"**{label}**")
+    range_cols = st.columns(2)
+    with range_cols[0]:
+        start_date = render_flexible_date_input(
+            "Start date",
+            value=start_value,
+            key=f"{key_prefix}_start",
+            help=help,
+            disabled=disabled,
+        )
+    with range_cols[1]:
+        end_date = render_flexible_date_input(
+            "End date",
+            value=end_value,
+            key=f"{key_prefix}_end",
+            help=help,
+            disabled=disabled,
+        )
+    return start_date, end_date
 
 
 def format_number(value) -> Optional[str]:
@@ -8689,7 +8751,7 @@ def dashboard(conn):
         _render_dashboard_announcement(allow_edit=True)
 
         st.markdown("#### Daily report coverage")
-        report_date_value = st.date_input(
+        report_date_value = render_flexible_date_input(
             "Review date",
             value=date.today(),
             key="dashboard_daily_report_date",
@@ -11735,11 +11797,11 @@ def _render_doc_detail_inputs(
         details["items"] = items_records
         st.session_state[items_key] = items_records
         default_purchase_date = parse_date_value(defaults.get("purchase_date"))
-        details["quote_date"] = st.date_input(
+        details["quote_date"] = render_flexible_date_input(
             "Quotation date",
             value=default_purchase_date or date.today(),
             key=f"{key_prefix}_quotation_date",
-            format="DD-MM-YYYY",
+            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
         )
         details["payment_status"] = st.selectbox(
             "Payment status",
@@ -11885,11 +11947,11 @@ def _render_doc_detail_inputs(
         )
         details["items"] = items_records
         st.session_state[items_key] = items_records
-        details["service_date"] = st.date_input(
+        details["service_date"] = render_flexible_date_input(
             "Service date",
             value=date.today(),
             key=f"{key_prefix}_service_date",
-            format="DD-MM-YYYY",
+            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
         )
         details["description"] = st.text_area(
             "Service description",
@@ -11957,11 +12019,11 @@ def _render_doc_detail_inputs(
         )
         details["items"] = items_records
         st.session_state[items_key] = items_records
-        details["maintenance_date"] = st.date_input(
+        details["maintenance_date"] = render_flexible_date_input(
             "Maintenance date",
             value=date.today(),
             key=f"{key_prefix}_maintenance_date",
-            format="DD-MM-YYYY",
+            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
         )
         details["description"] = st.text_area(
             "Maintenance description",
@@ -14299,7 +14361,7 @@ def customers_page(conn):
             )
             purchase_date = None
             if purchase_date_enabled:
-                purchase_date = st.date_input(
+                purchase_date = render_flexible_date_input(
                     "Purchase date",
                     value=purchase_default or datetime.now().date(),
                     key="new_customer_purchase_date",
@@ -14509,11 +14571,13 @@ def customers_page(conn):
                 if create_service:
                     service_cols = st.columns((1, 1, 1))
                     service_date_default = purchase_date or datetime.now().date()
-                    service_date_input = service_cols[0].date_input(
-                        "Service date",
-                        value=service_date_default,
-                        key="new_customer_service_date",
-                    )
+                    with service_cols[0]:
+                        service_date_input = render_flexible_date_input(
+                            "Service date",
+                            value=service_date_default,
+                            key="new_customer_service_date",
+                            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                        )
                     service_description = service_cols[1].text_area(
                         "Service description",
                         key="new_customer_service_description",
@@ -14540,11 +14604,13 @@ def customers_page(conn):
                 if create_maintenance:
                     maintenance_cols = st.columns((1, 1, 1))
                     maintenance_date_default = purchase_date or datetime.now().date()
-                    maintenance_date_input = maintenance_cols[0].date_input(
-                        "Maintenance date",
-                        value=maintenance_date_default,
-                        key="new_customer_maintenance_date",
-                    )
+                    with maintenance_cols[0]:
+                        maintenance_date_input = render_flexible_date_input(
+                            "Maintenance date",
+                            value=maintenance_date_default,
+                            key="new_customer_maintenance_date",
+                            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+                        )
                     maintenance_description = maintenance_cols[1].text_area(
                         "Maintenance description",
                         key="new_customer_maintenance_description",
@@ -15349,11 +15415,12 @@ def customers_page(conn):
                     key=f"customer_note_followup_{selected_customer_id}",
                 )
                 default_date = datetime.now().date()
-                reminder_date = st.date_input(
+                reminder_date = render_flexible_date_input(
                     "Reminder date",
                     value=default_date,
                     key=f"customer_note_reminder_{selected_customer_id}",
                     disabled=not enable_follow_up,
+                    help="Enter any date format; we'll standardize to DD-MM-YYYY.",
                 )
                 add_note = st.form_submit_button("Add remark", type="primary")
             if add_note:
@@ -15387,7 +15454,11 @@ def customers_page(conn):
                     int(row["note_id"]): row for row in notes_df.to_dict("records") if int_or_none(row.get("note_id")) is not None
                 }
                 editor_df = notes_df.copy()
-                editor_df["remind_on"] = pd.to_datetime(editor_df["remind_on"], errors="coerce")
+                editor_df["remind_on"] = editor_df["remind_on"].apply(
+                    lambda value: parse_date_value(value).strftime(DATE_FMT)
+                    if parse_date_value(value) is not None
+                    else ""
+                )
                 editor_df["created_at"] = pd.to_datetime(editor_df["created_at"], errors="coerce")
                 editor_df["updated_at"] = pd.to_datetime(editor_df["updated_at"], errors="coerce")
                 editor_df["Done"] = editor_df.get("is_done", 0).fillna(0).astype(int).apply(lambda v: bool(v))
@@ -15414,8 +15485,9 @@ def customers_page(conn):
                     column_config={
                         "note_id": st.column_config.Column("ID", disabled=True),
                         "note": st.column_config.TextColumn("Remark"),
-                        "remind_on": st.column_config.DateColumn(
-                            "Reminder date", format="DD-MM-YYYY", required=False
+                        "remind_on": st.column_config.TextColumn(
+                            "Reminder date",
+                            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
                         ),
                         "Done": st.column_config.CheckboxColumn("Completed"),
                         "created_at": st.column_config.DatetimeColumn(
@@ -15712,10 +15784,11 @@ def warranties_page(conn):
             key=note_key,
             help="Store remarks that will show up in follow-up reminders.",
         )
-        reminder_date = st.date_input(
+        reminder_date = render_flexible_date_input(
             "Reminder date",
             value=reminder_default,
-            help="Pick when to be reminded about this warranty.",
+            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+            key=f"warranty_followup_reminder_{selected_warranty}",
         )
         submit_followup = st.form_submit_button("Save reminder", type="primary")
 
@@ -15940,21 +16013,22 @@ def _render_service_section(conn, *, show_heading: bool = True):
         status_choice = get_status_choice("service_new")
         today = datetime.now().date()
         if status_choice == "Completed":
-            service_period_value = st.date_input(
+            service_period_value = render_flexible_date_range(
                 "Service period",
-                value=(today, today),
-                help="Select the start and end dates for the completed service.",
-                key="service_new_period_completed",
+                start_value=today,
+                end_value=today,
+                key_prefix="service_new_period_completed",
+                help="Enter start and end dates (any format). We'll standardize to DD-MM-YYYY.",
             )
         elif status_choice == "In progress":
-            service_period_value = st.date_input(
+            service_period_value = render_flexible_date_input(
                 "Service start date",
                 value=today,
                 help="Choose when this service work began.",
                 key="service_new_period_start",
             )
         else:
-            service_period_value = st.date_input(
+            service_period_value = render_flexible_date_input(
                 "Planned start date",
                 value=today,
                 help="Select when this service is scheduled to begin.",
@@ -16307,21 +16381,22 @@ def _render_service_section(conn, *, show_heading: bool = True):
         default_start = existing_start or today
         default_end = existing_end or default_start
         if edit_status_choice == "Completed":
-            edit_period_value = st.date_input(
+            edit_period_value = render_flexible_date_range(
                 "Service period",
-                value=(default_start, default_end),
-                key=f"service_edit_{selected_service_id}_period_completed",
+                start_value=default_start,
+                end_value=default_end,
+                key_prefix=f"service_edit_{selected_service_id}_period_completed",
                 help="Update the start and end dates for this service.",
             )
         elif edit_status_choice == "In progress":
-            edit_period_value = st.date_input(
+            edit_period_value = render_flexible_date_input(
                 "Service start date",
                 value=default_start,
                 key=f"service_edit_{selected_service_id}_period_start",
                 help="Adjust when this service began.",
             )
         else:
-            edit_period_value = st.date_input(
+            edit_period_value = render_flexible_date_input(
                 "Planned start date",
                 value=default_start,
                 key=f"service_edit_{selected_service_id}_period_planned",
@@ -17733,10 +17808,11 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
         st.markdown("### Quotation details")
         basic_cols = st.columns((1, 1))
         with basic_cols[0]:
-            quotation_date = st.date_input(
+            quotation_date = render_flexible_date_input(
                 "Quotation date",
                 value=st.session_state.get("quotation_date") or default_date,
                 key="quotation_date",
+                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
             )
             customer_company = st.text_input(
                 "Customer name",
@@ -17858,12 +17934,14 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                     follow_up_seed.date() if follow_up_seed else datetime.now().date()
                 )
                 if not isinstance(follow_up_raw, (date, datetime)):
-                    st.session_state["quotation_follow_up_date"] = follow_up_default
-                follow_up_date_value = st.date_input(
+                    st.session_state["quotation_follow_up_date"] = follow_up_default.strftime(
+                        DATE_FMT
+                    )
+                follow_up_date_value = render_flexible_date_input(
                     "Next follow-up date",
                     value=follow_up_default,
                     key="quotation_follow_up_date",
-                    disabled=False,
+                    help="Enter any date format; we'll standardize to DD-MM-YYYY.",
                 )
             else:
                 st.session_state["quotation_follow_up_date"] = None
@@ -18213,26 +18291,11 @@ def _render_quotation_management(conn):
             deduped.append(name)
         return ", ".join(deduped)
 
-    def _as_editable_date(value: object) -> Optional[date]:
-        if value in (None, "", "nan", "NaT"):
+    def _as_editable_date(value: object) -> Optional[str]:
+        parsed = parse_date_value(value)
+        if parsed is None:
             return None
-        if isinstance(value, datetime):
-            return value.date()
-        if isinstance(value, date):
-            return value
-        try:
-            parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
-        except Exception:
-            return None
-        if isinstance(parsed, pd.DatetimeIndex):
-            parsed = parsed[0] if len(parsed) else None
-        if parsed is None or pd.isna(parsed):
-            return None
-        if isinstance(parsed, pd.Timestamp):
-            parsed = parsed.to_pydatetime()
-        if isinstance(parsed, datetime):
-            return parsed.date()
-        return None
+        return parsed.strftime(DATE_FMT)
 
     quotes_df = quotes_df.copy()
     quotes_df["follow_up_date"] = quotes_df.get("follow_up_date", pd.Series(dtype=object)).apply(
@@ -18290,8 +18353,9 @@ def _render_quotation_management(conn):
 
     edit_config = {
         "follow_up_notes": st.column_config.TextColumn("Follow-up notes"),
-        "follow_up_date": st.column_config.DateColumn(
-            "Follow-up date", format="DD-MM-YYYY"
+        "follow_up_date": st.column_config.TextColumn(
+            "Follow-up date",
+            help="Enter any date format; we'll standardize to DD-MM-YYYY.",
         ),
         "reminder_label": st.column_config.TextColumn("Reminder"),
         "reference": st.column_config.TextColumn("Reference"),
@@ -18422,11 +18486,11 @@ def _render_quotation_management(conn):
         )
         follow_up_date_input: Optional[date] = None
         if not clear_follow_up_date:
-            follow_up_date_input = st.date_input(
+            follow_up_date_input = render_flexible_date_input(
                 "Follow-up date",
                 value=follow_up_date_seed or date.today(),
                 key="quotation_detail_follow_up_date",
-                format="DD-MM-YYYY",
+                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
             )
     with col_right:
         follow_up_notes_input = st.text_area(
@@ -18586,11 +18650,12 @@ def advanced_search_page(conn):
         key="advanced_search_keyword",
         help="Search across quotations, customers, delivery orders, services, and maintenance logs.",
     )
-    date_window = st.date_input(
+    date_window = render_flexible_date_range(
         "Date window",
-        value=(date.today() - timedelta(days=30), date.today()),
+        start_value=date.today() - timedelta(days=30),
+        end_value=date.today(),
+        key_prefix="advanced_search_dates",
         help="Filter results by creation or activity date.",
-        key="advanced_search_dates",
     )
     min_amount = st.number_input(
         "Minimum amount (for quotations)",
@@ -18841,10 +18906,12 @@ def advanced_search_page(conn):
         format_func=lambda uid: staff_map.get(uid, f"User #{uid}"),
         key="advanced_search_history_staff",
     )
-    history_range = st.date_input(
+    history_range = render_flexible_date_range(
         "History range",
-        value=date_window,
-        key="advanced_search_history_range",
+        start_value=date_window[0] if isinstance(date_window, (list, tuple)) else None,
+        end_value=date_window[1] if isinstance(date_window, (list, tuple)) else None,
+        key_prefix="advanced_search_history_range",
+        help="Filter history entries by date.",
     )
     history_start = history_end = None
     if isinstance(history_range, (list, tuple)) and len(history_range) == 2:
@@ -18994,21 +19061,22 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         maintenance_status_choice = get_status_choice("maintenance_new")
         today = datetime.now().date()
         if maintenance_status_choice == "Completed":
-            maintenance_period_value = st.date_input(
+            maintenance_period_value = render_flexible_date_range(
                 "Maintenance period",
-                value=(today, today),
+                start_value=today,
+                end_value=today,
                 help="Select the start and end dates for the maintenance work.",
-                key="maintenance_new_period_completed",
+                key_prefix="maintenance_new_period_completed",
             )
         elif maintenance_status_choice == "In progress":
-            maintenance_period_value = st.date_input(
+            maintenance_period_value = render_flexible_date_input(
                 "Maintenance start date",
                 value=today,
                 help="Choose when this maintenance began.",
                 key="maintenance_new_period_start",
             )
         else:
-            maintenance_period_value = st.date_input(
+            maintenance_period_value = render_flexible_date_input(
                 "Planned start date",
                 value=today,
                 help="Select when this maintenance is scheduled to begin.",
@@ -19336,21 +19404,22 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         default_start = existing_start or today
         default_end = existing_end or default_start
         if maintenance_edit_choice == "Completed":
-            maintenance_period_edit = st.date_input(
+            maintenance_period_edit = render_flexible_date_range(
                 "Maintenance period",
-                value=(default_start, default_end),
-                key=f"maintenance_edit_{selected_maintenance_id}_period_completed",
+                start_value=default_start,
+                end_value=default_end,
+                key_prefix=f"maintenance_edit_{selected_maintenance_id}_period_completed",
                 help="Update the start and end dates for this maintenance record.",
             )
         elif maintenance_edit_choice == "In progress":
-            maintenance_period_edit = st.date_input(
+            maintenance_period_edit = render_flexible_date_input(
                 "Maintenance start date",
                 value=default_start,
                 key=f"maintenance_edit_{selected_maintenance_id}_period_start",
                 help="Adjust when this maintenance began.",
             )
         else:
-            maintenance_period_edit = st.date_input(
+            maintenance_period_edit = render_flexible_date_input(
                 "Planned start date",
                 value=default_start,
                 key=f"maintenance_edit_{selected_maintenance_id}_period_planned",
@@ -20166,10 +20235,11 @@ def delivery_orders_page(
         )
     date_range = None
     if use_date_filter:
-        date_range = st.date_input(
+        date_range = render_flexible_date_range(
             "Created between",
-            value=(datetime.now().date() - timedelta(days=30), datetime.now().date()),
-            key=filter_date_range_key,
+            start_value=datetime.now().date() - timedelta(days=30),
+            end_value=datetime.now().date(),
+            key_prefix=filter_date_range_key,
         )
 
     do_df = df_query(
@@ -21791,12 +21861,14 @@ def import_page(conn):
         hide_index=True,
         num_rows="dynamic",
         column_config={
-            "date": st.column_config.DateColumn("Date", format="DD-MM-YYYY", required=False),
-            "purchase_date": st.column_config.DateColumn(
-                "Purchase date", format="DD-MM-YYYY", required=False
+            "date": st.column_config.TextColumn(
+                "Date", help="Enter any date format; we'll standardize to DD-MM-YYYY."
             ),
-            "follow_up_date": st.column_config.DateColumn(
-                "Follow-up date", format="DD-MM-YYYY", required=False
+            "purchase_date": st.column_config.TextColumn(
+                "Purchase date", help="Enter any date format; we'll standardize to DD-MM-YYYY."
+            ),
+            "follow_up_date": st.column_config.TextColumn(
+                "Follow-up date", help="Enter any date format; we'll standardize to DD-MM-YYYY."
             ),
             "work_done_code": st.column_config.TextColumn(
                 "Work done code", required=False
@@ -24108,35 +24180,39 @@ def reports_page(conn):
             key="report_period_type",
         )
         if period_choice == "daily":
-            day_kwargs: dict[str, object] = {}
+            day_value = render_flexible_date_input(
+                "Report date",
+                value=default_start,
+                key="report_period_daily",
+                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
+            )
             if (
                 STRICT_REPORT_WINDOWS
                 and not is_admin
                 and not editing_record
+                and day_value
+                and day_value != today
             ):
-                day_kwargs["min_value"] = today
-                day_kwargs["max_value"] = today
-            day_value = st.date_input(
-                "Report date",
-                value=default_start,
-                key="report_period_daily",
-                **day_kwargs,
-            )
+                st.warning("Reports are limited to today for staff accounts.")
+                day_value = today
+                st.session_state["report_period_daily"] = today.strftime(DATE_FMT)
             start_date = day_value
             end_date = day_value
         elif period_choice == "weekly":
             base_start = default_start if editing_record else today - timedelta(days=today.weekday())
             base_end = default_end if editing_record else base_start + timedelta(days=6)
-            week_value = st.date_input(
+            week_value = render_flexible_date_range(
                 "Week range",
-                value=(base_start, base_end),
-                key="report_period_weekly",
+                start_value=base_start,
+                end_value=base_end,
+                key_prefix="report_period_weekly",
+                help="Enter any date format; we'll standardize to DD-MM-YYYY.",
             )
             if isinstance(week_value, (list, tuple)) and len(week_value) == 2:
                 start_date, end_date = week_value
             else:
                 start_date = week_value
-                end_date = week_value + timedelta(days=6)
+                end_date = week_value + timedelta(days=6) if week_value else None
             st.caption(
                 f"Selected window: {format_period_range(to_iso_date(start_date), to_iso_date(end_date))}"
             )
@@ -24146,17 +24222,13 @@ def reports_page(conn):
                 month_seed = base_month.replace(day=1)
             except Exception:
                 month_seed = date(today.year, today.month, 1)
-            month_value = st.date_input(
+            month_value = render_flexible_date_input(
                 "Month",
                 value=month_seed,
                 key="report_period_monthly",
+                help="Enter any date in the month; we'll standardize to DD-MM-YYYY.",
             )
-            if isinstance(month_value, (list, tuple)) and month_value:
-                month_seed = month_value[0]
-            else:
-                month_seed = month_value
-            if not isinstance(month_seed, date):
-                month_seed = month_seed.to_pydatetime().date() if hasattr(month_seed, "to_pydatetime") else month_seed
+            month_seed = month_value or month_seed
             if not isinstance(month_seed, date):
                 month_seed = date(today.year, today.month, 1)
             month_start = month_seed.replace(day=1)
@@ -24432,10 +24504,12 @@ def reports_page(conn):
     )
 
     default_history_start = today - timedelta(days=30)
-    history_range = st.date_input(
+    history_range = render_flexible_date_range(
         "Period range",
-        value=(default_history_start, today),
-        key="report_history_range",
+        start_value=default_history_start,
+        end_value=today,
+        key_prefix="report_history_range",
+        help="Enter any date format; we'll standardize to DD-MM-YYYY.",
     )
     range_start = range_end = None
     if isinstance(history_range, (list, tuple)) and len(history_range) == 2:
