@@ -10,6 +10,9 @@ import os
 import re
 import sqlite3
 import textwrap
+import subprocess
+import tempfile
+import secrets
 import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -57,6 +60,8 @@ BACKUP_MIRROR_PATH = (
     Path(BACKUP_MIRROR_DIR).expanduser() if BACKUP_MIRROR_DIR else None
 )
 LOG_PATH = CONFIG.data_dir / "ps_sales.log"
+DEBUG_DIAG = os.getenv("DEBUG_DIAG", "").strip().lower() in {"1", "true", "yes", "on"}
+MAX_UPLOAD_BYTES = int(float(os.getenv("PS_SALES_MAX_UPLOAD_MB", "25")) * 1024 * 1024)
 
 
 DEFAULT_QUOTATION_STATUSES: Tuple[str, ...] = (
@@ -108,6 +113,36 @@ def _get_logger() -> logging.Logger:
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
     return logger
+
+
+def _debug_diag_enabled() -> bool:
+    return DEBUG_DIAG
+
+
+def _get_git_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parent,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _format_bytes(size: Optional[int]) -> str:
+    if size is None:
+        return "unknown"
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
 
 
 class SafeFormatDict(dict):
@@ -914,7 +949,11 @@ def render_letter_preview(state: Dict[str, Any]) -> None:
 
 
 def save_uploaded_file(uploaded_file, subdir: str) -> Optional[str]:
-    return UPLOAD_MANAGER.save(uploaded_file, subdir)
+    try:
+        return UPLOAD_MANAGER.save(uploaded_file, subdir)
+    except ValueError as exc:
+        st.error(str(exc))
+        return None
 
 
 def generate_letter_pdf(state: Dict[str, Any]) -> bytes:
@@ -2453,6 +2492,46 @@ def authenticate(username: str, password: str) -> Tuple[Optional[Dict], Optional
     return None, "Invalid credentials."
 
 
+def _ensure_debug_user() -> Optional[Dict]:
+    if not _debug_diag_enabled():
+        return None
+    if st.session_state.get("user"):
+        return st.session_state["user"]
+    debug_username = os.getenv("DEBUG_DIAG_USER", "diagnostic")
+    with get_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT user_id, username, role, display_name, designation, phone FROM users WHERE username=?",
+            (debug_username,),
+        ).fetchone()
+    if row is None:
+        hashed = PASSWORD_SERVICE.hash(secrets.token_urlsafe(16))
+        with get_cursor() as cur:
+            cur.execute(
+                "INSERT INTO users(username, pass_hash, role) VALUES (?, ?, 'admin')",
+                (debug_username, hashed),
+            )
+        with get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT user_id, username, role, display_name, designation, phone FROM users WHERE username=?",
+                (debug_username,),
+            ).fetchone()
+    if row is None:
+        return None
+    payload = {
+        "user_id": row["user_id"],
+        "username": row["username"],
+        "role": row["role"],
+        "display_name": row["display_name"],
+        "designation": row["designation"],
+        "phone": row["phone"],
+    }
+    st.session_state["user"] = payload
+    st.session_state["debug_diag"] = True
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
@@ -2555,31 +2634,34 @@ def apply_theme_styles() -> None:
         }}
         [data-testid="stDataFrame"],
         [data-testid="stDataEditor"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
-            color-scheme: light !important;
         }}
         [data-testid="stDataFrame"] > div,
         [data-testid="stDataEditor"] > div,
         [data-testid="stDataFrame"] [role="grid"],
         [data-testid="stDataEditor"] [role="grid"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
         }}
         [data-testid="stDataFrame"] [role="columnheader"],
         [data-testid="stDataFrame"] [role="gridcell"],
         [data-testid="stDataEditor"] [role="columnheader"],
         [data-testid="stDataEditor"] [role="gridcell"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataEditor"] input,
         [data-testid="stDataEditor"] textarea {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-baseweb="table"],
@@ -2587,25 +2669,25 @@ def apply_theme_styles() -> None:
         [data-baseweb="table"] tbody,
         [data-baseweb="table"] th,
         [data-baseweb="table"] td {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
-            color-scheme: light !important;
         }}
         [data-baseweb="table"] [role="rowgroup"],
         [data-baseweb="table"] [role="row"],
         [data-baseweb="table"] [role="gridcell"],
         [data-baseweb="table"] [role="columnheader"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
-            color-scheme: light !important;
         }}
         [data-baseweb="table"] tr:nth-child(even) {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
         }}
         [data-testid="stTable"] {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             border: 1px solid var(--ps-panel-border) !important;
             border-radius: 0.65rem;
             overflow: hidden;
@@ -2613,15 +2695,17 @@ def apply_theme_styles() -> None:
         [data-testid="stTable"] table,
         [data-testid="stTable"] th,
         [data-testid="stTable"] td {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stMarkdownContainer"] table,
         [data-testid="stMarkdownContainer"] th,
         [data-testid="stMarkdownContainer"] td {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+            -webkit-text-fill-color: var(--text-color) !important;
             border-color: var(--ps-panel-border) !important;
         }}
         [data-testid="stDataFrame"],
@@ -2629,10 +2713,9 @@ def apply_theme_styles() -> None:
         [data-testid="stTable"],
         [data-baseweb="table"],
         [data-baseweb="table"] * {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
             -webkit-text-fill-color: var(--text-color) !important;
-            color-scheme: light !important;
         }}
         [data-baseweb="table"] [role="gridcell"] *,
         [data-baseweb="table"] [role="columnheader"] *,
@@ -2647,7 +2730,7 @@ def apply_theme_styles() -> None:
         [data-testid="stDataFrame"] *,
         [data-testid="stDataEditor"] *,
         [data-testid="stTable"] * {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
             -webkit-text-fill-color: var(--text-color) !important;
         }}
@@ -2676,7 +2759,7 @@ def apply_theme_styles() -> None:
         [data-testid="stDataEditor"] [role="columnheader"],
         [data-testid="stTable"] th,
         [data-testid="stTable"] td {{
-            background-color: var(--ps-panel-bg) !important;
+            background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
             -webkit-text-fill-color: var(--text-color) !important;
         }}
@@ -2709,6 +2792,160 @@ def apply_theme_styles() -> None:
     )
 
 
+def _path_status(path: Path) -> dict[str, object]:
+    exists = path.exists()
+    writable = False
+    last_modified = ""
+    if exists:
+        try:
+            test_file = path / ".write_test" if path.is_dir() else path
+            if path.is_dir():
+                test_file.write_text("ok", encoding="utf-8")
+                test_file.unlink(missing_ok=True)
+            writable = True
+        except OSError:
+            writable = False
+        try:
+            last_modified = datetime.fromtimestamp(path.stat().st_mtime).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except OSError:
+            last_modified = ""
+    return {
+        "path": str(path),
+        "exists": exists,
+        "writable": writable,
+        "last_modified": last_modified or "n/a",
+    }
+
+
+def _render_sales_upload_preview(path: Path, label: str) -> None:
+    suffix = path.suffix.lower()
+    payload = path.read_bytes()
+    if suffix == ".pdf":
+        encoded = base64.b64encode(payload).decode("utf-8")
+        iframe = (
+            f"<iframe src='data:application/pdf;base64,{encoded}' "
+            "width='100%' height='520px' style='border: none;'></iframe>"
+        )
+        st.markdown(iframe, unsafe_allow_html=True)
+    elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        st.image(payload, caption=label, use_column_width=True)
+    else:
+        st.info("Preview not available for this file type.")
+    st.download_button("Download file", data=payload, file_name=path.name)
+
+
+def render_system_diagnostics_sales() -> None:
+    st.title("System Diagnostics")
+    st.caption("DEBUG_DIAG is enabled. Diagnostics run without login.")
+
+    system_info = {
+        "cwd": os.getcwd(),
+        "data_dir": str(CONFIG.data_dir),
+        "db_path": str(DATABASE.db_path),
+        "git_commit": _get_git_commit(),
+        "debug_diag": str(_debug_diag_enabled()),
+    }
+    st.subheader("System info")
+    st.json(system_info)
+
+    env_keys = [
+        "PS_SALES_DATA_DIR",
+        "PS_SALES_DB_URL",
+        "PS_SALES_MAX_UPLOAD_MB",
+        "DEBUG_DIAG",
+    ]
+    st.subheader("Environment variables")
+    st.table([{"key": key, "value": os.getenv(key, "")} for key in env_keys])
+
+    st.subheader("Streamlit theme")
+    st.json(
+        {
+            "theme.base": st.get_option("theme.base"),
+            "theme.textColor": st.get_option("theme.textColor"),
+            "theme.backgroundColor": st.get_option("theme.backgroundColor"),
+            "theme.secondaryBackgroundColor": st.get_option("theme.secondaryBackgroundColor"),
+        }
+    )
+
+    st.subheader("Storage paths")
+    st.table(
+        [
+            _path_status(CONFIG.data_dir),
+            _path_status(BACKUP_DIR),
+            _path_status(UPLOAD_MANAGER.base_dir),
+            _path_status(DATABASE.db_path),
+        ]
+    )
+
+    st.subheader("Database integrity checks")
+    if st.button("Run read checks", use_container_width=True):
+        try:
+            with get_conn() as conn:
+                conn.row_factory = sqlite3.Row
+                companies = conn.execute("SELECT COUNT(*) AS c FROM companies").fetchone()
+                quotations = conn.execute("SELECT COUNT(*) AS c FROM quotations").fetchone()
+            st.success(
+                f"Read check OK • companies={companies['c']} • quotations={quotations['c']}"
+            )
+        except Exception as exc:
+            st.error(f"Read check failed: {exc}")
+
+    st.subheader("Upload diagnostics")
+    st.caption(f"Max upload size: {_format_bytes(MAX_UPLOAD_BYTES)}")
+    diag_upload = st.file_uploader(
+        "Upload a PDF or image to verify preview/download",
+        type=["pdf", "png", "jpg", "jpeg", "webp", "gif"],
+        key="sales_diag_upload_file",
+    )
+    if diag_upload is not None and st.button(
+        "Save diagnostic upload", key="sales_diag_upload_save"
+    ):
+        size = getattr(diag_upload, "size", None)
+        if size and size > MAX_UPLOAD_BYTES:
+            st.error(f"File exceeds {_format_bytes(MAX_UPLOAD_BYTES)} size limit.")
+        else:
+            try:
+                relative_path = UPLOAD_MANAGER.save(diag_upload, "diagnostics")
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            st.success(f"Saved to {relative_path}")
+            path = CONFIG.data_dir / relative_path
+            if path.exists():
+                _render_sales_upload_preview(path, path.name)
+
+    st.subheader("Backup diagnostics")
+    if st.button("Create diagnostic backup", use_container_width=True):
+        try:
+            archive_bytes = build_full_archive()
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
+                contents = zf.namelist()
+            st.success(f"Backup created with {len(contents)} entries.")
+        except Exception as exc:
+            st.error(f"Backup failed: {exc}")
+    if st.button("Dry-run restore latest backup", use_container_width=True):
+        backups = sorted(
+            BACKUP_DIR.glob("ps_sales_backup_*.zip"), key=lambda p: p.stat().st_mtime
+        )
+        if not backups:
+            st.warning("No backups found.")
+        else:
+            latest = backups[-1]
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with zipfile.ZipFile(latest, "r") as zf:
+                        zf.extractall(tmpdir)
+                    db_candidates = list(Path(tmpdir).rglob("*.db"))
+                st.success(
+                    f"Dry-run restore OK • extracted {latest.name} • "
+                    f"db files found: {len(db_candidates)}"
+                )
+            except Exception as exc:
+                st.error(f"Dry-run restore failed: {exc}")
+
+
 def _navigation_pages(user: Dict) -> dict[str, str]:
     pages_common = {
         "Dashboard": "dashboard",
@@ -2724,8 +2961,12 @@ def _navigation_pages(user: Dict) -> dict[str, str]:
         "Users": "users",
     }
     if user["role"] == "admin":
-        return {**pages_common, **pages_admin}
-    return pages_common
+        pages = {**pages_common, **pages_admin}
+    else:
+        pages = pages_common
+    if _debug_diag_enabled():
+        pages["System Diagnostics"] = "diagnostics"
+    return pages
 
 
 def _sync_sales_nav(key: str, pages: dict[str, str]) -> None:
@@ -2740,6 +2981,8 @@ def _sync_sales_nav(key: str, pages: dict[str, str]) -> None:
 def sidebar(user: Dict, pages: dict[str, str]) -> None:
     labels = list(pages.keys())
     st.sidebar.title("Navigation")
+    if _debug_diag_enabled():
+        st.sidebar.warning("DEBUG_DIAG enabled: login bypassed.")
     if st.sidebar.button("Create quotation", use_container_width=True):
         st.session_state["active_page"] = "quotation_letters"
 
@@ -6332,6 +6575,8 @@ def main() -> None:
         st.session_state.pop("user", None)
         st.session_state.pop("active_page", None)
         st.session_state.pop("navigation_choice", None)
+    if _debug_diag_enabled():
+        _ensure_debug_user()
     if "user" not in st.session_state:
         login_screen()
         return
@@ -6376,6 +6621,8 @@ def main() -> None:
         render_users()
     elif page == "notifications":
         render_notifications(user)
+    elif page == "diagnostics":
+        render_system_diagnostics_sales()
 
 
 if __name__ == "__main__":
