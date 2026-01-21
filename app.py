@@ -41,6 +41,7 @@ from backup_utils import ensure_monthly_backup, get_backup_status, enforce_backu
 
 import streamlit as st
 from streamlit.components.v1 import html as st_components_html
+from streamlit.errors import StreamlitAPIException
 from collections import OrderedDict
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -188,6 +189,93 @@ def _format_bytes(size: Optional[int]) -> str:
         if value < 1024 or unit == units[-1]:
             return f"{value:.1f} {unit}"
         value /= 1024
+
+
+def _looks_like_date_column(column_name: str) -> bool:
+    lowered = column_name.lower()
+    return "date" in lowered or lowered.endswith("_at") or lowered.endswith("_on")
+
+
+def normalize_editor_df(df: pd.DataFrame) -> tuple[pd.DataFrame, set[str]]:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame(), set()
+    normalized = df.copy()
+    date_columns: set[str] = set()
+    for col in normalized.columns:
+        series = normalized[col]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            normalized[col] = pd.to_datetime(series, errors="coerce").dt.date
+            date_columns.add(col)
+            continue
+        try:
+            parsed = pd.to_datetime(series, errors="coerce")
+        except Exception:
+            parsed = pd.Series([pd.NaT] * len(series))
+        non_null_ratio = parsed.notna().mean() if len(parsed) else 0.0
+        if _looks_like_date_column(col) or non_null_ratio >= 0.6:
+            normalized[col] = parsed.dt.date
+            date_columns.add(col)
+    return normalized, date_columns
+
+
+def build_column_config(
+    df: pd.DataFrame, date_columns: set[str]
+) -> tuple[dict[str, object], list[str], list[str]]:
+    column_config: dict[str, object] = {}
+    disabled_columns: list[str] = []
+    warnings: list[str] = []
+    for col in df.columns:
+        lowered = str(col).lower()
+        if lowered in {"id", "doc_id"} or lowered.endswith("_id"):
+            disabled_columns.append(col)
+        series = df[col]
+        if col in date_columns:
+            column_config[col] = st.column_config.DateColumn(
+                col, format="YYYY-MM-DD"
+            )
+        elif pd.api.types.is_bool_dtype(series):
+            column_config[col] = st.column_config.CheckboxColumn(col)
+        elif pd.api.types.is_numeric_dtype(series):
+            column_config[col] = st.column_config.NumberColumn(col)
+        else:
+            column_config[col] = st.column_config.TextColumn(col)
+        if col in date_columns and series.notna().sum() == 0:
+            warnings.append(f"{col} has no valid dates; editing is disabled.")
+            disabled_columns.append(col)
+    return column_config, disabled_columns, warnings
+
+
+def safe_data_editor(
+    df: pd.DataFrame,
+    *,
+    key: str,
+    column_config: Optional[dict[str, object]] = None,
+    disabled: Optional[list[str]] = None,
+    **kwargs,
+) -> pd.DataFrame:
+    normalized, date_columns = normalize_editor_df(df)
+    auto_config, auto_disabled, warnings = build_column_config(
+        normalized, date_columns
+    )
+    merged_config = {**auto_config, **(column_config or {})}
+    disabled_columns = sorted(set(auto_disabled) | set(disabled or []))
+    if warnings:
+        st.warning(" ".join(warnings))
+    try:
+        return st.data_editor(
+            normalized,
+            column_config=merged_config,
+            disabled=disabled_columns,
+            key=key,
+            **kwargs,
+        )
+    except StreamlitAPIException as exc:
+        st.error(
+            f"Editor rendering failed due to a column type mismatch. "
+            f"The table is shown in read-only mode. ({exc})"
+        )
+        st.dataframe(normalized, use_container_width=True)
+        return normalized
     return f"{value:.1f} GB"
 
 SERVICE_REPORT_FIELDS = OrderedDict(
@@ -792,9 +880,10 @@ def _build_report_column_config(
                 step=config.get("step"),
             )
         elif config.get("type") == "date":
-            column_config[key] = st.column_config.TextColumn(
+            column_config[key] = st.column_config.DateColumn(
                 label,
                 help=help_text or "Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                format="YYYY-MM-DD",
             )
         elif config.get("type") == "select":
             column_config[key] = st.column_config.SelectboxColumn(
@@ -1389,20 +1478,25 @@ def get_conn():
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA busy_timeout = 30000;")
     conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA temp_store = MEMORY;")
+    conn.execute("PRAGMA cache_size = -20000;")
     return conn
 
 def init_schema(conn):
     ensure_upload_dirs()
-    conn.executescript(SCHEMA_SQL)
-    for attempt in range(3):
+    for attempt in range(5):
         try:
+            conn.executescript(SCHEMA_SQL)
+            conn.execute("BEGIN IMMEDIATE")
             ensure_schema_upgrades(conn)
+            conn.commit()
             break
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt == 2:
+            conn.rollback()
+            if "locked" not in str(exc).lower() or attempt == 4:
                 raise
             time.sleep(0.5 * (attempt + 1))
-    conn.commit()
     # bootstrap admin if empty
     cur = conn.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
@@ -11821,7 +11915,7 @@ def _render_doc_detail_inputs(
             axis=1,
         )
         st.markdown("**Quotation items**")
-        edited_items = st.data_editor(
+        edited_items = safe_data_editor(
             items_df[["description", "quantity", "rate"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
@@ -11887,7 +11981,7 @@ def _render_doc_detail_inputs(
             axis=1,
         )
         st.markdown("**Products**")
-        edited_items = st.data_editor(
+        edited_items = safe_data_editor(
             items_df[["description", "quantity", "unit_price"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
@@ -11972,7 +12066,7 @@ def _render_doc_detail_inputs(
             axis=1,
         )
         st.markdown("**Products**")
-        edited_items = st.data_editor(
+        edited_items = safe_data_editor(
             items_df[["description", "quantity", "unit_price"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
@@ -12044,7 +12138,7 @@ def _render_doc_detail_inputs(
             axis=1,
         )
         st.markdown("**Products**")
-        edited_items = st.data_editor(
+        edited_items = safe_data_editor(
             items_df[["description", "quantity", "unit_price"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
@@ -12116,7 +12210,7 @@ def _render_doc_detail_inputs(
             axis=1,
         )
         st.markdown("**Items purchased (optional)**")
-        edited_items = st.data_editor(
+        edited_items = safe_data_editor(
             items_df[["description", "quantity", "unit_price"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
@@ -12906,917 +13000,609 @@ def render_operations_document_uploader(
     selected_customer_label: Optional[str] = None,
     show_customer_select: bool = True,
 ) -> None:
-    st.markdown("### Operations document uploads")
-    st.markdown(
-        """
-        <style>
-        @media (max-width: 768px) {
-          [data-testid="stHorizontalBlock"] {
-            flex-wrap: wrap;
-          }
-          [data-testid="stHorizontalBlock"] > div {
-            flex: 1 1 100% !important;
-            min-width: 100% !important;
-          }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("### Operations documents")
     customer_options, customer_labels, _, _ = fetch_customer_choices(conn, only_complete=False)
     customer_choices = [cid for cid in customer_options if cid is not None]
     if not customer_choices:
-        st.info("No customers available for document uploads yet.")
+        st.info("No customers available for documents yet.")
         return
 
-    selected_customer = selected_customer_id
-    if selected_customer is None and show_customer_select:
-        selected_customer = st.selectbox(
-            "Customer",
-            customer_choices,
-            format_func=lambda cid: customer_labels.get(cid, f"Customer #{cid}"),
-            key=f"{key_prefix}_customer",
+    doc_type_options = ["Delivery order", "Work done", "Service", "Maintenance", "Other"]
+    filter_cols = st.columns((1.6, 1.2, 1.1, 1.1))
+    with filter_cols[0]:
+        search_query = st.text_input(
+            "Search documents (name or remarks)",
+            key=f"{key_prefix}_doc_search",
         )
-    elif selected_customer is not None:
-        label = selected_customer_label or customer_labels.get(
-            selected_customer, f"Customer #{selected_customer}"
+    with filter_cols[1]:
+        default_customer = selected_customer_id if selected_customer_id in customer_choices else None
+        customer_filter = st.selectbox(
+            "Filter by customer",
+            options=[None] + customer_choices,
+            index=([None] + customer_choices).index(default_customer)
+            if default_customer in customer_choices
+            else 0,
+            format_func=lambda cid: customer_labels.get(cid, "(all customers)")
+            if cid
+            else "(all customers)",
+            key=f"{key_prefix}_doc_customer_filter",
         )
-        st.markdown(f"**Selected customer:** {label}")
-
-    if selected_customer is None:
-        st.info("Select a customer to upload operations documents.")
-        return
-    customer_seed = df_query(
-        conn,
-        """
-        SELECT name, company_name, phone, address, delivery_address, sales_person
-        FROM customers
-        WHERE customer_id=?
-        """,
-        (int(selected_customer),),
-    )
-    customer_record = customer_seed.iloc[0].to_dict() if not customer_seed.empty else {}
-    toggle_key = f"{key_prefix}_show_uploads"
-    show_uploads = bool(st.session_state.get(toggle_key, False))
-    toggle_label = "Upload operations documents" if not show_uploads else "Hide upload options"
-    if st.button(toggle_label, key=f"{key_prefix}_upload_toggle"):
-        show_uploads = not show_uploads
-        st.session_state[toggle_key] = show_uploads
-    if not show_uploads:
-        st.caption("Click upload to add delivery orders, work done, service, maintenance, or other files.")
-        return
-
-    with st.container():
-        upload_cols = st.columns(2)
-        with upload_cols[0]:
-            st.markdown("**Delivery order (DO)**")
-            with st.form(key=f"{key_prefix}_do_form", clear_on_submit=False):
-                do_file = st.file_uploader(
-                    "Delivery order upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_do_file",
-                    help="Upload the delivery order PDF or image.",
-                )
-                _apply_ocr_autofill(
-                    upload=do_file,
-                    ocr_key_prefix=f"{key_prefix}_do_file",
-                    doc_type="Delivery order",
-                    details_key_prefix=f"{key_prefix}_do_details",
-                )
-                do_details = _render_doc_detail_inputs(
-                    "Delivery order",
-                    key_prefix=f"{key_prefix}_do_details",
-                    defaults=customer_record,
-                )
-                submit_do = st.form_submit_button(
-                    "Save delivery order",
-                )
-            if _guard_double_submit(f"{key_prefix}_do_save", submit_do):
-                if do_file is None:
-                    st.error("Select a delivery order document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Delivery order",
-                        upload_file=do_file,
-                        details=do_details,
-                    )
-                    if saved:
-                        st.success("Delivery order uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_do_file",
-                            details_key_prefix=f"{key_prefix}_do_details",
-                            doc_type="Delivery order",
-                        )
-
-        with upload_cols[1]:
-            st.markdown("**Work done**")
-            with st.form(key=f"{key_prefix}_work_done_form", clear_on_submit=False):
-                work_done_file = st.file_uploader(
-                    "Work done upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_work_done_file",
-                    help="Upload completed work slips or PDFs.",
-                )
-                _apply_ocr_autofill(
-                    upload=work_done_file,
-                    ocr_key_prefix=f"{key_prefix}_work_done_file",
-                    doc_type="Work done",
-                    details_key_prefix=f"{key_prefix}_work_done_details",
-                )
-                work_done_details = _render_doc_detail_inputs(
-                    "Work done",
-                    key_prefix=f"{key_prefix}_work_done_details",
-                    defaults=customer_record,
-                )
-                submit_work_done = st.form_submit_button(
-                    "Save work done",
-                )
-            if _guard_double_submit(f"{key_prefix}_work_done_save", submit_work_done):
-                if work_done_file is None:
-                    st.error("Select a work done document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Work done",
-                        upload_file=work_done_file,
-                        details=work_done_details,
-                    )
-                    if saved:
-                        st.success("Work done uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_work_done_file",
-                            details_key_prefix=f"{key_prefix}_work_done_details",
-                            doc_type="Work done",
-                        )
-
-        upload_cols = st.columns(2)
-        with upload_cols[0]:
-            st.markdown("**Service**")
-            with st.form(key=f"{key_prefix}_service_form", clear_on_submit=False):
-                service_file = st.file_uploader(
-                    "Service upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_service_file",
-                    help="Upload service documents.",
-                )
-                _apply_ocr_autofill(
-                    upload=service_file,
-                    ocr_key_prefix=f"{key_prefix}_service_file",
-                    doc_type="Service",
-                    details_key_prefix=f"{key_prefix}_service_details",
-                )
-                service_details = _render_doc_detail_inputs(
-                    "Service",
-                    key_prefix=f"{key_prefix}_service_details",
-                    defaults=customer_record,
-                )
-                submit_service = st.form_submit_button(
-                    "Save service",
-                )
-            if _guard_double_submit(f"{key_prefix}_service_save", submit_service):
-                if service_file is None:
-                    st.error("Select a service document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Service",
-                        upload_file=service_file,
-                        details=service_details,
-                    )
-                    if saved:
-                        st.success("Service uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_service_file",
-                            details_key_prefix=f"{key_prefix}_service_details",
-                            doc_type="Service",
-                        )
-
-        with upload_cols[1]:
-            st.markdown("**Maintenance**")
-            with st.form(key=f"{key_prefix}_maintenance_form", clear_on_submit=False):
-                maintenance_file = st.file_uploader(
-                    "Maintenance upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_maintenance_file",
-                    help="Upload maintenance documents.",
-                )
-                _apply_ocr_autofill(
-                    upload=maintenance_file,
-                    ocr_key_prefix=f"{key_prefix}_maintenance_file",
-                    doc_type="Maintenance",
-                    details_key_prefix=f"{key_prefix}_maintenance_details",
-                )
-                maintenance_details = _render_doc_detail_inputs(
-                    "Maintenance",
-                    key_prefix=f"{key_prefix}_maintenance_details",
-                    defaults=customer_record,
-                )
-                submit_maintenance = st.form_submit_button(
-                    "Save maintenance",
-                )
-            if _guard_double_submit(f"{key_prefix}_maintenance_save", submit_maintenance):
-                if maintenance_file is None:
-                    st.error("Select a maintenance document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Maintenance",
-                        upload_file=maintenance_file,
-                        details=maintenance_details,
-                    )
-                    if saved:
-                        st.success("Maintenance uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_maintenance_file",
-                            details_key_prefix=f"{key_prefix}_maintenance_details",
-                            doc_type="Maintenance",
-                        )
-
-        st.markdown("**Others**")
-        with st.form(key=f"{key_prefix}_other_form", clear_on_submit=False):
-            other_file = st.file_uploader(
-                "Other document upload",
-                type=None,
-                accept_multiple_files=False,
-                key=f"{key_prefix}_other_file",
-                help="Upload any other supporting document.",
-            )
-            _apply_ocr_autofill(
-                upload=other_file,
-                ocr_key_prefix=f"{key_prefix}_other_file",
-                doc_type="Other",
-                details_key_prefix=f"{key_prefix}_other_details",
-            )
-            other_details = _render_doc_detail_inputs(
-                "Other",
-                key_prefix=f"{key_prefix}_other_details",
-                defaults=customer_record,
-            )
-            submit_other = st.form_submit_button(
-                "Save other upload",
-            )
-        if _guard_double_submit(f"{key_prefix}_other_save", submit_other):
-            if other_file is None:
-                st.error("Select a document to upload.")
-            else:
-                saved = _save_customer_document_upload(
-                    conn,
-                    customer_id=int(selected_customer),
-                    customer_record=customer_record,
-                    doc_type="Other",
-                    upload_file=other_file,
-                    details=other_details,
-                )
-                if saved:
-                    st.success("Other document uploaded.")
-                    _clear_operations_upload_state(
-                        file_key=f"{key_prefix}_other_file",
-                        details_key_prefix=f"{key_prefix}_other_details",
-                        doc_type="Other",
-                    )
+    with filter_cols[2]:
+        doc_type_filter = st.selectbox(
+            "Filter by doc type",
+            options=["All"] + doc_type_options,
+            key=f"{key_prefix}_doc_type_filter",
+        )
+    with filter_cols[3]:
+        date_filter = st.text_input(
+            "Filter by date (text)",
+            key=f"{key_prefix}_doc_date_filter",
+            help="Filter by a date string like 2024-01 or 15-03-2024.",
+        )
 
     docs_df = df_query(
         conn,
         """
-        SELECT document_id, doc_type, file_path, original_name, uploaded_at, uploaded_by
-        FROM customer_documents
-        WHERE customer_id=?
-          AND deleted_at IS NULL
-        ORDER BY datetime(uploaded_at) DESC, document_id DESC
+        SELECT cd.document_id,
+               cd.customer_id,
+               cd.doc_type,
+               cd.file_path,
+               cd.original_name,
+               cd.uploaded_at,
+               cd.uploaded_by,
+               COALESCE(c.name, c.company_name, '(customer)') AS customer_name,
+               COALESCE(u.username, '(user)') AS uploaded_by_name,
+               d.do_number,
+               d.description AS do_description,
+               d.remarks AS do_remarks,
+               d.status AS do_status,
+               d.created_at AS do_created_at,
+               d.record_type,
+               sd.document_id AS service_document_id,
+               s.service_id,
+               s.do_number AS service_do_number,
+               s.description AS service_description,
+               s.remarks AS service_remarks,
+               s.status AS service_status,
+               s.service_date,
+               md.document_id AS maintenance_document_id,
+               m.maintenance_id,
+               m.do_number AS maintenance_do_number,
+               m.description AS maintenance_description,
+               m.remarks AS maintenance_remarks,
+               m.status AS maintenance_status,
+               m.maintenance_date,
+               o.document_id AS other_document_id,
+               o.description AS other_description
+        FROM customer_documents cd
+        LEFT JOIN customers c ON c.customer_id = cd.customer_id
+        LEFT JOIN users u ON u.user_id = cd.uploaded_by
+        LEFT JOIN delivery_orders d ON d.file_path = cd.file_path AND d.deleted_at IS NULL
+        LEFT JOIN service_documents sd ON sd.file_path = cd.file_path
+        LEFT JOIN services s ON s.service_id = sd.service_id AND s.deleted_at IS NULL
+        LEFT JOIN maintenance_documents md ON md.file_path = cd.file_path
+        LEFT JOIN maintenance_records m ON m.maintenance_id = md.maintenance_id AND m.deleted_at IS NULL
+        LEFT JOIN operations_other_documents o ON o.file_path = cd.file_path AND o.deleted_at IS NULL
+        WHERE cd.deleted_at IS NULL
+          AND cd.doc_type IN ('Delivery order', 'Work done', 'Service', 'Maintenance', 'Other')
+        ORDER BY datetime(cd.uploaded_at) DESC, cd.document_id DESC
         """,
-        (int(selected_customer),),
     )
-    if not docs_df.empty:
-        docs_df = docs_df.drop_duplicates(
-            subset=["file_path", "doc_type", "original_name"], keep="first"
-        )
-    docs_df_all = docs_df.copy()
-    st.markdown("#### Existing documents")
-    if docs_df.empty:
-        st.caption("No documents uploaded for this customer yet.")
-    else:
-        doc_type_filters = [
-            ("All", "All documents"),
-            ("Delivery order", "Delivery order (DO)"),
-            ("Work done", "Work done (WO)"),
-            ("Service", "Service"),
-            ("Maintenance", "Maintenance"),
-            ("Other", "Other"),
-        ]
-        type_label_map = {key: label for key, label in doc_type_filters}
-        with st.sidebar:
-            selected_doc_filter = st.radio(
-                "Operations documents",
-                [key for key, _ in doc_type_filters],
-                format_func=lambda key: type_label_map.get(key, key),
-                key=f"{key_prefix}_doc_filter",
-            )
-        scoped_docs = docs_df.copy()
-        if selected_doc_filter != "All":
-            scoped_docs = scoped_docs[
-                scoped_docs["doc_type"].fillna("") == selected_doc_filter
-            ]
-        scoped_docs = scoped_docs.sort_values(
-            by=["uploaded_at", "document_id"], ascending=[False, False]
-        )
-        st.caption("Showing the latest 20 uploads for the selected category.")
-        latest_docs = scoped_docs.head(20)
-        table_rows = []
-        for _, row in latest_docs.iterrows():
-            path = resolve_upload_path(row.get("file_path"))
-            label = clean_text(row.get("original_name")) or "(document)"
-            doc_type = clean_text(row.get("doc_type")) or "Document"
-            uploaded_at = pd.to_datetime(row.get("uploaded_at"), errors="coerce")
-            uploaded_label = uploaded_at.strftime("%d-%m-%Y") if pd.notna(uploaded_at) else "—"
-            view_icon = "📎" if path and path.exists() else ""
-            table_rows.append(
-                {
-                    "Document": f"{doc_type}: {label}",
-                    "Uploaded": uploaded_label,
-                    "View upload file": view_icon,
-                }
-            )
-        st.dataframe(
-            pd.DataFrame(table_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.markdown("#### Edit or delete an uploaded document")
-        search_query = st.text_input(
-            "Search documents (name or type)",
-            key=f"{key_prefix}_doc_search",
-        )
-        edit_scope = docs_df_all.copy()
-        if selected_doc_filter != "All":
-            edit_scope = edit_scope[
-                edit_scope["doc_type"].fillna("") == selected_doc_filter
-            ]
-        if search_query:
-            query_value = search_query.strip().lower()
-            edit_scope = edit_scope[
-                edit_scope.apply(
-                    lambda row: query_value
-                    in " ".join(
-                        [
-                            clean_text(row.get("doc_type")),
-                            clean_text(row.get("original_name")),
-                            clean_text(row.get("file_path")),
-                        ]
-                    ).lower(),
-                    axis=1,
-                )
-            ]
-        else:
-            edit_scope = edit_scope.sort_values(
-                by=["uploaded_at", "document_id"], ascending=[False, False]
-            ).head(20)
-        doc_records = edit_scope.to_dict("records")
-        if not doc_records:
-            st.caption("No documents match that search.")
-            return
-        doc_labels = {
-            int(row["document_id"]): " • ".join(
-                part
-                for part in [
-                    clean_text(row.get("doc_type")) or "Document",
-                    clean_text(row.get("original_name")) or "(file)",
-                    pd.to_datetime(row.get("uploaded_at"), errors="coerce").strftime("%d-%m-%Y")
-                    if pd.notna(pd.to_datetime(row.get("uploaded_at"), errors="coerce"))
-                    else "",
-                ]
-                if part
-            )
-            for row in doc_records
-        }
-        doc_choices = list(doc_labels.keys())
-        selected_doc_id = st.selectbox(
-            "Select a document",
-            doc_choices,
-            format_func=lambda rid: doc_labels.get(rid, f"Document #{rid}"),
-            key=f"{key_prefix}_doc_edit_select",
-        )
-        selected_doc = next(
-            row for row in doc_records if int(row["document_id"]) == int(selected_doc_id)
-        )
-        existing_doc_path = resolve_upload_path(selected_doc.get("file_path"))
-        if existing_doc_path and existing_doc_path.exists():
-            st.download_button(
-                "Download current document",
-                data=existing_doc_path.read_bytes(),
-                file_name=existing_doc_path.name,
-                key=f"{key_prefix}_doc_download_{int(selected_doc_id)}",
-            )
-        actor_id = current_user_id()
-        can_edit = actor_id is not None
-        delivery_record = None
-        delivery_items_df = None
-        delivery_doc_type = clean_text(selected_doc.get("doc_type"))
-        if delivery_doc_type in {"Delivery order", "Work done"}:
-            record_type = "work_done" if delivery_doc_type == "Work done" else "delivery_order"
-            delivery_df = df_query(
-                conn,
-                """
-                SELECT do_number, description, remarks, sales_person, status, items_payload, record_type
-                FROM delivery_orders
-                WHERE file_path=?
-                  AND record_type=?
-                  AND deleted_at IS NULL
-                """,
-                (clean_text(selected_doc.get("file_path")), record_type),
-            )
-            if not delivery_df.empty:
-                delivery_record = delivery_df.iloc[0].to_dict()
-                delivery_items = parse_delivery_items_payload(delivery_record.get("items_payload"))
-                if not delivery_items:
-                    delivery_items = _default_simple_items()
-                delivery_items_df = pd.DataFrame(delivery_items)
-                for col in ["description", "quantity", "unit_price", "total"]:
-                    if col not in delivery_items_df.columns:
-                        delivery_items_df[col] = 0.0 if col != "description" else ""
-                delivery_items_df["total"] = delivery_items_df.apply(
-                    lambda row: max(
-                        _coerce_float(row.get("quantity"), 0.0)
-                        * _coerce_float(row.get("unit_price"), 0.0),
-                        0.0,
-                    ),
-                    axis=1,
-                )
-            else:
-                st.info("No delivery/work done details found for this upload yet.")
-        with st.form(f"{key_prefix}_doc_edit_form"):
-            doc_type_options = ["Delivery order", "Work done", "Service", "Maintenance", "Other"]
-            selected_doc_type = clean_text(selected_doc.get("doc_type")) or "Other"
-            if selected_doc_type not in doc_type_options:
-                selected_doc_type = "Other"
-            doc_type_choice = selected_doc_type
-            st.text_input(
-                "Document type",
-                value=selected_doc_type,
-                key=f"{key_prefix}_doc_edit_type",
-                disabled=True,
-            )
-            replace_doc_file = st.file_uploader(
-                "Replace document (optional)",
-                type=["pdf", "png", "jpg", "jpeg", "webp"],
-                key=f"{key_prefix}_doc_edit_file",
-            )
-            delivery_description_input = None
-            delivery_remarks_input = None
-            delivery_status_choice = None
-            delivery_sales_person = None
-            edited_delivery_items = None
-            if doc_type_choice in {"Delivery order", "Work done"} and delivery_record:
-                st.markdown("**Edit delivery/work done details**")
-                st.text_input(
-                    "Document number",
-                    value=clean_text(delivery_record.get("do_number")),
-                    disabled=True,
-                    key=f"{key_prefix}_doc_edit_do_number",
-                )
-                current_status = normalize_delivery_status(delivery_record.get("status"))
-                if current_status not in DELIVERY_STATUS_OPTIONS:
-                    current_status = DELIVERY_STATUS_OPTIONS[0]
-                delivery_status_choice = st.selectbox(
-                    "Status",
-                    options=DELIVERY_STATUS_OPTIONS,
-                    index=DELIVERY_STATUS_OPTIONS.index(current_status),
-                    key=f"{key_prefix}_doc_edit_status",
-                    format_func=lambda option: DELIVERY_STATUS_LABELS.get(option, option.title()),
-                )
-                delivery_sales_person = st.text_input(
-                    "Person in charge",
-                    value=clean_text(delivery_record.get("sales_person")),
-                    key=f"{key_prefix}_doc_edit_sales_person",
-                )
-                delivery_description_input = st.text_area(
-                    "Description",
-                    value=clean_text(delivery_record.get("description")),
-                    key=f"{key_prefix}_doc_edit_description",
-                )
-                delivery_remarks_input = st.text_area(
-                    "Remarks",
-                    value=clean_text(delivery_record.get("remarks")),
-                    key=f"{key_prefix}_doc_edit_remarks",
-                )
-                edited_delivery_items = st.data_editor(
-                    delivery_items_df[["description", "quantity", "unit_price"]],
-                    num_rows="dynamic",
-                    hide_index=True,
-                    use_container_width=True,
-                    key=f"{key_prefix}_doc_edit_items",
-                    column_config={
-                        "description": st.column_config.TextColumn("Product"),
-                        "quantity": st.column_config.NumberColumn(
-                            "Qty", min_value=0.0, step=1.0, format="%d"
-                        ),
-                        "unit_price": st.column_config.NumberColumn(
-                            "Unit price", min_value=0.0, step=100.0, format="%.2f"
-                        ),
-                    },
-                )
-            save_doc_changes = st.form_submit_button(
-                "Save document changes",
-                type="primary",
-                disabled=not can_edit,
-            )
-
-        if save_doc_changes:
-            if not can_edit:
-                st.error("Only staff members can edit this document.")
-                return
-            stored_path = clean_text(selected_doc.get("file_path"))
-            original_name = clean_text(selected_doc.get("original_name"))
-            if replace_doc_file is not None:
-                doc_dir_map = {
-                    "Delivery order": DELIVERY_ORDER_DIR,
-                    "Work done": DELIVERY_ORDER_DIR,
-                    "Service": SERVICE_DOCS_DIR,
-                    "Maintenance": MAINTENANCE_DOCS_DIR,
-                    "Other": OPERATIONS_OTHER_DIR,
-                }
-                target_dir = doc_dir_map.get(doc_type_choice, CUSTOMER_DOCS_DIR)
-                target_dir.mkdir(parents=True, exist_ok=True)
-                doc_type_slug = (
-                    _sanitize_path_component(doc_type_choice.lower().replace(" ", "_"))
-                    or "document"
-                )
-                safe_original = Path(replace_doc_file.name or "document.pdf").name
-                filename = f"{doc_type_slug}_{int(selected_customer)}_{safe_original}"
-                saved_path = save_uploaded_file(
-                    replace_doc_file,
-                    target_dir,
-                    filename=filename,
-                    allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
-                    default_extension=".pdf",
-                )
-                if not saved_path:
-                    st.error("Unable to save the replacement file.")
-                    return
-                try:
-                    stored_path = str(saved_path.relative_to(BASE_DIR))
-                except ValueError:
-                    stored_path = str(saved_path)
-                original_name = safe_original
-            conn.execute(
-                """
-                UPDATE customer_documents
-                SET doc_type=?,
-                    file_path=?,
-                    original_name=?,
-                    updated_at=datetime('now'),
-                    updated_by=?
-                WHERE document_id=?
-                """,
-                (
-                    doc_type_choice,
-                    stored_path,
-                    original_name,
-                    actor_id,
-                    int(selected_doc_id),
+    if customer_filter:
+        docs_df = docs_df[docs_df["customer_id"] == int(customer_filter)]
+    if doc_type_filter != "All":
+        docs_df = docs_df[docs_df["doc_type"].fillna("") == doc_type_filter]
+    if search_query:
+        needle = search_query.strip().lower()
+        docs_df = docs_df[
+            docs_df.apply(
+                lambda row: any(
+                    needle in str(row.get(col, "")).lower()
+                    for col in [
+                        "doc_type",
+                        "original_name",
+                        "file_path",
+                        "do_description",
+                        "do_remarks",
+                        "service_description",
+                        "service_remarks",
+                        "maintenance_description",
+                        "maintenance_remarks",
+                        "other_description",
+                    ]
                 ),
+                axis=1,
             )
-            conn.commit()
-            if doc_type_choice in {"Delivery order", "Work done"} and delivery_record:
-                items_records = (
-                    edited_delivery_items.to_dict("records")
-                    if isinstance(edited_delivery_items, pd.DataFrame)
-                    else []
-                )
-                cleaned_items, total_amount = normalize_simple_items(items_records)
-                items_payload = json.dumps(cleaned_items, ensure_ascii=False) if cleaned_items else None
-                record_type = clean_text(delivery_record.get("record_type")) or (
-                    "work_done" if doc_type_choice == "Work done" else "delivery_order"
-                )
+        ]
+
+    if docs_df.empty:
+        st.caption("No documents match the selected filters.")
+        return
+
+    def _resolve_source(row: dict[str, object]) -> str:
+        if clean_text(row.get("do_number")):
+            return "delivery"
+        if row.get("service_id"):
+            return "service"
+        if row.get("maintenance_id"):
+            return "maintenance"
+        if row.get("other_document_id"):
+            return "other"
+        return "customer_document"
+
+    table_records = []
+    for _, row in docs_df.iterrows():
+        source = _resolve_source(row)
+        doc_type = clean_text(row.get("doc_type")) or "Document"
+        linked_value = ""
+        if source == "delivery":
+            linked_value = clean_text(row.get("do_number"))
+        elif source == "service":
+            linked_value = clean_text(row.get("service_do_number")) or f"Service #{int(row['service_id'])}"
+        elif source == "maintenance":
+            linked_value = clean_text(row.get("maintenance_do_number")) or f"Maintenance #{int(row['maintenance_id'])}"
+        elif source == "other":
+            linked_value = f"Other #{int(row['other_document_id'])}"
+        description = ""
+        status = ""
+        date_value = ""
+        if source == "delivery":
+            description = clean_text(row.get("do_remarks")) or clean_text(row.get("do_description"))
+            status = normalize_delivery_status(clean_text(row.get("do_status")))
+            date_value = clean_text(row.get("do_created_at"))
+        elif source == "service":
+            description = clean_text(row.get("service_remarks")) or clean_text(row.get("service_description"))
+            status = clean_text(row.get("service_status"))
+            date_value = clean_text(row.get("service_date"))
+        elif source == "maintenance":
+            description = clean_text(row.get("maintenance_remarks")) or clean_text(row.get("maintenance_description"))
+            status = clean_text(row.get("maintenance_status"))
+            date_value = clean_text(row.get("maintenance_date"))
+        elif source == "other":
+            description = clean_text(row.get("other_description"))
+            date_value = clean_text(row.get("uploaded_at"))
+        uploaded_at = pd.to_datetime(row.get("uploaded_at"), errors="coerce")
+        uploaded_label = uploaded_at.strftime("%d-%m-%Y") if pd.notna(uploaded_at) else "—"
+        table_records.append(
+            {
+                "doc_id": int(row["document_id"]),
+                "customer_id": int(row["customer_id"]),
+                "Doc Type": doc_type,
+                "Linked entity": linked_value,
+                "Customer": clean_text(row.get("customer_name")) or "(customer)",
+                "Title / filename": clean_text(row.get("original_name")) or "(file)",
+                "Remarks / description": description,
+                "Date": date_value,
+                "Status": status,
+                "Uploaded": uploaded_label,
+                "Uploaded by": clean_text(row.get("uploaded_by_name")) or "(user)",
+                "Actions": "Manage below",
+                "source": source,
+                "file_path": clean_text(row.get("file_path")),
+                "service_document_id": row.get("service_document_id"),
+                "maintenance_document_id": row.get("maintenance_document_id"),
+                "service_id": row.get("service_id"),
+                "maintenance_id": row.get("maintenance_id"),
+                "other_document_id": row.get("other_document_id"),
+                "do_number": clean_text(row.get("do_number")),
+            }
+        )
+
+    table_df = pd.DataFrame(table_records).set_index("doc_id")
+    if date_filter:
+        needle = date_filter.strip().lower()
+        table_df = table_df[
+            table_df["Date"].fillna("").astype(str).str.lower().str.contains(needle)
+        ]
+    if table_df.empty:
+        st.caption("No documents match the date filter.")
+        return
+
+    st.markdown("#### Documents")
+    table_view = table_df[
+        [
+            "Doc Type",
+            "Linked entity",
+            "Customer",
+            "Title / filename",
+            "Remarks / description",
+            "Date",
+            "Status",
+            "Uploaded",
+            "Uploaded by",
+            "Actions",
+        ]
+    ]
+    edited_table = safe_data_editor(
+        table_view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Remarks / description": st.column_config.TextColumn("Remarks / description"),
+            "Date": st.column_config.DateColumn(
+                "Date",
+                help="Edit dates as YYYY-MM-DD when applicable.",
+                format="YYYY-MM-DD",
+            ),
+            "Status": st.column_config.TextColumn("Status"),
+        },
+        disabled=[
+            "Doc Type",
+            "Linked entity",
+            "Customer",
+            "Title / filename",
+            "Uploaded",
+            "Uploaded by",
+            "Actions",
+        ],
+        key=f"{key_prefix}_doc_table",
+    )
+
+    actor_id = current_user_id()
+    can_edit = actor_id is not None
+    if st.button(
+        "Save inline edits",
+        key=f"{key_prefix}_doc_inline_save",
+        disabled=not can_edit,
+    ):
+        if not can_edit:
+            st.error("Only staff members can edit documents.")
+            return
+        for doc_id, original_row in table_view.iterrows():
+            edited_row = edited_table.loc[doc_id]
+            if original_row.equals(edited_row):
+                continue
+            source = table_df.loc[doc_id, "source"]
+            new_desc = clean_text(edited_row.get("Remarks / description"))
+            new_status = clean_text(edited_row.get("Status"))
+            new_date = clean_text(edited_row.get("Date"))
+            if source == "delivery":
                 conn.execute(
                     """
                     UPDATE delivery_orders
-                    SET description=?,
-                        remarks=?,
-                        sales_person=?,
+                    SET remarks=?,
                         status=?,
-                        items_payload=?,
-                        total_amount=?,
-                        file_path=?,
                         updated_at=datetime('now')
                     WHERE do_number=?
                       AND deleted_at IS NULL
                     """,
                     (
-                        clean_text(delivery_description_input),
-                        clean_text(delivery_remarks_input),
-                        clean_text(delivery_sales_person),
-                        normalize_delivery_status(delivery_status_choice),
-                        items_payload,
-                        total_amount if cleaned_items else None,
-                        stored_path,
-                        clean_text(delivery_record.get("do_number")),
+                        new_desc,
+                        normalize_delivery_status(new_status),
+                        clean_text(table_df.loc[doc_id, "do_number"]),
                     ),
                 )
-                conn.commit()
-                log_activity(
-                    conn,
-                    event_type="work_done_updated"
-                    if record_type == "work_done"
-                    else "delivery_order_updated",
-                    description=f"{'Work done' if record_type == 'work_done' else 'Delivery order'} "
-                    f"{clean_text(delivery_record.get('do_number'))} updated",
-                    entity_type="delivery_order",
-                    entity_id=clean_text(delivery_record.get("do_number")),
-                    user_id=actor_id,
+            elif source == "service":
+                conn.execute(
+                    """
+                    UPDATE services
+                    SET remarks=?,
+                        status=?,
+                        service_date=?,
+                        updated_at=datetime('now')
+                    WHERE service_id=?
+                      AND deleted_at IS NULL
+                    """,
+                    (
+                        new_desc,
+                        new_status,
+                        to_iso_date(new_date),
+                        int(table_df.loc[doc_id, "service_id"]),
+                    ),
                 )
-            log_activity(
-                conn,
-                event_type="customer_document_updated",
-                description=f"Document #{int(selected_doc_id)} updated",
-                entity_type="customer_document",
-                entity_id=int(selected_doc_id),
-                user_id=actor_id,
-            )
-            st.success("Document updated.")
-            _safe_rerun()
-
-        st.markdown("#### Delete document")
-        confirm_delete = st.checkbox(
-            "I understand this document will be deleted.",
-            key=f"{key_prefix}_doc_delete_confirm",
-        )
-        if st.button(
-            "Delete document",
-            type="secondary",
-            disabled=not (confirm_delete and can_edit),
-            key=f"{key_prefix}_doc_delete_button",
-        ):
-            if not can_edit:
-                st.error("Only staff members can delete this document.")
-                return
+            elif source == "maintenance":
+                conn.execute(
+                    """
+                    UPDATE maintenance_records
+                    SET remarks=?,
+                        status=?,
+                        maintenance_date=?,
+                        updated_at=datetime('now')
+                    WHERE maintenance_id=?
+                      AND deleted_at IS NULL
+                    """,
+                    (
+                        new_desc,
+                        new_status,
+                        to_iso_date(new_date),
+                        int(table_df.loc[doc_id, "maintenance_id"]),
+                    ),
+                )
+            elif source == "other":
+                conn.execute(
+                    """
+                    UPDATE operations_other_documents
+                    SET description=?,
+                        updated_at=datetime('now'),
+                        updated_by=?
+                    WHERE document_id=?
+                      AND deleted_at IS NULL
+                    """,
+                    (
+                        new_desc,
+                        actor_id,
+                        int(table_df.loc[doc_id, "other_document_id"]),
+                    ),
+                )
             conn.execute(
                 """
                 UPDATE customer_documents
-                SET deleted_at=datetime('now'),
-                    deleted_by=?
+                SET updated_at=datetime('now'),
+                    updated_by=?
                 WHERE document_id=?
                   AND deleted_at IS NULL
                 """,
-                (actor_id, int(selected_doc_id)),
+                (actor_id, int(doc_id)),
             )
-            conn.commit()
-            log_activity(
-                conn,
-                event_type="customer_document_deleted",
-                description=f"Document #{int(selected_doc_id)} deleted",
-                entity_type="customer_document",
-                entity_id=int(selected_doc_id),
-                user_id=actor_id,
-            )
-            st.warning("Document deleted.")
-            _safe_rerun()
+        conn.commit()
+        st.success("Inline edits saved.")
+        _safe_rerun()
 
-    other_df = df_query(
-        conn,
-        """
-        SELECT document_id, description, items_payload, file_path, original_name,
-               uploaded_at, uploaded_by, updated_at, updated_by
-        FROM operations_other_documents
-        WHERE customer_id=?
-          AND deleted_at IS NULL
-        ORDER BY datetime(uploaded_at) DESC, document_id DESC
-        """,
-        (int(selected_customer),),
-    )
-    if not other_df.empty:
-        st.markdown("#### Other purchase history")
-        for _, row in other_df.iterrows():
-            label = clean_text(row.get("description")) or "Other purchase"
-            uploaded_at = pd.to_datetime(row.get("uploaded_at"), errors="coerce")
-            updated_at = pd.to_datetime(row.get("updated_at"), errors="coerce")
-            date_label = uploaded_at.strftime("%d-%m-%Y") if pd.notna(uploaded_at) else ""
-            header = f"{label} {f'({date_label})' if date_label else ''}".strip()
-            with st.expander(header, expanded=False):
-                if pd.notna(updated_at) and updated_at != uploaded_at:
-                    st.caption(f"Last updated: {updated_at.strftime('%d-%m-%Y')}")
-                items_payload = clean_text(row.get("items_payload"))
-                if items_payload:
-                    try:
-                        items_rows = json.loads(items_payload)
-                    except (TypeError, ValueError):
-                        items_rows = []
-                    if items_rows:
-                        st.dataframe(pd.DataFrame(items_rows), use_container_width=True, hide_index=True)
-                path = resolve_upload_path(row.get("file_path"))
-                if path and path.exists():
-                    st.download_button(
-                        "Download document",
-                        data=path.read_bytes(),
-                        file_name=path.name,
-                        key=f"{key_prefix}_other_download_{int(row['document_id'])}",
-                    )
-                    render_upload_preview(
-                        path,
-                        label=label,
-                        key_prefix=f"{key_prefix}_other_preview_{int(row['document_id'])}",
-                    )
-        st.markdown("#### Edit or delete other uploads")
-        other_records = other_df.to_dict("records")
-        other_labels = {
-            int(row["document_id"]): " • ".join(
-                part
-                for part in [
-                    clean_text(row.get("description")) or f"Other #{int(row['document_id'])}",
-                    pd.to_datetime(row.get("uploaded_at"), errors="coerce").strftime("%d-%m-%Y")
-                    if pd.notna(pd.to_datetime(row.get("uploaded_at"), errors="coerce"))
-                    else "",
-                ]
-                if part
-            )
-            for row in other_records
-        }
-        other_choices = list(other_labels.keys())
-        selected_other_id = st.selectbox(
-            "Select an other upload",
-            other_choices,
-            format_func=lambda rid: other_labels.get(rid, f"Other #{rid}"),
-            key=f"{key_prefix}_other_edit_select_inline",
-        )
-        selected_other = next(
-            row for row in other_records if int(row["document_id"]) == int(selected_other_id)
-        )
-        existing_other_path = resolve_upload_path(selected_other.get("file_path"))
-        if existing_other_path and existing_other_path.exists():
-            st.download_button(
-                "Download current other document",
-                data=existing_other_path.read_bytes(),
-                file_name=existing_other_path.name,
-                key=f"{key_prefix}_other_download_edit_{int(selected_other_id)}",
-            )
-        existing_items_payload = clean_text(selected_other.get("items_payload"))
-        try:
-            existing_items = json.loads(existing_items_payload) if existing_items_payload else []
-        except (TypeError, ValueError):
-            existing_items = []
-        if not isinstance(existing_items, list):
-            existing_items = []
-        if not existing_items:
-            existing_items = _default_simple_items()
-        items_df = pd.DataFrame(existing_items)
-        for col in ["description", "quantity", "unit_price", "total"]:
-            if col not in items_df.columns:
-                items_df[col] = 0.0 if col != "description" else ""
-        items_df["total"] = items_df.apply(
-            lambda row: max(
-                _coerce_float(row.get("quantity"), 0.0)
-                * _coerce_float(row.get("unit_price"), 0.0),
-                0.0,
-            ),
-            axis=1,
-        )
-        actor_id = current_user_id()
-        can_edit = actor_id is not None
-        with st.form(f"{key_prefix}_other_edit_form_inline"):
-            description_input = st.text_area(
-                "Description",
-                value=clean_text(selected_other.get("description")) or "",
-                key=f"{key_prefix}_other_edit_desc_inline",
-            )
-            edited_items = st.data_editor(
-                items_df[["description", "quantity", "unit_price"]],
-                num_rows="dynamic",
-                hide_index=True,
-                use_container_width=True,
-                key=f"{key_prefix}_other_edit_items_inline",
-                column_config={
-                    "description": st.column_config.TextColumn("Item"),
-                    "quantity": st.column_config.NumberColumn(
-                        "Qty", min_value=0.0, step=1.0, format="%d"
-                    ),
-                    "unit_price": st.column_config.NumberColumn(
-                        "Unit price", min_value=0.0, step=100.0, format="%.2f"
-                    ),
-                },
-            )
+    st.markdown("#### Actions")
+    for doc_id, row in table_df.iterrows():
+        doc_label = f"{row['Doc Type']} • {row['Title / filename']}"
+        with st.expander(doc_label, expanded=False):
+            file_path = resolve_upload_path(row.get("file_path"))
+            if file_path and file_path.exists():
+                st.download_button(
+                    "Download",
+                    data=file_path.read_bytes(),
+                    file_name=file_path.name,
+                    key=f"{key_prefix}_doc_download_{doc_id}",
+                )
+                render_upload_preview(
+                    file_path,
+                    label=row.get("Title / filename"),
+                    key_prefix=f"{key_prefix}_doc_preview_{doc_id}",
+                )
+            else:
+                st.caption("File missing on disk.")
+
+            edit_cols = st.columns(2)
+            with edit_cols[0]:
+                doc_type_choice = st.selectbox(
+                    "Doc type",
+                    options=doc_type_options,
+                    index=doc_type_options.index(row["Doc Type"])
+                    if row["Doc Type"] in doc_type_options
+                    else 0,
+                    key=f"{key_prefix}_doc_type_{doc_id}",
+                    disabled=not can_edit,
+                )
+            with edit_cols[1]:
+                linked_value = row.get("Linked entity") or ""
+                linked_disabled = row["source"] in {"delivery", "other"}
+                linked_label = (
+                    "Linked entity (DO #)"
+                    if row["source"] == "delivery"
+                    else "Linked entity (DO/job id)"
+                )
+                linked_entity = st.text_input(
+                    linked_label,
+                    value=linked_value,
+                    key=f"{key_prefix}_doc_linked_{doc_id}",
+                    disabled=linked_disabled or not can_edit,
+                )
+
             replace_file = st.file_uploader(
-                "Replace other document (optional)",
+                "Replace file (optional)",
                 type=["pdf", "png", "jpg", "jpeg", "webp"],
-                key=f"{key_prefix}_other_edit_file_inline",
+                key=f"{key_prefix}_doc_replace_{doc_id}",
             )
-            save_changes = st.form_submit_button(
-                "Save other upload",
+
+            save_changes = st.button(
+                "Save changes",
+                key=f"{key_prefix}_doc_save_{doc_id}",
                 type="primary",
                 disabled=not can_edit,
             )
-
-        if save_changes:
-            if not can_edit:
-                st.error("Only staff members can edit this record.")
-                return
-            items_records = (
-                edited_items.to_dict("records")
-                if isinstance(edited_items, pd.DataFrame)
-                else []
-            )
-            cleaned_items, _ = normalize_simple_items(items_records)
-            items_payload = json.dumps(cleaned_items, ensure_ascii=False) if cleaned_items else None
-            stored_path = clean_text(selected_other.get("file_path"))
-            original_name = clean_text(selected_other.get("original_name"))
-            if replace_file is not None:
-                target_dir = OPERATIONS_OTHER_DIR
-                target_dir.mkdir(parents=True, exist_ok=True)
-                safe_original = Path(replace_file.name or "other_document.pdf").name
-                filename = f"other_{int(selected_customer)}_{safe_original}"
-                saved_path = save_uploaded_file(
-                    replace_file,
-                    target_dir,
-                    filename=filename,
-                    allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
-                    default_extension=".pdf",
-                )
-                if saved_path:
+            if save_changes:
+                if not can_edit:
+                    st.error("Only staff members can edit documents.")
+                    return
+                stored_path = clean_text(row.get("file_path"))
+                original_name = clean_text(row.get("Title / filename"))
+                saved_path = None
+                if replace_file is not None:
+                    doc_dir_map = {
+                        "Delivery order": DELIVERY_ORDER_DIR,
+                        "Work done": DELIVERY_ORDER_DIR,
+                        "Service": SERVICE_DOCS_DIR,
+                        "Maintenance": MAINTENANCE_DOCS_DIR,
+                        "Other": OPERATIONS_OTHER_DIR,
+                    }
+                    target_dir = doc_dir_map.get(doc_type_choice, CUSTOMER_DOCS_DIR)
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    doc_type_slug = (
+                        _sanitize_path_component(doc_type_choice.lower().replace(" ", "_"))
+                        or "document"
+                    )
+                    safe_original = Path(replace_file.name or "document.pdf").name
+                    filename = f"{doc_type_slug}_{int(row['customer_id'])}_{safe_original}"
+                    saved_path = save_uploaded_file(
+                        replace_file,
+                        target_dir,
+                        filename=filename,
+                        allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
+                        default_extension=".pdf",
+                    )
+                    if not saved_path:
+                        st.error("Unable to save the replacement file.")
+                        return
                     try:
                         stored_path = str(saved_path.relative_to(BASE_DIR))
                     except ValueError:
                         stored_path = str(saved_path)
                     original_name = safe_original
-            conn.execute(
-                """
-                UPDATE operations_other_documents
-                SET description=?,
-                    items_payload=?,
-                    file_path=?,
-                    original_name=?,
-                    updated_at=datetime('now'),
-                    updated_by=?
-                WHERE document_id=?
-                  AND deleted_at IS NULL
-                """,
-                (
-                    clean_text(description_input),
-                    items_payload,
-                    stored_path,
-                    original_name,
-                    actor_id,
-                    int(selected_other_id),
-                ),
-            )
-            conn.commit()
-            log_activity(
-                conn,
-                event_type="operations_other_updated",
-                description=f"Other record #{int(selected_other_id)} updated",
-                entity_type="operations_other",
-                entity_id=int(selected_other_id),
-                user_id=actor_id,
-            )
-            st.success("Other upload updated.")
-            _safe_rerun()
+                upload_meta = {}
+                if replace_file is not None and saved_path is not None:
+                    upload_meta = _extract_upload_metadata(replace_file, saved_path)
+                conn.execute(
+                    """
+                    UPDATE customer_documents
+                    SET doc_type=?,
+                        file_path=?,
+                        original_name=?,
+                        file_size=COALESCE(?, file_size),
+                        mime_type=COALESCE(?, mime_type),
+                        updated_at=datetime('now'),
+                        updated_by=?
+                    WHERE document_id=?
+                      AND deleted_at IS NULL
+                    """,
+                    (
+                        doc_type_choice,
+                        stored_path,
+                        original_name,
+                        upload_meta.get("file_size"),
+                        upload_meta.get("mime_type"),
+                        actor_id,
+                        int(doc_id),
+                    ),
+                )
+                if row["source"] == "delivery":
+                    record_type = "work_done" if doc_type_choice == "Work done" else "delivery_order"
+                    conn.execute(
+                        """
+                        UPDATE delivery_orders
+                        SET record_type=?,
+                            file_path=?,
+                            updated_at=datetime('now')
+                        WHERE do_number=?
+                          AND deleted_at IS NULL
+                        """,
+                        (
+                            record_type,
+                            stored_path,
+                            clean_text(row.get("do_number")),
+                        ),
+                    )
+                elif row["source"] == "service":
+                    if linked_entity and linked_entity != row.get("Linked entity"):
+                        conn.execute(
+                            """
+                            UPDATE services
+                            SET do_number=?,
+                                updated_at=datetime('now')
+                            WHERE service_id=?
+                              AND deleted_at IS NULL
+                            """,
+                            (clean_text(linked_entity), int(row["service_id"])),
+                        )
+                    if row.get("service_document_id"):
+                        conn.execute(
+                            """
+                            UPDATE service_documents
+                            SET file_path=?,
+                                original_name=?
+                            WHERE document_id=?
+                            """,
+                            (stored_path, original_name, int(row["service_document_id"])),
+                        )
+                elif row["source"] == "maintenance":
+                    if linked_entity and linked_entity != row.get("Linked entity"):
+                        conn.execute(
+                            """
+                            UPDATE maintenance_records
+                            SET do_number=?,
+                                updated_at=datetime('now')
+                            WHERE maintenance_id=?
+                              AND deleted_at IS NULL
+                            """,
+                            (clean_text(linked_entity), int(row["maintenance_id"])),
+                        )
+                    if row.get("maintenance_document_id"):
+                        conn.execute(
+                            """
+                            UPDATE maintenance_documents
+                            SET file_path=?,
+                                original_name=?
+                            WHERE document_id=?
+                            """,
+                            (stored_path, original_name, int(row["maintenance_document_id"])),
+                        )
+                elif row["source"] == "other":
+                    if row.get("other_document_id"):
+                        conn.execute(
+                            """
+                            UPDATE operations_other_documents
+                            SET file_path=?,
+                                original_name=?,
+                                updated_at=datetime('now'),
+                                updated_by=?
+                            WHERE document_id=?
+                              AND deleted_at IS NULL
+                            """,
+                            (
+                                stored_path,
+                                original_name,
+                                actor_id,
+                                int(row["other_document_id"]),
+                            ),
+                        )
+                conn.commit()
+                st.success("Document updated.")
+                _safe_rerun()
 
-        st.markdown("#### Delete other upload")
-        confirm_delete = st.checkbox(
-            "I understand this record will be removed from active views.",
-            key=f"{key_prefix}_other_delete_confirm_inline",
-        )
-        if st.button(
-            "Delete other upload",
-            type="secondary",
-            disabled=not (confirm_delete and can_edit),
-            key=f"{key_prefix}_other_delete_button_inline",
-        ):
-            if not can_edit:
-                st.error("Only staff members can delete this record.")
-                return
-            conn.execute(
-                """
-                UPDATE operations_other_documents
-                SET deleted_at=datetime('now'),
-                    deleted_by=?
-                WHERE document_id=?
-                  AND deleted_at IS NULL
-                """,
-                (actor_id, int(selected_other_id)),
+            confirm_delete = st.checkbox(
+                "Confirm delete",
+                key=f"{key_prefix}_doc_delete_confirm_{doc_id}",
+                disabled=not can_edit,
             )
-            conn.commit()
-            log_activity(
-                conn,
-                event_type="operations_other_deleted",
-                description=f"Other record #{int(selected_other_id)} deleted",
-                entity_type="operations_other",
-                entity_id=int(selected_other_id),
-                user_id=actor_id,
-            )
-            st.warning("Other upload deleted.")
-            _safe_rerun()
+            if st.button(
+                "Delete document",
+                key=f"{key_prefix}_doc_delete_{doc_id}",
+                type="secondary",
+                disabled=not (confirm_delete and can_edit),
+            ):
+                if not can_edit:
+                    st.error("Only staff members can delete documents.")
+                    return
+                conn.execute(
+                    """
+                    UPDATE customer_documents
+                    SET deleted_at=datetime('now'),
+                        deleted_by=?
+                    WHERE document_id=?
+                      AND deleted_at IS NULL
+                    """,
+                    (actor_id, int(doc_id)),
+                )
+                if row["source"] == "delivery":
+                    conn.execute(
+                        """
+                        UPDATE delivery_orders
+                        SET deleted_at=datetime('now'),
+                            deleted_by=?
+                        WHERE do_number=?
+                          AND deleted_at IS NULL
+                        """,
+                        (actor_id, clean_text(row.get("do_number"))),
+                    )
+                elif row["source"] == "service" and row.get("service_document_id"):
+                    conn.execute(
+                        "DELETE FROM service_documents WHERE document_id=?",
+                        (int(row["service_document_id"]),),
+                    )
+                elif row["source"] == "maintenance" and row.get("maintenance_document_id"):
+                    conn.execute(
+                        "DELETE FROM maintenance_documents WHERE document_id=?",
+                        (int(row["maintenance_document_id"]),),
+                    )
+                elif row["source"] == "other" and row.get("other_document_id"):
+                    conn.execute(
+                        """
+                        UPDATE operations_other_documents
+                        SET deleted_at=datetime('now'),
+                            deleted_by=?
+                        WHERE document_id=?
+                          AND deleted_at IS NULL
+                        """,
+                        (actor_id, int(row["other_document_id"])),
+                    )
+                conn.commit()
+                st.warning("Document deleted.")
+                _safe_rerun()
 
 
 def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
@@ -13998,7 +13784,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             value=clean_text(selected_record.get("description")) or "",
             key=f"{key_prefix}_other_edit_desc",
         )
-        edited_items = st.data_editor(
+        edited_items = safe_data_editor(
             items_df[["description", "quantity", "unit_price"]],
             num_rows="dynamic",
             hide_index=True,
@@ -14130,7 +13916,7 @@ def operations_page(conn):
     )
     st.markdown("### Customers")
     st.caption(
-        "Select a customer from the table below to upload delivery orders, work done, service, maintenance, or other files."
+        "Select a customer from the table below to filter the operations documents."
     )
     search_query = st.text_input(
         "Search customers",
@@ -14200,7 +13986,7 @@ def operations_page(conn):
                     refreshed_table["Select"] = refreshed_table["ID"].isin(selected_ids)
                 st.session_state[state_key] = refreshed_table
         table_source = st.session_state.get(state_key, table_df)
-        edited_table = st.data_editor(
+        edited_table = safe_data_editor(
             table_source,
             hide_index=True,
             use_container_width=True,
@@ -14253,38 +14039,6 @@ def operations_page(conn):
         st.caption(
             "Showing all matching customers. Use search to narrow the list if needed."
         )
-
-    last_customer_key = "operations_page_selected_customer_id"
-    if selected_customer_id is not None:
-        previous_customer_id = st.session_state.get(last_customer_key)
-        if previous_customer_id != selected_customer_id:
-            st.session_state[last_customer_key] = selected_customer_id
-            st.session_state["operations_page_show_uploads"] = False
-            _clear_operations_upload_state(
-                file_key="operations_page_do_file",
-                details_key_prefix="operations_page_do_details",
-                doc_type="Delivery order",
-            )
-            _clear_operations_upload_state(
-                file_key="operations_page_work_done_file",
-                details_key_prefix="operations_page_work_done_details",
-                doc_type="Work done",
-            )
-            _clear_operations_upload_state(
-                file_key="operations_page_service_file",
-                details_key_prefix="operations_page_service_details",
-                doc_type="Service",
-            )
-            _clear_operations_upload_state(
-                file_key="operations_page_maintenance_file",
-                details_key_prefix="operations_page_maintenance_details",
-                doc_type="Maintenance",
-            )
-            _clear_operations_upload_state(
-                file_key="operations_page_other_file",
-                details_key_prefix="operations_page_other_details",
-                doc_type="Other",
-            )
 
     render_operations_document_uploader(
         conn,
@@ -14446,7 +14200,7 @@ def customers_page(conn):
                 ),
                 axis=1,
             )
-            edited_products = st.data_editor(
+            edited_products = safe_data_editor(
                 products_df.drop(columns=["total"], errors="ignore"),
                 key="new_customer_products_table",
                 num_rows="dynamic",
@@ -15538,7 +15292,7 @@ def customers_page(conn):
                     if col in editor_df.columns
                 ]
                 editor_view = editor_df[column_order]
-                note_editor_state = st.data_editor(
+                note_editor_state = safe_data_editor(
                     editor_view,
                     hide_index=True,
                     num_rows="fixed",
@@ -15546,9 +15300,10 @@ def customers_page(conn):
                     column_config={
                         "note_id": st.column_config.Column("ID", disabled=True),
                         "note": st.column_config.TextColumn("Remark"),
-                        "remind_on": st.column_config.TextColumn(
+                        "remind_on": st.column_config.DateColumn(
                             "Reminder date",
                             help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                            format="YYYY-MM-DD",
                         ),
                         "Done": st.column_config.CheckboxColumn("Completed"),
                         "created_at": st.column_config.DatetimeColumn(
@@ -15976,7 +15731,7 @@ def warranties_page(conn):
             followup_rows.append(group)
         followup_df = pd.DataFrame(followup_rows).set_index("Warranty ID")
         editable_df = followup_df.copy()
-        edited_followups = st.data_editor(
+        edited_followups = safe_data_editor(
             editable_df,
             use_container_width=True,
             hide_index=True,
@@ -15987,6 +15742,7 @@ def warranties_page(conn):
                     options=["Pending", "Completed"],
                 )
             },
+            key="warranty_followups_editor",
         )
         updates: list[tuple[int, int]] = []
         warranty_updates: list[tuple[str, int]] = []
@@ -16182,7 +15938,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 }
             ],
         )
-        service_product_editor = st.data_editor(
+        service_product_editor = safe_data_editor(
             pd.DataFrame(service_product_rows),
             num_rows="dynamic",
             hide_index=True,
@@ -18053,7 +17809,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 default_value = 0.0 if column != "description" else ""
                 items_df[column] = default_value
         items_df = items_df[["description", "quantity", "rate", "total_price"]]
-        edited_df = st.data_editor(
+        edited_df = safe_data_editor(
             items_df.drop(columns=["total_price"], errors="ignore"),
             hide_index=True,
             num_rows="dynamic",
@@ -18561,9 +18317,10 @@ def _render_quotation_management(conn):
             "Follow-up history",
             disabled=True,
         ),
-        "follow_up_date": st.column_config.TextColumn(
+        "follow_up_date": st.column_config.DateColumn(
             "Follow-up date",
             help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            format="YYYY-MM-DD",
         ),
         "reminder_label": st.column_config.TextColumn("Reminder"),
         "reference": st.column_config.TextColumn("Reference"),
@@ -18572,7 +18329,7 @@ def _render_quotation_management(conn):
         "customer_name": st.column_config.TextColumn("Contact name"),
         "customer_contact": st.column_config.TextColumn("Contact"),
         "total_amount": st.column_config.TextColumn("Total amount (BDT)"),
-        "quote_date": st.column_config.TextColumn("Quote date"),
+        "quote_date": st.column_config.DateColumn("Quote date", format="YYYY-MM-DD"),
         "created_by_name": st.column_config.TextColumn("Created by", disabled=True),
     }
 
@@ -18582,7 +18339,7 @@ def _render_quotation_management(conn):
 
     edited_records: list[dict[str, object]] = []
     if not editable_df.empty:
-        edited = st.data_editor(
+        edited = safe_data_editor(
             tracker_df,
             hide_index=True,
             use_container_width=True,
@@ -19363,7 +19120,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 }
             ],
         )
-        maintenance_editor = st.data_editor(
+        maintenance_editor = safe_data_editor(
             pd.DataFrame(maintenance_rows),
             num_rows="dynamic",
             hide_index=True,
@@ -20228,7 +19985,7 @@ def delivery_orders_page(
         )
         if "line_total" in items_df_seed.columns:
             items_df_seed = items_df_seed.drop(columns=["line_total"], errors="ignore")
-        items_editor = st.data_editor(
+        items_editor = safe_data_editor(
             items_df_seed,
             num_rows="dynamic",
             hide_index=True,
@@ -22316,20 +22073,26 @@ def import_page(conn):
         if column in preview.columns:
             preview[column] = preview[column].apply(format_date_for_editor)
     _debug_dataframe_probe(preview, "Import review editor")
-    editor = st.data_editor(
+    editor = safe_data_editor(
         preview,
         key="import_editor",
         hide_index=True,
         num_rows="dynamic",
         column_config={
-            "date": st.column_config.TextColumn(
-                "Date", help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'."
+            "date": st.column_config.DateColumn(
+                "Date",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                format="YYYY-MM-DD",
             ),
-            "purchase_date": st.column_config.TextColumn(
-                "Purchase date", help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'."
+            "purchase_date": st.column_config.DateColumn(
+                "Purchase date",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                format="YYYY-MM-DD",
             ),
-            "follow_up_date": st.column_config.TextColumn(
-                "Follow-up date", help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'."
+            "follow_up_date": st.column_config.DateColumn(
+                "Follow-up date",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                format="YYYY-MM-DD",
             ),
             "work_done_code": st.column_config.TextColumn(
                 "Work done code", required=False
@@ -24745,7 +24508,7 @@ def reports_page(conn):
                 ]
                 if helper_label:
                     st.info(helper_label, icon="📝")
-        report_grid_df = st.data_editor(
+        report_grid_df = safe_data_editor(
             grid_df_seed,
             column_config=column_config,
             column_order=list(fields.keys()),
