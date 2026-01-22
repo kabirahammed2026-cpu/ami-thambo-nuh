@@ -6098,8 +6098,8 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         return
     st.session_state["_theme_css_render"] = (render_id, sidebar_hidden)
     theme = get_theme()
-    sidebar_display = "block"
-    content_offset = "var(--ps-sidebar-width)"
+    sidebar_display = "none" if sidebar_hidden else "block"
+    content_offset = "0rem" if sidebar_hidden else "var(--ps-sidebar-width)"
     colors = _build_theme_colors(theme)
     st.markdown(
         f"""
@@ -8247,7 +8247,7 @@ def _request_logout() -> None:
 
 
 def login_box(conn, *, render_id=None):
-    apply_theme_css(sidebar_hidden=False)
+    apply_theme_css(sidebar_hidden=st.session_state.get("sidebar_hidden", False))
     if st.session_state.user:
         _ensure_session_token(conn, st.session_state.user)
         st.sidebar.markdown("### Login")
@@ -25755,7 +25755,8 @@ def main():
     render_id = st.session_state["_render_id"]
     logger = _get_logger()
     init_ui()
-    apply_theme_css(sidebar_hidden=False)
+    sidebar_hidden = st.session_state.get("sidebar_hidden", False)
+    apply_theme_css(sidebar_hidden=sidebar_hidden)
     _ensure_quotation_editor_server()
     conn = get_conn()
     init_schema(conn)
@@ -25866,8 +25867,14 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown('<div id="ps-sidebar-toggle-anchor"></div>', unsafe_allow_html=True)
+    toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
+    if st.button(toggle_label, key="ps_sidebar_toggle"):
+        st.session_state["sidebar_hidden"] = not sidebar_hidden
+        st.rerun()
+
     with st.sidebar:
-        apply_theme_css(sidebar_hidden=False)
+        apply_theme_css(sidebar_hidden=sidebar_hidden)
         st.markdown("### Navigation")
         if _debug_diag_enabled():
             st.warning("DEBUG_DIAG enabled: login bypassed.")
