@@ -6225,13 +6225,14 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             font-size: 0.8rem;
             line-height: 1;
         }}
-        #ps-sidebar-toggle-anchor + div[data-testid="stButton"] {{
+        .ps-sidebar-toggle {{
             position: fixed;
             top: 0.7rem;
             left: 0.75rem;
             z-index: 2350;
+            display: block !important;
         }}
-        #ps-sidebar-toggle-anchor + div[data-testid="stButton"] button {{
+        .ps-sidebar-toggle div[data-testid="stButton"] button {{
             padding: 0.2rem 0.45rem;
             border-radius: 999px;
             min-height: unset;
@@ -8001,6 +8002,23 @@ def apply_customer_merge_updates(
     )
 
 
+def _render_app_header() -> None:
+    header_path = Path("Dashboard Top.png")
+    if header_path.exists():
+        encoded = base64.b64encode(header_path.read_bytes()).decode("utf-8")
+        st.markdown(
+            f"""
+            <div class="ps-dashboard-header">
+                <img src="data:image/png;base64,{encoded}" alt="PS Engineering – Business Suites" />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.title("PS Engineering – Business Suites")
+        st.caption("Customers • Warranties • Needs • Summaries")
+
+
 def init_ui():
     st.set_page_config(
         page_title="PS Business Suites",
@@ -8014,8 +8032,7 @@ def init_ui():
         st.session_state.user = None
     if st.session_state.user:
         st.set_option("client.toolbarMode", "minimal")
-        st.title("PS Engineering – Business Suites")
-        st.caption("Customers • Warranties • Needs • Summaries")
+        _render_app_header()
         st.markdown(
             """
             <style>
@@ -8065,6 +8082,21 @@ def init_ui():
             font-weight: 600;
             color: var(--ps-accent);
             margin-bottom: 0.25rem;
+        }
+        .ps-dashboard-header {
+            width: 100%;
+            height: 350px;
+            border-radius: 1.25rem;
+            overflow: hidden;
+            box-shadow: 0 18px 36px rgba(15, 23, 42, 0.18);
+            margin: 0.25rem 0 1.5rem;
+        }
+        .ps-dashboard-header img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            object-position: center;
+            display: block;
         }
         </style>
         """,
@@ -25867,9 +25899,11 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div id="ps-sidebar-toggle-anchor"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="ps-sidebar-toggle">', unsafe_allow_html=True)
     toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
-    if st.button(toggle_label, key="ps_sidebar_toggle"):
+    toggle_clicked = st.button(toggle_label, key="ps_sidebar_toggle")
+    st.markdown("</div>", unsafe_allow_html=True)
+    if toggle_clicked:
         st.session_state["sidebar_hidden"] = not sidebar_hidden
         st.rerun()
 
