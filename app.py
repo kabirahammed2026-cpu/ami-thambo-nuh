@@ -4988,6 +4988,15 @@ def store_report_attachment(uploaded_file, *, identifier: Optional[str] = None) 
     if uploaded_file is None:
         return None
 
+    validation_error = _validate_upload(
+        uploaded_file,
+        allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".xlsx", ".xls"},
+        max_bytes=MAX_UPLOAD_BYTES,
+    )
+    if validation_error:
+        _get_logger().warning("Report attachment rejected: %s", validation_error)
+        return None
+
     ensure_upload_dirs()
     raw_name = uploaded_file.name or "attachment"
     allowed_exts = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".xlsx", ".xls"}
@@ -5067,6 +5076,37 @@ def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
         logger.warning("Blocked upload path outside storage directory: %s", path_str)
         return None
     return resolved
+
+
+def is_file_path_referenced(conn, file_path: Optional[str]) -> bool:
+    if not file_path:
+        return False
+    checks = [
+        ("customer_documents", "file_path"),
+        ("operations_other_documents", "file_path"),
+        ("service_documents", "file_path"),
+        ("maintenance_documents", "file_path"),
+        ("delivery_orders", "file_path"),
+        ("delivery_orders", "payment_receipt_path"),
+        ("services", "bill_document_path"),
+        ("services", "payment_receipt_path"),
+        ("maintenance_records", "payment_receipt_path"),
+        ("quotations", "document_path"),
+        ("quotations", "payment_receipt_path"),
+        ("work_reports", "attachment_path"),
+        ("work_reports", "import_file_path"),
+    ]
+    for table, column in checks:
+        try:
+            row = conn.execute(
+                f"SELECT 1 FROM {table} WHERE {column}=? LIMIT 1",
+                (file_path,),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if row:
+            return True
+    return False
 
 
 def render_upload_preview(path: Path, *, label: str, key_prefix: str) -> None:
@@ -5588,6 +5628,115 @@ def delete_customer_record(conn, customer_id: int) -> None:
     do_code = clean_text(row[2])
     attachment_path = row[3]
 
+    file_paths: set[str] = set()
+
+    def _add_path(value: Optional[str]) -> None:
+        cleaned = clean_text(value)
+        if cleaned:
+            file_paths.add(cleaned)
+
+    if attachment_path:
+        _add_path(attachment_path)
+
+    delivery_rows = df_query(
+        conn,
+        "SELECT do_number, file_path, payment_receipt_path FROM delivery_orders WHERE customer_id=?",
+        (cid,),
+    )
+    do_numbers = []
+    if not delivery_rows.empty:
+        for row in delivery_rows.to_dict("records"):
+            do_number = clean_text(row.get("do_number"))
+            if do_number:
+                do_numbers.append(do_number)
+            _add_path(row.get("file_path"))
+            _add_path(row.get("payment_receipt_path"))
+
+    services_df = df_query(
+        conn,
+        "SELECT service_id, bill_document_path, payment_receipt_path FROM services WHERE customer_id=?",
+        (cid,),
+    )
+    service_ids = []
+    if not services_df.empty:
+        for row in services_df.to_dict("records"):
+            sid = int_or_none(row.get("service_id"))
+            if sid is not None:
+                service_ids.append(sid)
+            _add_path(row.get("bill_document_path"))
+            _add_path(row.get("payment_receipt_path"))
+
+    maintenance_df = df_query(
+        conn,
+        "SELECT maintenance_id, payment_receipt_path FROM maintenance_records WHERE customer_id=?",
+        (cid,),
+    )
+    maintenance_ids = []
+    if not maintenance_df.empty:
+        for row in maintenance_df.to_dict("records"):
+            mid = int_or_none(row.get("maintenance_id"))
+            if mid is not None:
+                maintenance_ids.append(mid)
+            _add_path(row.get("payment_receipt_path"))
+
+    if service_ids:
+        placeholders = ",".join("?" for _ in service_ids)
+        service_docs = df_query(
+            conn,
+            f"SELECT file_path FROM service_documents WHERE service_id IN ({placeholders})",
+            tuple(service_ids),
+        )
+        for row in service_docs.to_dict("records"):
+            _add_path(row.get("file_path"))
+
+    if maintenance_ids:
+        placeholders = ",".join("?" for _ in maintenance_ids)
+        maintenance_docs = df_query(
+            conn,
+            f"SELECT file_path FROM maintenance_documents WHERE maintenance_id IN ({placeholders})",
+            tuple(maintenance_ids),
+        )
+        for row in maintenance_docs.to_dict("records"):
+            _add_path(row.get("file_path"))
+
+    customer_docs = df_query(
+        conn,
+        "SELECT file_path FROM customer_documents WHERE customer_id=?",
+        (cid,),
+    )
+    for row in customer_docs.to_dict("records"):
+        _add_path(row.get("file_path"))
+
+    other_docs = df_query(
+        conn,
+        "SELECT file_path FROM operations_other_documents WHERE customer_id=?",
+        (cid,),
+    )
+    for row in other_docs.to_dict("records"):
+        _add_path(row.get("file_path"))
+
+    if do_numbers:
+        placeholders = ",".join("?" for _ in do_numbers)
+        conn.execute(
+            f"DELETE FROM services WHERE do_number IN ({placeholders})",
+            tuple(do_numbers),
+        )
+        conn.execute(
+            f"DELETE FROM maintenance_records WHERE do_number IN ({placeholders})",
+            tuple(do_numbers),
+        )
+        conn.execute(
+            f"DELETE FROM delivery_orders WHERE do_number IN ({placeholders})",
+            tuple(do_numbers),
+        )
+
+    conn.execute("DELETE FROM services WHERE customer_id=?", (cid,))
+    conn.execute("DELETE FROM maintenance_records WHERE customer_id=?", (cid,))
+    conn.execute("DELETE FROM customer_documents WHERE customer_id=?", (cid,))
+    conn.execute("DELETE FROM operations_other_documents WHERE customer_id=?", (cid,))
+    conn.execute("DELETE FROM warranties WHERE customer_id=?", (cid,))
+    conn.execute("DELETE FROM needs WHERE customer_id=?", (cid,))
+    conn.execute("DELETE FROM orders WHERE customer_id=?", (cid,))
     conn.execute("DELETE FROM customers WHERE customer_id=?", (cid,))
     if do_code:
         conn.execute(
@@ -5604,8 +5753,10 @@ def delete_customer_record(conn, customer_id: int) -> None:
         recalc_customer_duplicate_flag(conn, phone_val)
         conn.commit()
 
-    if attachment_path:
-        path = resolve_upload_path(attachment_path)
+    for stored_path in sorted(file_paths):
+        if is_file_path_referenced(conn, stored_path):
+            continue
+        path = resolve_upload_path(stored_path)
         if path and path.exists():
             try:
                 path.unlink()
@@ -7987,6 +8138,15 @@ def init_ui():
     st.markdown(
         """
         <style>
+        html,
+        body,
+        [data-testid="stAppViewContainer"] {
+            margin: 0;
+            padding: 0;
+        }
+        [data-testid="stAppViewContainer"] > .main {
+            padding: 0;
+        }
         [data-testid="stMetric"] {
             background: var(--ps-metric-bg);
             border-radius: 0.8rem;
@@ -8025,8 +8185,8 @@ def init_ui():
             max-width: 100% !important;
         }
         .ps-dashboard-header {
-            width: 100%;
-            margin: 0 0 1.5rem;
+            width: 100vw;
+            margin: 0 calc(50% - 50vw) 1.5rem;
             border-radius: 0;
             box-shadow: none;
             height: clamp(180px, 26vh, 320px);
@@ -25131,7 +25291,7 @@ def reports_page(conn):
         )
         submitted = st.form_submit_button("Save report", type="primary")
 
-    if submitted:
+    if _guard_double_submit("work_report_save", submitted):
         cleanup_path: Optional[str] = None
         cleanup_import_path: Optional[str] = None
         grid_rows_to_store = _grid_rows_from_editor(
@@ -25202,20 +25362,29 @@ def reports_page(conn):
                     save_allowed = False
 
             if save_allowed and attachment_upload is not None:
-                identifier = (
-                    f"user{report_owner_id}_{normalized_key}_{normalized_start.isoformat()}"
-                )
-                stored_path = store_report_attachment(
+                validation_error = _validate_upload(
                     attachment_upload,
-                    identifier=identifier,
+                    allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".xlsx", ".xls"},
+                    max_bytes=MAX_UPLOAD_BYTES,
                 )
-                if stored_path:
-                    attachment_to_store = stored_path
-                    if existing_attachment_value:
-                        cleanup_path = existing_attachment_value
-                else:
-                    st.error("Attachment could not be saved. Please try again.")
+                if validation_error:
+                    st.error(f"Attachment upload failed: {validation_error}")
                     attachment_save_failed = True
+                else:
+                    identifier = (
+                        f"user{report_owner_id}_{normalized_key}_{normalized_start.isoformat()}"
+                    )
+                    stored_path = store_report_attachment(
+                        attachment_upload,
+                        identifier=identifier,
+                    )
+                    if stored_path:
+                        attachment_to_store = stored_path
+                        if existing_attachment_value:
+                            cleanup_path = existing_attachment_value
+                    else:
+                        st.error("Attachment could not be saved. Please try again.")
+                        attachment_save_failed = True
             elif save_allowed and remove_attachment and existing_attachment_value:
                 attachment_to_store = None
                 cleanup_path = existing_attachment_value
