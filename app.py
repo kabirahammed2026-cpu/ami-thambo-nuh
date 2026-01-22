@@ -6181,68 +6181,6 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             word-break: break-word;
             white-space: pre-wrap;
         }}
-        .ps-mobile-nav {{
-            display: block;
-            position: fixed;
-            top: 1.25rem;
-            left: 1rem;
-            z-index: 2200;
-        }}
-        .ps-mobile-nav button {{
-            padding: 0.2rem 0.6rem;
-            border-radius: 999px;
-            font-size: 0.85rem;
-            min-height: unset;
-        }}
-        button[title="Show menu"],
-        button[title="Hide menu"],
-        button[aria-label="Show menu"],
-        button[aria-label="Hide menu"] {{
-            position: fixed;
-            top: 0.5rem;
-            left: 1rem;
-            z-index: 2300;
-            padding: 0.1rem 0.35rem;
-            border-radius: 999px;
-            font-size: 0;
-            min-height: unset;
-            min-width: unset;
-            width: 1.6rem;
-            height: 1.6rem;
-            background-color: var(--ps-button-bg) !important;
-            border: 1px solid var(--ps-button-border) !important;
-            color: var(--ps-button-text) !important;
-        }}
-        button[title="Show menu"]::before,
-        button[aria-label="Show menu"]::before {{
-            content: ">";
-            font-size: 0.8rem;
-            line-height: 1;
-        }}
-        button[title="Hide menu"]::before,
-        button[aria-label="Hide menu"]::before {{
-            content: "<";
-            font-size: 0.8rem;
-            line-height: 1;
-        }}
-        .ps-sidebar-toggle {{
-            position: fixed;
-            top: 0.7rem;
-            left: 0.75rem;
-            z-index: 2350;
-            display: block !important;
-        }}
-        .ps-sidebar-toggle div[data-testid="stButton"] button {{
-            padding: 0.2rem 0.45rem;
-            border-radius: 999px;
-            min-height: unset;
-            min-width: unset;
-            width: 1.8rem;
-            height: 1.8rem;
-            background-color: var(--ps-button-bg) !important;
-            border: 1px solid var(--ps-button-border) !important;
-            color: var(--ps-button-text) !important;
-        }}
         @media (max-width: 1200px) {{
             [data-testid="stSidebar"] {{
                 display: var(--ps-sidebar-display);
@@ -8024,10 +7962,9 @@ def init_ui():
         page_title="PS Business Suites",
         page_icon="🧰",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
     st.session_state["ocr_uploads_enabled"] = True
-    st.session_state.setdefault("sidebar_hidden", False)
     if "user" not in st.session_state:
         st.session_state.user = None
     if st.session_state.user:
@@ -8085,18 +8022,58 @@ def init_ui():
         }
         .ps-dashboard-header {
             width: 100%;
-            height: 350px;
             border-radius: 1.25rem;
-            overflow: hidden;
             box-shadow: 0 18px 36px rgba(15, 23, 42, 0.18);
             margin: 0.25rem 0 1.5rem;
         }
         .ps-dashboard-header img {
             width: 100%;
-            height: 100%;
-            object-fit: cover;
-            object-position: center;
+            height: auto;
+            object-fit: contain;
             display: block;
+        }
+        .ps-top-nav {
+            position: sticky;
+            top: 0;
+            z-index: 2100;
+            background: var(--ps-bg);
+            padding: 0.35rem 0 0.5rem;
+            border-bottom: 1px solid var(--ps-panel-border);
+        }
+        .ps-top-nav-brand {
+            font-weight: 700;
+            font-size: 1.05rem;
+            color: var(--ps-text);
+            padding: 0.35rem 0.25rem;
+        }
+        .ps-top-nav-links [role="radiogroup"] {
+            display: flex;
+            flex-wrap: nowrap;
+            gap: 0.5rem;
+            justify-content: center;
+        }
+        .ps-top-nav-links label {
+            margin-right: 0 !important;
+        }
+        .ps-top-nav-actions {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+        }
+        .ps-top-nav-hamburger {
+            display: none;
+            position: absolute;
+            right: 1rem;
+            top: 0.35rem;
+        }
+        @media (max-width: 900px) {
+            .ps-top-nav-links,
+            .ps-top-nav-actions {
+                display: none;
+            }
+            .ps-top-nav-hamburger {
+                display: block;
+            }
         }
         </style>
         """,
@@ -25787,7 +25764,7 @@ def main():
     render_id = st.session_state["_render_id"]
     logger = _get_logger()
     init_ui()
-    sidebar_hidden = st.session_state.get("sidebar_hidden", False)
+    sidebar_hidden = True
     apply_theme_css(sidebar_hidden=sidebar_hidden)
     _ensure_quotation_editor_server()
     conn = get_conn()
@@ -25862,68 +25839,69 @@ def main():
             selection = pages[0]
         st.session_state["nav_page"] = selection
         st.session_state["page"] = selection
+        st.session_state["nav_selection_top"] = selection
+        st.session_state["nav_selection_mobile"] = selection
 
-    if "nav_selection_sidebar" not in st.session_state:
-        st.session_state["nav_selection_sidebar"] = current_page
-    elif st.session_state.get("nav_selection_sidebar") not in pages:
-        st.session_state["nav_selection_sidebar"] = current_page
-    def _render_mobile_nav() -> None:
-        if "nav_selection_mobile" not in st.session_state:
-            st.session_state["nav_selection_mobile"] = current_page
-        elif st.session_state.get("nav_selection_mobile") not in pages:
-            st.session_state["nav_selection_mobile"] = current_page
-        st.markdown('<div class="ps-mobile-nav">', unsafe_allow_html=True)
-        if hasattr(st, "popover"):
-            with st.popover("☰"):
-                st.radio(
-                    "Navigate",
-                    pages,
-                    key="nav_selection_mobile",
-                    on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
-                )
-                if st.button("Logout", key="mobile_logout", use_container_width=True):
-                    _request_logout()
-                    st.rerun()
-        else:
-            with st.expander("☰ Menu", expanded=False):
-                st.radio(
-                    "Navigate",
-                    pages,
-                    key="nav_selection_mobile",
-                    on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
-                )
-                if st.button(
-                    "Logout", key="mobile_logout_expander", use_container_width=True
-                ):
-                    _request_logout()
-                    st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+    if "nav_selection_top" not in st.session_state:
+        st.session_state["nav_selection_top"] = current_page
+    elif st.session_state.get("nav_selection_top") not in pages:
+        st.session_state["nav_selection_top"] = current_page
+    if "nav_selection_mobile" not in st.session_state:
+        st.session_state["nav_selection_mobile"] = current_page
+    elif st.session_state.get("nav_selection_mobile") not in pages:
+        st.session_state["nav_selection_mobile"] = current_page
 
-    st.markdown('<div class="ps-sidebar-toggle">', unsafe_allow_html=True)
-    toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
-    toggle_clicked = st.button(toggle_label, key="ps_sidebar_toggle")
-    st.markdown("</div>", unsafe_allow_html=True)
-    if toggle_clicked:
-        st.session_state["sidebar_hidden"] = not sidebar_hidden
-        st.rerun()
-
-    with st.sidebar:
-        apply_theme_css(sidebar_hidden=sidebar_hidden)
-        st.markdown("### Navigation")
-        if _debug_diag_enabled():
-            st.warning("DEBUG_DIAG enabled: login bypassed.")
+    st.markdown('<div class="ps-top-nav">', unsafe_allow_html=True)
+    nav_cols = st.columns([2.2, 6.8, 1.4])
+    with nav_cols[0]:
+        st.markdown(
+            '<div class="ps-top-nav-brand">PS Engineering • Business Suites</div>',
+            unsafe_allow_html=True,
+        )
+    with nav_cols[1]:
+        st.markdown('<div class="ps-top-nav-links">', unsafe_allow_html=True)
         st.radio(
             "Navigate",
             pages,
-            key="nav_selection_sidebar",
-            on_change=lambda: _sync_nav_choice("nav_selection_sidebar"),
+            key="nav_selection_top",
+            on_change=lambda: _sync_nav_choice("nav_selection_top"),
+            horizontal=True,
+            label_visibility="collapsed",
         )
-        st.divider()
-        if st.button("Logout", key="sidebar_logout_main", use_container_width=True):
+        st.markdown("</div>", unsafe_allow_html=True)
+    with nav_cols[2]:
+        st.markdown('<div class="ps-top-nav-actions">', unsafe_allow_html=True)
+        if st.button("Logout", key="top_logout"):
             _request_logout()
             st.rerun()
-
-    _render_mobile_nav()
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="ps-top-nav-hamburger">', unsafe_allow_html=True)
+    if hasattr(st, "popover"):
+        with st.popover("☰"):
+            st.radio(
+                "Navigate",
+                pages,
+                key="nav_selection_mobile",
+                on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+            )
+            if st.button("Logout", key="mobile_logout", use_container_width=True):
+                _request_logout()
+                st.rerun()
+    else:
+        with st.expander("☰ Menu", expanded=False):
+            st.radio(
+                "Navigate",
+                pages,
+                key="nav_selection_mobile",
+                on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+            )
+            if st.button(
+                "Logout", key="mobile_logout_expander", use_container_width=True
+            ):
+                _request_logout()
+                st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
