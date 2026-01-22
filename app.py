@@ -6163,6 +6163,8 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             z-index: 1100;
             border-right: 1px solid var(--ps-panel-border);
             display: var(--ps-sidebar-display) !important;
+            transform: none !important;
+            visibility: visible !important;
         }}
         [data-testid="stSidebar"] > div {{
             height: 100%;
