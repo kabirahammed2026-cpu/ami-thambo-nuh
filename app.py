@@ -3171,6 +3171,60 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                 }
             )
 
+    scope_clause, scope_params = customer_scope_filter("c")
+    scope_filter = f" AND {scope_clause}" if scope_clause else ""
+    warranty_followups = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT w.warranty_id,
+                   w.follow_up_date,
+                   c.name AS customer,
+                   p.name AS product,
+                   p.model,
+                   w.serial
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            LEFT JOIN products p ON p.product_id = w.product_id
+            WHERE w.follow_up_date IS NOT NULL
+              {scope_filter}
+            ORDER BY date(w.follow_up_date) ASC, w.warranty_id ASC
+            LIMIT 12
+            """
+        ),
+        scope_params,
+    )
+    if not warranty_followups.empty:
+        for _, row in warranty_followups.iterrows():
+            follow_date_val = clean_text(row.get("follow_up_date"))
+            follow_dt = pd.to_datetime(follow_date_val, errors="coerce")
+            severity = "info"
+            if pd.notna(follow_dt) and follow_dt.date() <= date.today():
+                severity = "warning"
+            follow_label = format_period_range(
+                follow_date_val, follow_date_val
+            ) or (follow_date_val or "(date pending)")
+            customer_label = clean_text(row.get("customer")) or "(unknown)"
+            product_label = " ".join(
+                part
+                for part in [
+                    clean_text(row.get("product")),
+                    clean_text(row.get("model")),
+                ]
+                if part
+            )
+            serial_label = clean_text(row.get("serial")) or ""
+            warranty_label = " ".join(part for part in [customer_label, product_label] if part)
+            if serial_label:
+                warranty_label = f"{warranty_label} SN {serial_label}".strip()
+            alerts.append(
+                {
+                    "title": warranty_label or f"Warranty #{row.get('warranty_id')}",
+                    "message": f"Warranty follow-up due {follow_label}",
+                    "severity": severity,
+                }
+            )
+
     follow_up_reports = df_query(
         conn,
         dedent(
@@ -3225,8 +3279,6 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
         for _, reminder in follow_up_reminders[:12]:
             alerts.append(reminder)
 
-    scope_clause, scope_params = customer_scope_filter("c")
-    scope_filter = f" AND {scope_clause}" if scope_clause else ""
     note_alerts = df_query(
         conn,
         dedent(
@@ -6166,6 +6218,23 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             min-width: unset;
             width: 1.6rem;
             height: 1.6rem;
+            background-color: var(--ps-button-bg) !important;
+            border: 1px solid var(--ps-button-border) !important;
+            color: var(--ps-button-text) !important;
+        }}
+        #ps-sidebar-toggle-anchor + div[data-testid="stButton"] {{
+            position: fixed;
+            top: 0.7rem;
+            left: 0.75rem;
+            z-index: 2350;
+        }}
+        #ps-sidebar-toggle-anchor + div[data-testid="stButton"] button {{
+            padding: 0.2rem 0.45rem;
+            border-radius: 999px;
+            min-height: unset;
+            min-width: unset;
+            width: 1.8rem;
+            height: 1.8rem;
             background-color: var(--ps-button-bg) !important;
             border: 1px solid var(--ps-button-border) !important;
             color: var(--ps-button-text) !important;
@@ -16064,7 +16133,7 @@ def warranties_page(conn):
                 note_id = int_or_none(existing_note.iloc[0].get("note_id"))
                 if note_id is not None:
                     conn.execute(
-                        "UPDATE customer_notes SET note=?, remind_on=? WHERE note_id=?",
+                        "UPDATE customer_notes SET note=?, remind_on=?, is_done=0 WHERE note_id=?",
                         (tagged_note, reminder_iso, int(note_id)),
                     )
             if note_id is None:
@@ -18693,6 +18762,45 @@ def _render_quotation_management(conn):
             return None
         return parsed.strftime(INPUT_DATE_FMT)
 
+    def _render_attachment_preview(
+        label: str,
+        path_value: Optional[str],
+        *,
+        key_prefix: str,
+    ) -> None:
+        if not path_value:
+            st.caption(f"{label}: not attached.")
+            return
+        resolved = resolve_upload_path(path_value)
+        if not resolved or not resolved.exists():
+            st.caption(f"{label}: file missing.")
+            return
+        data = resolved.read_bytes()
+        st.download_button(
+            f"Download {label}",
+            data=data,
+            file_name=resolved.name,
+            key=f"{key_prefix}_{resolved.stem}",
+        )
+        suffix = resolved.suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+            with st.expander(f"Preview {label}", expanded=False):
+                st.image(data, caption=resolved.name, use_container_width=True)
+        elif suffix == ".pdf":
+            with st.expander(f"Preview {label}", expanded=False):
+                encoded = base64.b64encode(data).decode("utf-8")
+                st_components_html(
+                    f"""
+                    <iframe
+                        src="data:application/pdf;base64,{encoded}"
+                        width="100%"
+                        height="520"
+                        style="border: none;"
+                    ></iframe>
+                    """,
+                    height=520,
+                )
+
     quotes_df = quotes_df.copy()
     quotes_df["follow_up_date"] = quotes_df.get("follow_up_date", pd.Series(dtype=object)).apply(
         _as_editable_date
@@ -18889,6 +18997,18 @@ def _render_quotation_management(conn):
         if display_columns:
             items_df = items_df[display_columns]
         st.dataframe(items_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Attached files")
+    _render_attachment_preview(
+        "Quotation document",
+        clean_text(selected_row.get("document_path")),
+        key_prefix=f"quotation_doc_{selected_detail_id}",
+    )
+    _render_attachment_preview(
+        "Payment receipt",
+        existing_receipt,
+        key_prefix=f"quotation_receipt_{selected_detail_id}",
+    )
 
     col_left, col_right = st.columns(2)
     with col_left:
@@ -25767,6 +25887,7 @@ def main():
     sidebar_hidden = bool(st.session_state.get("sidebar_hidden"))
     toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
     toggle_icon = ">" if sidebar_hidden else "<"
+    st.markdown('<div id="ps-sidebar-toggle-anchor"></div>', unsafe_allow_html=True)
     if st.button(toggle_icon, key="sidebar_toggle_main", help=toggle_label):
         st.session_state["sidebar_hidden"] = not sidebar_hidden
         st.rerun()
