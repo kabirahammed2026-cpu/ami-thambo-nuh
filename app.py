@@ -8020,16 +8020,22 @@ def init_ui():
             color: var(--ps-accent);
             margin-bottom: 0.25rem;
         }
+        .main .block-container {
+            padding: 0 !important;
+            max-width: 100% !important;
+        }
         .ps-dashboard-header {
             width: 100%;
-            border-radius: 1.25rem;
-            box-shadow: 0 18px 36px rgba(15, 23, 42, 0.18);
-            margin: 0.25rem 0 1.5rem;
+            margin: 0 0 1.5rem;
+            border-radius: 0;
+            box-shadow: none;
+            height: clamp(180px, 26vh, 320px);
+            overflow: hidden;
         }
         .ps-dashboard-header img {
             width: 100%;
-            height: auto;
-            object-fit: contain;
+            height: 100%;
+            object-fit: cover;
             display: block;
         }
         .ps-top-nav {
