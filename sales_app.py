@@ -2955,6 +2955,11 @@ def apply_theme_styles() -> None:
             color: var(--text-color) !important;
             -webkit-text-fill-color: var(--text-color) !important;
         }}
+        [data-testid="stSidebar"] {{
+            display: block !important;
+            transform: none !important;
+            visibility: visible !important;
+        }}
         .ps-quick-nav {{
             position: -webkit-sticky;
             position: sticky;
@@ -2965,11 +2970,6 @@ def apply_theme_styles() -> None:
             padding: 0.25rem 0;
             width: 100%;
             background-color: var(--secondary-background-color);
-        }}
-        @media (max-width: 1200px) {{
-            [data-testid="stSidebar"] {{
-                display: none !important;
-            }}
         }}
         </style>
         """,
@@ -6780,7 +6780,11 @@ def render_settings() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="PS Business Suites by ZAD", layout="wide")
+    st.set_page_config(
+        page_title="PS Business Suites by ZAD",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     logger = _get_logger()
     _, backup_error = ensure_monthly_backup(
         BACKUP_DIR,
