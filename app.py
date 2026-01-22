@@ -241,10 +241,9 @@ def normalize_editor_df(
 
 def build_column_config(
     df: pd.DataFrame, date_columns: set[str], forced_date_columns: Optional[set[str]] = None
-) -> tuple[dict[str, object], list[str], list[str]]:
+) -> tuple[dict[str, object], list[str]]:
     column_config: dict[str, object] = {}
     disabled_columns: list[str] = []
-    warnings: list[str] = []
     forced_date_columns = forced_date_columns or set()
     for col in df.columns:
         lowered = str(col).lower()
@@ -255,20 +254,13 @@ def build_column_config(
             column_config[col] = st.column_config.DateColumn(
                 col, format="YYYY-MM-DD"
             )
-            if (
-                col not in forced_date_columns
-                and series.notna().sum() == 0
-                and lowered != "reminder_date"
-            ):
-                warnings.append(f"{col} has no valid dates; editing is disabled.")
-                disabled_columns.append(col)
         elif pd.api.types.is_bool_dtype(series):
             column_config[col] = st.column_config.CheckboxColumn(col)
         elif pd.api.types.is_numeric_dtype(series):
             column_config[col] = st.column_config.NumberColumn(col)
         else:
             column_config[col] = st.column_config.TextColumn(col)
-    return column_config, disabled_columns, warnings
+    return column_config, disabled_columns
 
 
 def safe_data_editor(
@@ -293,13 +285,11 @@ def safe_data_editor(
         numeric_columns=explicit_number_columns,
         date_columns=explicit_date_columns,
     )
-    auto_config, auto_disabled, warnings = build_column_config(
+    auto_config, auto_disabled = build_column_config(
         normalized, date_columns, forced_date_columns=explicit_date_columns
     )
     merged_config = {**auto_config, **(column_config or {})}
     disabled_columns = sorted(set(auto_disabled) | set(disabled or []))
-    if warnings:
-        st.warning(" ".join(warnings))
     try:
         return st.data_editor(
             normalized,
@@ -315,7 +305,6 @@ def safe_data_editor(
         )
         st.dataframe(normalized, use_container_width=True)
         return normalized
-    return f"{value:.1f} GB"
 
 SERVICE_REPORT_FIELDS = OrderedDict(
     [

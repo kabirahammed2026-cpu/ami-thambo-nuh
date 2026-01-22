@@ -278,6 +278,26 @@ class UploadManager:
         self.base_dir = config.data_dir / "uploads"
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
+    def _read_uploaded_bytes(self, uploaded_file) -> bytes:
+        if uploaded_file is None:
+            return b""
+        if hasattr(uploaded_file, "getvalue"):
+            try:
+                data = uploaded_file.getvalue()
+            except Exception:
+                data = b""
+            if data:
+                return data
+        if hasattr(uploaded_file, "seek"):
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+        try:
+            return uploaded_file.read()
+        except Exception:
+            return b""
+
     def _safe_name(self, name: str) -> str:
         cleaned = name.replace("\\", "/").split("/")[-1]
         return cleaned or "upload"
@@ -290,18 +310,43 @@ class UploadManager:
     def save(self, uploaded_file, subdir: str) -> str:
         target_dir = self._target_dir(subdir)
         filename = self._safe_name(getattr(uploaded_file, "name", "upload"))
-        target_path = target_dir / filename
-        data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        ext = Path(filename).suffix.lower()
+        allowed_exts = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
+        for mime in self.config.allowed_mime_types:
+            allowed_exts.update(mimetypes.guess_all_extensions(mime) or [])
+        if allowed_exts and ext and ext not in allowed_exts:
+            raise ValueError(f"Unsupported file type: {ext}")
+        size = getattr(uploaded_file, "size", None)
+        if isinstance(size, (int, float)) and size > self.config.max_upload_bytes:
+            raise ValueError(
+                f"File exceeds {self.config.max_upload_bytes} bytes size limit."
+            )
+        data = self._read_uploaded_bytes(uploaded_file)
         size = len(data)
         if size > self.config.max_upload_bytes:
             raise ValueError(
                 f"File exceeds {self.config.max_upload_bytes} bytes size limit."
             )
+        if not data:
+            raise ValueError("Upload appears to be empty.")
         mime_type, _ = mimetypes.guess_type(filename)
         if self.config.allowed_mime_types:
             allowed = {m.strip() for m in self.config.allowed_mime_types if m.strip()}
-            if mime_type not in allowed:
+            if mime_type and mime_type not in allowed:
                 raise ValueError(f"Unsupported MIME type: {mime_type or 'unknown'}")
+        target_path = target_dir / filename
+        if target_path.exists():
+            try:
+                if target_path.read_bytes() == data:
+                    return str(target_path.relative_to(self.config.data_dir))
+            except OSError:
+                pass
+        base_stem = target_path.stem
+        base_suffix = target_path.suffix
+        counter = 1
+        while target_path.exists():
+            target_path = target_dir / f"{base_stem}_{counter}{base_suffix}"
+            counter += 1
         with open(target_path, "wb") as f:
             f.write(data)
         return str(target_path.relative_to(self.config.data_dir))

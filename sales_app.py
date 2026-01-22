@@ -24,6 +24,7 @@ import html
 import pandas as pd
 import dateparser
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
@@ -117,6 +118,49 @@ def _get_logger() -> logging.Logger:
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
     return logger
+
+
+def _normalize_editor_df(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    normalized = df.copy()
+    for col in normalized.columns:
+        series = normalized[col]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            normalized[col] = pd.to_datetime(series, errors="coerce").dt.date
+        elif pd.api.types.is_bool_dtype(series):
+            normalized[col] = series.astype(bool)
+        elif pd.api.types.is_numeric_dtype(series):
+            normalized[col] = pd.to_numeric(series, errors="coerce")
+        else:
+            normalized[col] = series.astype(object).where(series.notna(), "")
+    return normalized
+
+
+def safe_data_editor(
+    df: pd.DataFrame,
+    *,
+    key: str,
+    column_config: Optional[dict[str, object]] = None,
+    disabled: Optional[list[str]] = None,
+    **kwargs,
+) -> pd.DataFrame:
+    normalized = _normalize_editor_df(df)
+    try:
+        return st.data_editor(
+            normalized,
+            column_config=column_config,
+            disabled=disabled or [],
+            key=key,
+            **kwargs,
+        )
+    except StreamlitAPIException as exc:
+        st.error(
+            "Editor rendering failed due to a column type mismatch. "
+            f"The table is shown in read-only mode. ({exc})"
+        )
+        st.dataframe(normalized, use_container_width=True)
+        return normalized
 
 
 def _debug_diag_enabled() -> bool:
@@ -5544,7 +5588,7 @@ def render_quotations(user: Dict) -> None:
     save_declines = False
     edited_df = working_df
     with st.form(decline_form_key):
-        edited_df = st.data_editor(
+        edited_df = safe_data_editor(
             working_df,
             hide_index=True,
             use_container_width=True,
