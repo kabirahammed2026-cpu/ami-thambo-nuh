@@ -6162,7 +6162,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             overflow-y: auto;
             z-index: 1100;
             border-right: 1px solid var(--ps-panel-border);
-            display: var(--ps-sidebar-display);
+            display: var(--ps-sidebar-display) !important;
         }}
         [data-testid="stSidebar"] > div {{
             height: 100%;
@@ -6202,7 +6202,7 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             z-index: 2300;
             padding: 0.1rem 0.35rem;
             border-radius: 999px;
-            font-size: 0.7rem;
+            font-size: 0;
             min-height: unset;
             min-width: unset;
             width: 1.6rem;
@@ -6210,6 +6210,18 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-button-bg) !important;
             border: 1px solid var(--ps-button-border) !important;
             color: var(--ps-button-text) !important;
+        }}
+        button[title="Show menu"]::before,
+        button[aria-label="Show menu"]::before {{
+            content: ">";
+            font-size: 0.8rem;
+            line-height: 1;
+        }}
+        button[title="Hide menu"]::before,
+        button[aria-label="Hide menu"]::before {{
+            content: "<";
+            font-size: 0.8rem;
+            line-height: 1;
         }}
         #ps-sidebar-toggle-anchor + div[data-testid="stButton"] {{
             position: fixed;
@@ -25875,9 +25887,8 @@ def main():
 
     sidebar_hidden = bool(st.session_state.get("sidebar_hidden"))
     toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
-    toggle_icon = ">" if sidebar_hidden else "<"
     st.markdown('<div id="ps-sidebar-toggle-anchor"></div>', unsafe_allow_html=True)
-    if st.button(toggle_icon, key="sidebar_toggle_main", help=toggle_label):
+    if st.button(toggle_label, key="sidebar_toggle_main"):
         st.session_state["sidebar_hidden"] = not sidebar_hidden
         st.rerun()
 
