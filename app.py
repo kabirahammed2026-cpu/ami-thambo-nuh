@@ -8182,6 +8182,7 @@ def init_ui():
         }
         .main .block-container {
             padding: 0 !important;
+            margin-top: 0 !important;
             max-width: 100% !important;
         }
         .ps-dashboard-header {
@@ -8191,11 +8192,13 @@ def init_ui():
             box-shadow: none;
             height: clamp(180px, 26vh, 320px);
             overflow: hidden;
+            background: var(--ps-bg);
         }
         .ps-dashboard-header img {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            object-fit: contain;
+            object-position: center;
             display: block;
         }
         .ps-top-nav {
