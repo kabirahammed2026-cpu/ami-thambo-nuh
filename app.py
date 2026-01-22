@@ -6098,8 +6098,8 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
         return
     st.session_state["_theme_css_render"] = (render_id, sidebar_hidden)
     theme = get_theme()
-    sidebar_display = "none" if sidebar_hidden else "block"
-    content_offset = "0rem" if sidebar_hidden else "var(--ps-sidebar-width)"
+    sidebar_display = "block"
+    content_offset = "var(--ps-sidebar-width)"
     colors = _build_theme_colors(theme)
     st.markdown(
         f"""
@@ -8245,7 +8245,7 @@ def _request_logout() -> None:
 
 
 def login_box(conn, *, render_id=None):
-    apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
+    apply_theme_css(sidebar_hidden=False)
     if st.session_state.user:
         _ensure_session_token(conn, st.session_state.user)
         st.sidebar.markdown("### Login")
@@ -25753,7 +25753,7 @@ def main():
     render_id = st.session_state["_render_id"]
     logger = _get_logger()
     init_ui()
-    apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
+    apply_theme_css(sidebar_hidden=False)
     _ensure_quotation_editor_server()
     conn = get_conn()
     init_schema(conn)
@@ -25865,13 +25865,10 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
 
     with st.sidebar:
-        apply_theme_css(sidebar_hidden=bool(st.session_state.get("sidebar_hidden")))
+        apply_theme_css(sidebar_hidden=False)
         st.markdown("### Navigation")
         if _debug_diag_enabled():
             st.warning("DEBUG_DIAG enabled: login bypassed.")
-        if st.button("Hide menu", key="sidebar_hide_menu", use_container_width=True):
-            st.session_state["sidebar_hidden"] = True
-            st.rerun()
         st.radio(
             "Navigate",
             pages,
@@ -25884,13 +25881,6 @@ def main():
             st.rerun()
 
     _render_mobile_nav()
-
-    sidebar_hidden = bool(st.session_state.get("sidebar_hidden"))
-    toggle_label = "Show menu" if sidebar_hidden else "Hide menu"
-    st.markdown('<div id="ps-sidebar-toggle-anchor"></div>', unsafe_allow_html=True)
-    if st.button(toggle_label, key="sidebar_toggle_main"):
-        st.session_state["sidebar_hidden"] = not sidebar_hidden
-        st.rerun()
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
