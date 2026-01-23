@@ -8228,20 +8228,11 @@ def init_ui():
             display: flex;
             justify-content: flex-end;
             align-items: center;
-        }
-        .ps-top-nav-hamburger {
-            display: none;
-            position: absolute;
-            right: 1rem;
-            top: 0.35rem;
+            gap: 0.5rem;
         }
         @media (max-width: 900px) {
-            .ps-top-nav-links,
-            .ps-top-nav-actions {
+            .ps-top-nav-links {
                 display: none;
-            }
-            .ps-top-nav-hamburger {
-                display: block;
             }
         }
         </style>
@@ -26049,36 +26040,31 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
     with nav_cols[2]:
         st.markdown('<div class="ps-top-nav-actions">', unsafe_allow_html=True)
-        if st.button("Logout", key="top_logout"):
-            _request_logout()
-            st.rerun()
+        if hasattr(st, "popover"):
+            with st.popover("☰"):
+                st.radio(
+                    "Navigate",
+                    pages,
+                    key="nav_selection_mobile",
+                    on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+                )
+                if st.button("Logout", key="mobile_logout", use_container_width=True):
+                    _request_logout()
+                    st.rerun()
+        else:
+            with st.expander("☰ Menu", expanded=False):
+                st.radio(
+                    "Navigate",
+                    pages,
+                    key="nav_selection_mobile",
+                    on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+                )
+                if st.button(
+                    "Logout", key="mobile_logout_expander", use_container_width=True
+                ):
+                    _request_logout()
+                    st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown('<div class="ps-top-nav-hamburger">', unsafe_allow_html=True)
-    if hasattr(st, "popover"):
-        with st.popover("☰"):
-            st.radio(
-                "Navigate",
-                pages,
-                key="nav_selection_mobile",
-                on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
-            )
-            if st.button("Logout", key="mobile_logout", use_container_width=True):
-                _request_logout()
-                st.rerun()
-    else:
-        with st.expander("☰ Menu", expanded=False):
-            st.radio(
-                "Navigate",
-                pages,
-                key="nav_selection_mobile",
-                on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
-            )
-            if st.button(
-                "Logout", key="mobile_logout_expander", use_container_width=True
-            ):
-                _request_logout()
-                st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     page = st.session_state.get("nav_page", pages[0])
