@@ -8140,6 +8140,8 @@ def init_ui():
         <style>
         html,
         body,
+        #root,
+        .stApp,
         [data-testid="stAppViewContainer"] {
             margin: 0;
             padding: 0;
@@ -8190,14 +8192,15 @@ def init_ui():
             margin: 0 calc(50% - 50vw) 1.5rem;
             border-radius: 0;
             box-shadow: none;
-            height: clamp(180px, 26vh, 320px);
+            height: calc(100vw * 350 / 1600);
+            max-height: 350px;
             overflow: hidden;
-            background: var(--ps-bg);
+            background: #f7e6f3;
         }
         .ps-dashboard-header img {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            object-fit: contain;
             object-position: center;
             display: block;
         }
