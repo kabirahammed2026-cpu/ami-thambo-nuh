@@ -8142,7 +8142,8 @@ def init_ui():
         body,
         #root,
         .stApp,
-        [data-testid="stAppViewContainer"] {
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main {
             margin: 0;
             padding: 0;
         }
@@ -8189,13 +8190,16 @@ def init_ui():
         }
         .ps-dashboard-header {
             width: 100vw;
-            margin: 0 calc(50% - 50vw) 1.5rem;
+            margin-left: calc(50% - 50vw);
+            margin-right: calc(50% - 50vw);
+            margin-top: 0;
+            margin-bottom: 1.5rem;
             border-radius: 0;
             box-shadow: none;
             height: calc(100vw * 350 / 1600);
             max-height: 350px;
             overflow: hidden;
-            background: #f7e6f3;
+            background: #f3d9e6;
         }
         .ps-dashboard-header img {
             width: 100%;
