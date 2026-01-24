@@ -1581,7 +1581,29 @@ def ensure_schema_upgrades(conn):
 
     def add_column(table: str, column: str, definition: str) -> None:
         if not has_column(table, column):
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            if "DEFAULT (datetime('now'))" in definition:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                conn.execute(
+                    f"UPDATE {table} SET {column} = COALESCE({column}, datetime('now'))"
+                )
+                trigger_name = f"set_{table}_{column}_on_insert"
+                ensure_trigger(
+                    trigger_name,
+                    dedent(
+                        f"""
+                        CREATE TRIGGER {trigger_name}
+                        AFTER INSERT ON {table}
+                        WHEN NEW.{column} IS NULL
+                        BEGIN
+                            UPDATE {table}
+                            SET {column} = datetime('now')
+                            WHERE rowid = NEW.rowid;
+                        END;
+                        """
+                    ),
+                )
+            else:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def ensure_trigger(name: str, sql: str) -> None:
         cur = conn.execute(
