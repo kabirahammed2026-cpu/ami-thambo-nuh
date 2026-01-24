@@ -8102,8 +8102,13 @@ def apply_customer_merge_updates(
 
 
 def _render_nav_logo() -> Optional[str]:
-    logo_path = Path("Dashboard Top.png")
-    if not logo_path.exists():
+    candidate_paths = [
+        Path("logo"),
+        Path("logo.png"),
+        Path("Dashboard Top.png"),
+    ]
+    logo_path = next((path for path in candidate_paths if path.exists()), None)
+    if not logo_path:
         return None
     payload = _safe_read_bytes(logo_path)
     if not payload:
@@ -8198,14 +8203,14 @@ def init_ui():
             top: 0;
             z-index: 2100;
             background: var(--ps-bg);
-            padding: 0.35rem 0 0.5rem;
+            padding: 0.1rem 0 0.35rem;
             border-bottom: 1px solid var(--ps-panel-border);
         }
         .ps-top-nav-brand {
             display: inline-flex;
             align-items: center;
             gap: 0.4rem;
-            padding: 0.35rem 0.25rem;
+            padding: 0.2rem 0.25rem;
             color: var(--ps-text);
             text-decoration: none;
         }
