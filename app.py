@@ -2474,6 +2474,7 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
 
     warnings: list[str] = []
     text_content = ""
+    table_hints: list[str] = []
     suffix = Path(upload.name).suffix.lower()
     file_bytes = upload.getvalue()
 
@@ -2507,14 +2508,23 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
             boosted = ImageOps.autocontrast(grayscale)
             boosted = ImageEnhance.Contrast(boosted).enhance(1.8)
             boosted = ImageEnhance.Sharpness(boosted).enhance(1.2)
-            primary_text = pytesseract.image_to_string(boosted)
-
+            configs = [
+                "--oem 3 --psm 6 -c preserve_interword_spaces=1",
+                "--oem 3 --psm 4 -c preserve_interword_spaces=1",
+                "--oem 3 --psm 11",
+            ]
+            results = [
+                pytesseract.image_to_string(boosted, config=config) for config in configs
+            ]
+            primary_text = max(results, key=lambda value: len(value.strip())) if results else ""
             if len(primary_text.strip()) >= 12:
                 return primary_text
 
             inverted = ImageOps.invert(grayscale)
             inverted = ImageEnhance.Contrast(inverted).enhance(1.6)
-            alt_text = pytesseract.image_to_string(inverted)
+            alt_text = pytesseract.image_to_string(
+                inverted, config="--oem 3 --psm 6 -c preserve_interword_spaces=1"
+            )
             return alt_text if len(alt_text.strip()) > len(primary_text.strip()) else primary_text
         except pytesseract.TesseractNotFoundError:
             _OCR_ENGINE_AVAILABLE = False
@@ -2525,6 +2535,65 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
         except Exception as exc:  # pragma: no cover - defensive against OCR failures
             warnings.append(f"OCR failed: {exc}")
             return ""
+
+    def _extract_table_lines(image: Image.Image) -> list[str]:
+        if not _ensure_ocr_engine_available():
+            return []
+        try:
+            data = pytesseract.image_to_data(
+                image,
+                output_type=pytesseract.Output.DICT,
+                config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
+            )
+        except pytesseract.TesseractNotFoundError:
+            _OCR_ENGINE_AVAILABLE = False
+            return []
+        except Exception:
+            return []
+
+        row_map: dict[tuple[int, int, int], list[tuple[int, str]]] = {}
+        for idx, text in enumerate(data.get("text", [])):
+            cleaned = str(text or "").strip()
+            if not cleaned:
+                continue
+            try:
+                conf = float(data.get("conf", [])[idx])
+            except Exception:
+                conf = 0.0
+            if conf < 0:
+                continue
+            key = (
+                int(data.get("block_num", [0])[idx]),
+                int(data.get("par_num", [0])[idx]),
+                int(data.get("line_num", [0])[idx]),
+            )
+            left = int(data.get("left", [0])[idx])
+            row_map.setdefault(key, []).append((left, cleaned))
+
+        table_lines: list[str] = []
+        for key in sorted(row_map.keys()):
+            words = row_map[key]
+            words.sort(key=lambda entry: entry[0])
+            if len(words) < 2:
+                continue
+            parts: list[str] = []
+            last_left = None
+            for left, word in words:
+                if last_left is None:
+                    parts.append(word)
+                else:
+                    gap = left - last_left
+                    parts.append((" | " if gap > 40 else " ") + word)
+                last_left = left
+            row_text = "".join(parts).strip()
+            if row_text and re.search(r"\d", row_text):
+                table_lines.append(row_text)
+        return table_lines
+
+    def _ocr_image_with_tables(image: Image.Image) -> tuple[str, list[str]]:
+        text = _ocr_image(image)
+        table_lines = _extract_table_lines(image)
+        return text, table_lines
 
     if suffix == ".pdf":
         pages: list[str] = []
@@ -2539,7 +2608,10 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
                 for image_file in getattr(page, "images", []):
                     try:
                         pil_image = Image.open(io.BytesIO(image_file.data))
-                        image_ocr.append(_ocr_image(pil_image))
+                        image_text, table_rows = _ocr_image_with_tables(pil_image)
+                        if image_text:
+                            image_ocr.append(image_text)
+                        table_hints.extend(table_rows)
                     except Exception:
                         continue
                 if image_ocr:
@@ -2554,11 +2626,16 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
             try:
                 from pdf2image import convert_from_bytes
 
-                last_page = max(1, min(2, len(pages) or 2))
+                last_page = max(1, min(3, len(pages) or 3))
                 raster_pages = convert_from_bytes(
                     file_bytes, dpi=300, first_page=1, last_page=last_page
                 )
-                extra_ocr = [_ocr_image(image) for image in raster_pages]
+                extra_ocr = []
+                for image in raster_pages:
+                    image_text, table_rows = _ocr_image_with_tables(image)
+                    if image_text:
+                        extra_ocr.append(image_text)
+                    table_hints.extend(table_rows)
                 combined = "\n".join([text_content, *extra_ocr]).strip()
                 if combined:
                     text_content = combined
@@ -2575,7 +2652,11 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
             warnings.append(f"Could not open the uploaded image: {exc}")
             return "", warnings
 
-        text_content = _ocr_image(image)
+        text_content, table_lines = _ocr_image_with_tables(image)
+        table_hints.extend(table_lines)
+
+    if table_hints:
+        text_content = "\n".join([text_content, *table_hints]).strip()
 
     return text_content, warnings
 
@@ -2955,6 +3036,73 @@ def _extract_quotation_metadata(text: str) -> dict[str, object]:
         ]
         return items
 
+    def _extract_table_items(source_lines: list[str]) -> list[dict[str, object]]:
+        header_idx = None
+        for idx, line in enumerate(source_lines):
+            if re.search(r"\bdescription\b", line, re.IGNORECASE) and re.search(
+                r"\bqty\b|\bquantity\b", line, re.IGNORECASE
+            ):
+                header_idx = idx
+                break
+        start_idx = header_idx + 1 if header_idx is not None else 0
+        table_lines = source_lines[start_idx:]
+        items: list[dict[str, object]] = []
+        description_buffer: list[str] = []
+        qty_pattern = re.compile(
+            r"(?P<qty>\d+(?:\.\d+)?)\s*(set|sets|pcs|nos|units|unit|qty|pair|pairs)?",
+            re.IGNORECASE,
+        )
+        price_pattern = re.compile(r"(?P<price>[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?)")
+
+        for line in table_lines:
+            if re.search(r"total\s+amount|taka\s+in\s+word", line, re.IGNORECASE):
+                break
+            cleaned = re.sub(r"\s{2,}", " ", line.strip())
+            if not cleaned:
+                continue
+            split_line = re.split(r"\s\|\s", cleaned)
+            candidate = split_line[-1] if split_line else cleaned
+            prices = price_pattern.findall(candidate)
+            qty_match = qty_pattern.search(candidate)
+            if prices or qty_match:
+                qty_value = 1.0
+                if qty_match:
+                    try:
+                        qty_value = float(qty_match.group("qty"))
+                    except ValueError:
+                        qty_value = 1.0
+                rate_value = 0.0
+                if prices:
+                    try:
+                        rate_value = float(prices[0].replace(",", ""))
+                    except ValueError:
+                        rate_value = 0.0
+                description_text = " ".join(description_buffer).strip()
+                if not description_text:
+                    description_text = cleaned
+                    if qty_match:
+                        description_text = description_text.replace(
+                            qty_match.group(0), ""
+                        ).strip(" ,-/")
+                    if prices:
+                        for price in prices:
+                            description_text = description_text.replace(price, "")
+                    description_text = description_text.strip(" ,-/")
+                if description_text:
+                    items.append(
+                        {
+                            "description": description_text,
+                            "model": "",
+                            "quantity": qty_value,
+                            "rate": rate_value,
+                            "discount": 0.0,
+                        }
+                    )
+                description_buffer = []
+            else:
+                description_buffer.append(cleaned)
+        return items
+
     reference = _header_value("ref") or _match(
         [
             r"quotation\s*(?:no\.|number|#)[:#\s]*([\w/-]+)",
@@ -3048,7 +3196,11 @@ def _extract_quotation_metadata(text: str) -> dict[str, object]:
         best_total = max(parsed_totals)
         updates["quotation_detected_total"] = best_total
 
-    detected_items = _extract_price_schedule() or _parse_line_items_from_text(lines)
+    detected_items = (
+        _extract_price_schedule()
+        or _extract_table_items(lines)
+        or _parse_line_items_from_text(lines)
+    )
     if detected_items:
         updates["_detected_items"] = detected_items
 
@@ -14589,17 +14741,24 @@ def operations_page(conn):
         key="operations_customer_search",
         help="Search by customer name, company, phone, or sales rep.",
     )
-    where_clause = ""
+    scope_clause, scope_params = customer_scope_filter()
+    where_parts: list[str] = []
     params: list[object] = []
     if search_query:
         like_value = f"%{search_query.strip().lower()}%"
-        where_clause = (
-            "WHERE lower(COALESCE(name, '')) LIKE ? "
+        where_parts.append(
+            "("
+            "lower(COALESCE(name, '')) LIKE ? "
             "OR lower(COALESCE(company_name, '')) LIKE ? "
             "OR lower(COALESCE(phone, '')) LIKE ? "
             "OR lower(COALESCE(sales_person, '')) LIKE ?"
+            ")"
         )
         params = [like_value, like_value, like_value, like_value]
+    if scope_clause:
+        where_parts.append(scope_clause)
+        params.extend(scope_params)
+    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     customers_df = df_query(
         conn,
         f"""
@@ -18170,6 +18329,7 @@ def _upsert_customer_from_manual_quotation(
         merge_customers_by_phone(conn, phone_number)
     return cursor.lastrowid
 
+
 def _persist_quotation_pdf(
     record_id: int, pdf_bytes: bytes, reference: Optional[str]
 ) -> Optional[str]:
@@ -18189,6 +18349,65 @@ def _persist_quotation_pdf(
         return str(dest.relative_to(BASE_DIR))
     except (OSError, ValueError):
         return None
+
+
+def _sync_customer_from_quotation(
+    conn,
+    *,
+    current_name: Optional[str],
+    current_company: Optional[str],
+    current_phone: Optional[str],
+    new_name: Optional[str],
+    new_company: Optional[str],
+    new_phone: Optional[str],
+) -> None:
+    scope_clause, scope_params = customer_scope_filter()
+    phone_key = _normalize_phone_key(current_phone)
+    customer_id = None
+    if phone_key:
+        phone_query = "SELECT customer_id, phone FROM customers"
+        if scope_clause:
+            phone_query = f"{phone_query} WHERE {scope_clause}"
+        phone_rows = conn.execute(phone_query, scope_params).fetchall()
+        for row in phone_rows:
+            if _normalize_phone_key(row[1]) == phone_key:
+                customer_id = int(row[0])
+                break
+    if customer_id is None:
+        lookup_parts: list[str] = []
+        lookup_params: list[object] = []
+        if current_name:
+            lookup_parts.append("LOWER(COALESCE(name, '')) = LOWER(?)")
+            lookup_params.append(current_name)
+        if current_company:
+            lookup_parts.append("LOWER(COALESCE(company_name, '')) = LOWER(?)")
+            lookup_params.append(current_company)
+        if lookup_parts:
+            lookup_clause = " OR ".join(lookup_parts)
+            query = f"SELECT customer_id FROM customers WHERE ({lookup_clause})"
+            if scope_clause:
+                query = f"{query} AND {scope_clause}"
+            query = f"{query} ORDER BY customer_id DESC LIMIT 1"
+            row = conn.execute(query, tuple(lookup_params) + scope_params).fetchone()
+            if row:
+                customer_id = int(row[0])
+    if customer_id is None:
+        return
+    updates: dict[str, object] = {}
+    if new_name and new_name != current_name:
+        updates["name"] = new_name
+    if new_company and new_company != current_company:
+        updates["company_name"] = new_company
+    if new_phone and new_phone != current_phone:
+        updates["phone"] = new_phone
+    if not updates:
+        return
+    set_clause = ", ".join(f"{col}=?" for col in updates)
+    conn.execute(
+        f"UPDATE customers SET {set_clause} WHERE customer_id=?",
+        (*updates.values(), customer_id),
+    )
+    conn.commit()
 
 
 def _update_quotation_records(
@@ -18229,6 +18448,14 @@ def _update_quotation_records(
             customer_company,
             customer_contact,
         ) = row
+        new_reference = clean_text(entry.get("reference")) or clean_text(current_reference)
+        new_customer_name = clean_text(entry.get("customer_name")) or clean_text(customer_name)
+        new_customer_company = clean_text(entry.get("customer_company")) or clean_text(
+            customer_company
+        )
+        new_customer_contact = clean_text(entry.get("customer_contact")) or clean_text(
+            customer_contact
+        )
         current_status = clean_text(current_status) or "pending"
         if current_status in {"paid", "rejected"} and not allow_locked:
             locked.append(quotation_id)
@@ -18298,6 +18525,10 @@ def _update_quotation_records(
             """
             UPDATE quotations
             SET status=?,
+                reference=?,
+                customer_name=?,
+                customer_company=?,
+                customer_contact=?,
                 follow_up_status=?,
                 follow_up_notes=?,
                 follow_up_date=?,
@@ -18309,6 +18540,10 @@ def _update_quotation_records(
             """,
             (
                 status_value,
+                new_reference,
+                new_customer_name,
+                new_customer_company,
+                new_customer_contact,
                 follow_up_status,
                 follow_up_notes,
                 follow_up_date,
@@ -18318,7 +18553,23 @@ def _update_quotation_records(
                 quotation_id,
             ),
         )
-        reference_label = clean_text(current_reference) or f"Quotation #{quotation_id}"
+        if any(
+            [
+                clean_text(customer_name) != new_customer_name,
+                clean_text(customer_company) != new_customer_company,
+                clean_text(customer_contact) != new_customer_contact,
+            ]
+        ):
+            _sync_customer_from_quotation(
+                conn,
+                current_name=clean_text(customer_name),
+                current_company=clean_text(customer_company),
+                current_phone=clean_text(customer_contact),
+                new_name=new_customer_name,
+                new_company=new_customer_company,
+                new_phone=new_customer_contact,
+            )
+        reference_label = clean_text(new_reference) or f"Quotation #{quotation_id}"
         if status_value == "paid":
             sync_follow_up_reminder(
                 conn,
@@ -18413,14 +18664,18 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             pass
 
     salesperson_seed = salesperson_profile["name"]
+    scope_clause, scope_params = customer_scope_filter()
+    where_clause = f"WHERE {scope_clause}" if scope_clause else ""
     customer_df = df_query(
         conn,
-        """
+        f"""
         SELECT customer_id, name, company_name, address, delivery_address, phone, COALESCE(delivery_address, address) AS district
         FROM customers
+        {where_clause}
         ORDER BY LOWER(COALESCE(name, company_name, phone, 'customer'))
         LIMIT 200
         """,
+        scope_params,
     )
     autofill_options = [None]
     autofill_labels = {None: "Manual entry"}
