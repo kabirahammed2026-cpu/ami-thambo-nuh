@@ -8159,6 +8159,10 @@ def init_ui():
         }
         [data-testid="stAppViewContainer"] > .main {
             padding: 0;
+            padding-top: 0 !important;
+        }
+        header[data-testid="stHeader"] {
+            display: none;
         }
         [data-testid="stMetric"] {
             background: var(--ps-metric-bg);
@@ -26079,10 +26083,10 @@ def main():
         if nav_logo_uri:
             st.markdown(
                 (
-                    '<a class="ps-top-nav-brand ps-top-nav-logo" href="/" '
+                    '<div class="ps-top-nav-brand ps-top-nav-logo" '
                     'aria-label="PS Engineering Business Suites">'
                     f'<img src="{nav_logo_uri}" alt="PS Engineering Business Suites" />'
-                    "</a>"
+                    "</div>"
                 ),
                 unsafe_allow_html=True,
             )
