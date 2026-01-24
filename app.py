@@ -4861,6 +4861,16 @@ def _read_uploaded_bytes(uploaded_file) -> bytes:
         return b""
 
 
+def _safe_read_bytes(path: Optional[Path]) -> Optional[bytes]:
+    if not path:
+        return None
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        _get_logger().warning("Unable to read file %s: %s", path, exc)
+        return None
+
+
 def save_uploaded_file(
     uploaded_file,
     target_dir: Path,
@@ -8091,21 +8101,15 @@ def apply_customer_merge_updates(
     )
 
 
-def _render_app_header() -> None:
-    header_path = Path("Dashboard Top.png")
-    if header_path.exists():
-        encoded = base64.b64encode(header_path.read_bytes()).decode("utf-8")
-        st.markdown(
-            f"""
-            <div class="ps-dashboard-header">
-                <img src="data:image/png;base64,{encoded}" alt="PS Engineering – Business Suites" />
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.title("PS Engineering – Business Suites")
-        st.caption("Customers • Warranties • Needs • Summaries")
+def _render_nav_logo() -> Optional[str]:
+    logo_path = Path("Dashboard Top.png")
+    if not logo_path.exists():
+        return None
+    payload = _safe_read_bytes(logo_path)
+    if not payload:
+        return None
+    encoded = base64.b64encode(payload).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
 
 
 def init_ui():
@@ -8120,7 +8124,8 @@ def init_ui():
         st.session_state.user = None
     if st.session_state.user:
         st.set_option("client.toolbarMode", "minimal")
-        _render_app_header()
+        nav_logo_uri = _render_nav_logo()
+        st.session_state["nav_logo_uri"] = nav_logo_uri
         st.markdown(
             """
             <style>
@@ -8188,26 +8193,6 @@ def init_ui():
             margin-top: 0 !important;
             max-width: 100% !important;
         }
-        .ps-dashboard-header {
-            width: 100vw;
-            margin-left: calc(50% - 50vw);
-            margin-right: calc(50% - 50vw);
-            margin-top: 0;
-            margin-bottom: 1.5rem;
-            border-radius: 0;
-            box-shadow: none;
-            height: calc(100vw * 350 / 1600);
-            max-height: 350px;
-            overflow: hidden;
-            background: #f3d9e6;
-        }
-        .ps-dashboard-header img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            object-position: center;
-            display: block;
-        }
         .ps-top-nav {
             position: sticky;
             top: 0;
@@ -8217,10 +8202,17 @@ def init_ui():
             border-bottom: 1px solid var(--ps-panel-border);
         }
         .ps-top-nav-brand {
-            font-weight: 700;
-            font-size: 1.05rem;
-            color: var(--ps-text);
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
             padding: 0.35rem 0.25rem;
+            color: var(--ps-text);
+            text-decoration: none;
+        }
+        .ps-top-nav-logo img {
+            height: clamp(18px, 2vw, 22px);
+            width: auto;
+            display: block;
         }
         .ps-top-nav-links [role="radiogroup"] {
             display: flex;
@@ -9064,9 +9056,8 @@ def dashboard(conn):
                 path = resolve_upload_path(file_value)
                 if not path or not path.exists():
                     continue
-                try:
-                    payload = path.read_bytes()
-                except OSError:
+                payload = _safe_read_bytes(path)
+                if not payload:
                     continue
                 label = f"{label_prefix} • {kind}"
                 st.download_button(
@@ -9823,9 +9814,8 @@ def dashboard(conn):
                         resolved = resolve_upload_path(clean_path)
                         if not resolved or not resolved.exists():
                             continue
-                        try:
-                            file_bytes = resolved.read_bytes()
-                        except OSError:
+                        file_bytes = _safe_read_bytes(resolved)
+                        if not file_bytes:
                             continue
                         st.download_button(
                             f"Download {label.lower()}",
@@ -11855,12 +11845,16 @@ def render_customer_quick_edit_section(
                     )
                     path = resolve_upload_path(doc.get("path"))
                     if path and path.exists():
-                        st.download_button(
-                            f"{label}{suffix}",
-                            data=path.read_bytes(),
-                            file_name=path.name,
-                            key=f"{key_prefix}_quick_view_{cid}_{idx}",
-                        )
+                        payload = _safe_read_bytes(path)
+                        if payload:
+                            st.download_button(
+                                f"{label}{suffix}",
+                                data=payload,
+                                file_name=path.name,
+                                key=f"{key_prefix}_quick_view_{cid}_{idx}",
+                            )
+                        else:
+                            st.caption(f"{label}{suffix} (file unreadable)")
                     else:
                         st.caption(f"{label}{suffix} (file missing)")
         col_offset += 1
@@ -13321,12 +13315,16 @@ def render_customer_document_uploader(
             file_label = f"{doc_type}: {label}{suffix}"
             cols = st.columns([0.75, 0.25])
             with cols[0]:
-                st.download_button(
-                    file_label,
-                    data=path.read_bytes(),
-                    file_name=path.name,
-                    key=f"{key_prefix}_download_{int(row['document_id'])}",
-                )
+                payload = _safe_read_bytes(path)
+                if payload:
+                    st.download_button(
+                        file_label,
+                        data=payload,
+                        file_name=path.name,
+                        key=f"{key_prefix}_download_{int(row['document_id'])}",
+                    )
+                else:
+                    st.warning("Unable to read this document file.", icon="⚠️")
             with cols[1]:
                 st.caption(_format_bytes(path.stat().st_size))
             render_upload_preview(
@@ -13973,12 +13971,16 @@ def render_operations_document_uploader(
         with st.expander(doc_label, expanded=False):
             file_path = resolve_upload_path(row.get("file_path"))
             if file_path and file_path.exists():
-                st.download_button(
-                    "Download",
-                    data=file_path.read_bytes(),
-                    file_name=file_path.name,
-                    key=f"{key_prefix}_doc_download_{doc_id}",
-                )
+                payload = _safe_read_bytes(file_path)
+                if payload:
+                    st.download_button(
+                        "Download",
+                        data=payload,
+                        file_name=file_path.name,
+                        key=f"{key_prefix}_doc_download_{doc_id}",
+                    )
+                else:
+                    st.warning("Unable to read the document file.", icon="⚠️")
                 render_upload_preview(
                     file_path,
                     label=row.get("Title / filename"),
@@ -14377,12 +14379,16 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
     )
     existing_file_path = resolve_upload_path(selected_record.get("file_path"))
     if existing_file_path and existing_file_path.exists():
-        st.download_button(
-            "Download current document",
-            data=existing_file_path.read_bytes(),
-            file_name=existing_file_path.name,
-            key=f"{key_prefix}_other_download_{int(selected_id)}",
-        )
+        payload = _safe_read_bytes(existing_file_path)
+        if payload:
+            st.download_button(
+                "Download current document",
+                data=payload,
+                file_name=existing_file_path.name,
+                key=f"{key_prefix}_other_download_{int(selected_id)}",
+            )
+        else:
+            st.warning("Unable to read the current document.", icon="⚠️")
     existing_items_payload = clean_text(selected_record.get("items_payload"))
     try:
         existing_items = json.loads(existing_items_payload) if existing_items_payload else []
@@ -15687,12 +15693,16 @@ def customers_page(conn):
             attachment_path = selected_raw.get("attachment_path")
             resolved_attachment = resolve_upload_path(attachment_path)
             if resolved_attachment and resolved_attachment.exists():
-                st.download_button(
-                    "Download current document",
-                    data=resolved_attachment.read_bytes(),
-                    file_name=resolved_attachment.name,
-                    key=f"cust_pdf_dl_{selected_customer_id}",
-                )
+                payload = _safe_read_bytes(resolved_attachment)
+                if payload:
+                    st.download_button(
+                        "Download current document",
+                        data=payload,
+                        file_name=resolved_attachment.name,
+                        key=f"cust_pdf_dl_{selected_customer_id}",
+                    )
+                else:
+                    st.warning("Unable to read the customer attachment.", icon="⚠️")
             else:
                 st.caption("No customer document attached yet.")
             is_admin = user.get("role") == "admin"
@@ -17012,12 +17022,16 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 key=f"service_edit_receipt_clear_{selected_service_id}",
             )
         if resolved_receipt and resolved_receipt.exists():
-            st.download_button(
-                "Download receipt",
-                data=resolved_receipt.read_bytes(),
-                file_name=resolved_receipt.name,
-                key=f"service_receipt_download_{selected_service_id}",
-            )
+            payload = _safe_read_bytes(resolved_receipt)
+            if payload:
+                st.download_button(
+                    "Download receipt",
+                    data=payload,
+                    file_name=resolved_receipt.name,
+                    key=f"service_receipt_download_{selected_service_id}",
+                )
+            else:
+                st.warning("Unable to read the receipt file.", icon="⚠️")
         elif existing_receipt_path:
             st.caption("Receipt file not found. Upload a new copy to replace it.")
         save_updates = st.button("Save updates", key="save_service_updates")
@@ -17139,12 +17153,16 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 display_name = clean_text(doc_row.get("original_name"))
                 if path and path.exists():
                     label = display_name or path.name
-                    st.download_button(
-                        f"Download {label}",
-                        data=path.read_bytes(),
-                        file_name=path.name,
-                        key=f"service_doc_dl_{int(doc_row['document_id'])}",
-                    )
+                    payload = _safe_read_bytes(path)
+                    if payload:
+                        st.download_button(
+                            f"Download {label}",
+                            data=payload,
+                            file_name=path.name,
+                            key=f"service_doc_dl_{int(doc_row['document_id'])}",
+                        )
+                    else:
+                        st.warning("Unable to read the service document.", icon="⚠️")
                 else:
                     label = display_name or "Document"
                     st.caption(f"⚠️ Missing file: {label}")
@@ -18885,12 +18903,16 @@ def _render_quotation_management(conn):
                 label_parts.append(created_by_label)
             label = " • ".join(part for part in label_parts if part)
             if path and path.exists():
-                st.download_button(
-                    label,
-                    data=path.read_bytes(),
-                    file_name=path.name,
-                    key=f"quotation_upload_{record.get('quotation_id')}",
-                )
+                payload = _safe_read_bytes(path)
+                if payload:
+                    st.download_button(
+                        label,
+                        data=payload,
+                        file_name=path.name,
+                        key=f"quotation_upload_{record.get('quotation_id')}",
+                    )
+                else:
+                    st.warning("Unable to read the quotation document.", icon="⚠️")
             else:
                 st.caption(f"{label} (file missing)")
         st.markdown("---")
@@ -18954,7 +18976,10 @@ def _render_quotation_management(conn):
         if not resolved or not resolved.exists():
             st.caption(f"{label}: file missing.")
             return
-        data = resolved.read_bytes()
+        data = _safe_read_bytes(resolved)
+        if not data:
+            st.warning(f"{label}: unable to read file.", icon="⚠️")
+            return
         st.download_button(
             f"Download {label}",
             data=data,
@@ -20218,12 +20243,16 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 key=f"maintenance_clear_receipt_{selected_maintenance_id}",
             )
         if resolved_receipt and resolved_receipt.exists():
-            st.download_button(
-                "Download receipt",
-                data=resolved_receipt.read_bytes(),
-                file_name=resolved_receipt.name,
-                key=f"maintenance_receipt_download_{selected_maintenance_id}",
-            )
+            payload = _safe_read_bytes(resolved_receipt)
+            if payload:
+                st.download_button(
+                    "Download receipt",
+                    data=payload,
+                    file_name=resolved_receipt.name,
+                    key=f"maintenance_receipt_download_{selected_maintenance_id}",
+                )
+            else:
+                st.warning("Unable to read the receipt file.", icon="⚠️")
         elif existing_receipt_path:
             st.caption("Receipt file not found. Upload a new copy to replace it.")
         save_maintenance = st.button(
@@ -20321,8 +20350,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     message_bits.append("Receipt removed")
                 st.success(" ".join(message_bits))
                 _safe_rerun()
-                st.success("Maintenance record updated.")
-                _safe_rerun()
 
         attachments_df = df_query(
             conn,
@@ -20343,12 +20370,16 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 display_name = clean_text(doc_row.get("original_name"))
                 if path and path.exists():
                     label = display_name or path.name
-                    st.download_button(
-                        f"Download {label}",
-                        data=path.read_bytes(),
-                        file_name=path.name,
-                        key=f"maintenance_doc_dl_{int(doc_row['document_id'])}",
-                    )
+                    payload = _safe_read_bytes(path)
+                    if payload:
+                        st.download_button(
+                            f"Download {label}",
+                            data=payload,
+                            file_name=path.name,
+                            key=f"maintenance_doc_dl_{int(doc_row['document_id'])}",
+                        )
+                    else:
+                        st.warning("Unable to read the maintenance document.", icon="⚠️")
                 else:
                     label = display_name or "Document"
                     st.caption(f"⚠️ Missing file: {label}")
@@ -20714,11 +20745,14 @@ def delivery_orders_page(
             if current_receipt_path:
                 receipt_file = resolve_upload_path(current_receipt_path)
                 if receipt_file and receipt_file.exists():
-                    receipt_download = receipt_file.read_bytes()
-                    receipt_download_name = receipt_file.name
-                    receipt_download_key = (
-                        f"{record_label.lower().replace(' ', '_')}_receipt_view"
-                    )
+                    receipt_download = _safe_read_bytes(receipt_file)
+                    if receipt_download:
+                        receipt_download_name = receipt_file.name
+                        receipt_download_key = (
+                            f"{record_label.lower().replace(' ', '_')}_receipt_view"
+                        )
+                    else:
+                        receipt_download = None
                 st.caption("Uploading a new file will replace the current receipt.")
         st.markdown("**Products / items**")
         items_df_seed = pd.DataFrame(
@@ -21099,12 +21133,16 @@ def delivery_orders_page(
             receipt_value = clean_text(row.get("payment_receipt_path"))
             receipt_file = resolve_upload_path(receipt_value) if receipt_value else None
             if receipt_file and receipt_file.exists():
-                row_cols[6].download_button(
-                    "View",
-                    data=receipt_file.read_bytes(),
-                    file_name=receipt_file.name,
-                    key=f"do_receipt_view_{row_key}",
-                )
+                payload = _safe_read_bytes(receipt_file)
+                if payload:
+                    row_cols[6].download_button(
+                        "View",
+                        data=payload,
+                        file_name=receipt_file.name,
+                        key=f"do_receipt_view_{row_key}",
+                    )
+                else:
+                    row_cols[6].caption("Receipt unreadable")
             else:
                 row_cols[6].write(clean_text(row.get("Receipt")) or "")
             upload_receipt = row_cols[7].file_uploader(
@@ -21187,12 +21225,16 @@ def delivery_orders_page(
         path_value = downloads.get(selected_download)
         file_path = resolve_upload_path(path_value)
         if file_path and file_path.exists():
-            st.download_button(
-                f"Download {selected_download}",
-                data=file_path.read_bytes(),
-                file_name=file_path.name,
-                key=f"{key_prefix}_download_button",
-            )
+            payload = _safe_read_bytes(file_path)
+            if payload:
+                st.download_button(
+                    f"Download {selected_download}",
+                    data=payload,
+                    file_name=file_path.name,
+                    key=f"{key_prefix}_download_button",
+                )
+            else:
+                st.warning("Unable to read the selected file.", icon="⚠️")
         else:
             st.info("The selected delivery order file could not be found.")
     elif st.session_state.get(filter_text_key) or query_text:
@@ -22034,12 +22076,16 @@ def customer_summary_page(conn):
             label = f"{doc['source']}: {doc['reference']} – {doc['display']}"
             if doc.get("uploaded"):
                 label = f"{label} (uploaded {doc['uploaded']})"
-            st.download_button(
-                f"Download {label}",
-                data=path.read_bytes(),
-                file_name=path.name,
-                key=f"cust_doc_{doc['key']}_{idx}",
-            )
+            payload = _safe_read_bytes(path)
+            if payload:
+                st.download_button(
+                    f"Download {label}",
+                    data=payload,
+                    file_name=path.name,
+                    key=f"cust_doc_{doc['key']}_{idx}",
+                )
+            else:
+                st.warning("Unable to read one of the customer documents.", icon="⚠️")
         zip_buffer = bundle_documents_zip(documents)
         if zip_buffer is not None:
             archive_title = _sanitize_path_component(info.get("name") or blank_label)
@@ -25104,10 +25150,7 @@ def reports_page(conn):
     existing_attachment_name: Optional[str] = None
     if existing_attachment_path and existing_attachment_path.exists():
         existing_attachment_name = existing_attachment_path.name
-        try:
-            existing_attachment_bytes = existing_attachment_path.read_bytes()
-        except OSError:
-            existing_attachment_bytes = None
+        existing_attachment_bytes = _safe_read_bytes(existing_attachment_path)
     existing_import_path = (
         resolve_upload_path(existing_import_value)
         if existing_import_value
@@ -25117,10 +25160,7 @@ def reports_page(conn):
     existing_import_name: Optional[str] = None
     if existing_import_path and existing_import_path.exists():
         existing_import_name = existing_import_path.name
-        try:
-            existing_import_bytes = existing_import_path.read_bytes()
-        except OSError:
-            existing_import_bytes = None
+        existing_import_bytes = _safe_read_bytes(existing_import_path)
 
     if existing_attachment_value:
         st.caption("Current attachment")
@@ -26027,13 +26067,25 @@ def main():
     elif st.session_state.get("nav_selection_mobile") not in pages:
         st.session_state["nav_selection_mobile"] = current_page
 
+    nav_logo_uri = st.session_state.get("nav_logo_uri")
     st.markdown('<div class="ps-top-nav">', unsafe_allow_html=True)
     nav_cols = st.columns([2.2, 6.8, 1.4])
     with nav_cols[0]:
-        st.markdown(
-            '<div class="ps-top-nav-brand">PS Engineering • Business Suites</div>',
-            unsafe_allow_html=True,
-        )
+        if nav_logo_uri:
+            st.markdown(
+                (
+                    '<a class="ps-top-nav-brand ps-top-nav-logo" href="/" '
+                    'aria-label="PS Engineering Business Suites">'
+                    f'<img src="{nav_logo_uri}" alt="PS Engineering Business Suites" />'
+                    "</a>"
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="ps-top-nav-brand">PS Engineering • Business Suites</div>',
+                unsafe_allow_html=True,
+            )
     with nav_cols[1]:
         st.markdown('<div class="ps-top-nav-links">', unsafe_allow_html=True)
         st.radio(
