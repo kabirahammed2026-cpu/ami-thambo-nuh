@@ -2729,7 +2729,8 @@ def _run_upload_ocr(upload, *, key_prefix: str) -> tuple[str, list[str]]:
     text_key = f"{key_prefix}_ocr_text"
     warnings_key = f"{key_prefix}_ocr_warnings"
     if st.session_state.get(token_key) != token:
-        text_content, warnings = _extract_text_from_quotation_upload(upload)
+        with st.spinner("Reading document for OCR auto-fill..."):
+            text_content, warnings = _extract_text_from_quotation_upload(upload)
         st.session_state[token_key] = token
         st.session_state[text_key] = text_content
         st.session_state[warnings_key] = warnings
@@ -8371,6 +8372,9 @@ def init_ui():
     st.markdown(
         """
         <style>
+        :root {
+            --ps-top-nav-height: 3.2rem;
+        }
         html,
         body,
         #root,
@@ -8426,12 +8430,18 @@ def init_ui():
             max-width: 100% !important;
         }
         .ps-top-nav {
-            position: sticky;
+            position: fixed;
             top: 0;
+            left: 0;
+            right: 0;
             z-index: 2100;
             background: var(--ps-bg);
             padding: 0.1rem 0 0.35rem;
             border-bottom: 1px solid var(--ps-panel-border);
+            min-height: var(--ps-top-nav-height);
+        }
+        .ps-top-nav-spacer {
+            height: var(--ps-top-nav-height);
         }
         .ps-top-nav-brand {
             display: inline-flex;
@@ -26596,6 +26606,7 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="ps-top-nav-spacer"></div>', unsafe_allow_html=True)
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
