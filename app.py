@@ -8439,6 +8439,21 @@ def init_ui():
             padding: 0.1rem 0 0.35rem;
             border-bottom: 1px solid var(--ps-panel-border);
             min-height: var(--ps-top-nav-height);
+            display: flex;
+            align-items: center;
+        }
+        .ps-top-nav [data-testid="stHorizontalBlock"] {
+            align-items: center;
+            margin: 0;
+        }
+        .ps-top-nav [data-testid="column"] {
+            display: flex;
+            align-items: center;
+        }
+        .ps-top-nav [data-testid="column"] > div {
+            display: flex;
+            align-items: center;
+            width: 100%;
         }
         .ps-top-nav-spacer {
             height: var(--ps-top-nav-height);
@@ -8461,6 +8476,8 @@ def init_ui():
             align-items: center;
             gap: 0.65rem;
             justify-content: center;
+            flex-wrap: wrap;
+            min-height: calc(var(--ps-top-nav-height) - 0.6rem);
         }
         .ps-top-nav-links .ps-top-nav-menu-label {
             font-size: 0.85rem;
@@ -8472,9 +8489,13 @@ def init_ui():
             flex-wrap: wrap;
             gap: 0.5rem 0.85rem;
             justify-content: center;
+            width: auto !important;
         }
         .ps-top-nav-links label {
             margin-right: 0 !important;
+        }
+        .ps-top-nav-links [data-testid="stRadio"] {
+            margin: 0 !important;
         }
         .ps-top-nav-actions {
             display: flex;
