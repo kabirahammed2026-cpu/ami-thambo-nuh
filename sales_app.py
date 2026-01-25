@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import secrets
 import zipfile
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, time as dt_time
 from pathlib import Path
@@ -1522,6 +1523,10 @@ def resolve_upload_path(relative_path: str) -> Path:
 def run_health_checks() -> list[str]:
     logger = _get_logger()
     warnings: list[str] = []
+    if _debug_diag_enabled():
+        message = "DEBUG_DIAG is enabled; login is bypassed for diagnostics."
+        warnings.append(message)
+        logger.warning(message)
     try:
         CONFIG.data_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1559,6 +1564,11 @@ def run_health_checks() -> list[str]:
     if retention_warning:
         warnings.append(retention_warning)
         logger.warning(retention_warning)
+    if BACKUP_MIRROR_PATH is None:
+        warnings.append(
+            "Backup mirror not configured. Set PS_SALES_BACKUP_MIRROR_DIR "
+            "to keep a second copy on a Linode volume."
+        )
     return warnings
 
 
@@ -3004,6 +3014,56 @@ def _path_status(path: Path) -> dict[str, object]:
     }
 
 
+def _scan_missing_uploads_sales() -> list[dict[str, str]]:
+    checks = [
+        ("quotations", "pdf_path"),
+        ("quotations", "payment_receipt"),
+        ("quotation_letters", "pdf_path"),
+        ("quotation_letters", "payment_receipt"),
+        ("work_orders", "pdf_path"),
+        ("delivery_orders", "pdf_path"),
+        ("delivery_orders", "receipt_path"),
+    ]
+    missing: list[dict[str, str]] = []
+    with get_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        for table, column in checks:
+            try:
+                rows = conn.execute(
+                    f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL AND TRIM({column}) != ''"
+                ).fetchall()
+            except sqlite3.Error:
+                continue
+            for row in rows:
+                path_value = row[column]
+                if not path_value:
+                    continue
+                try:
+                    resolved = resolve_upload_path(str(path_value))
+                except ValueError:
+                    resolved = None
+                if resolved is None or not resolved.exists():
+                    missing.append(
+                        {"table": table, "column": column, "path": str(path_value)}
+                    )
+    return missing
+
+
+def _run_storage_roundtrip(base_dir: Path) -> dict[str, str]:
+    start = time.perf_counter()
+    test_path = base_dir / ".diag_storage_roundtrip"
+    try:
+        test_path.write_text("storage-check", encoding="utf-8")
+        payload = test_path.read_text(encoding="utf-8")
+    finally:
+        test_path.unlink(missing_ok=True)
+    duration_ms = (time.perf_counter() - start) * 1000
+    return {
+        "bytes": str(len(payload.encode("utf-8"))),
+        "duration_ms": f"{duration_ms:.1f}",
+    }
+
+
 def _render_sales_upload_preview(path: Path, label: str) -> None:
     suffix = path.suffix.lower()
     payload = path.read_bytes()
@@ -3077,6 +3137,22 @@ def render_system_diagnostics_sales() -> None:
         except Exception as exc:
             st.error(f"Read check failed: {exc}")
 
+    st.subheader("Performance checks")
+    if st.button("Run performance checks", use_container_width=True):
+        try:
+            start = time.perf_counter()
+            with get_conn() as conn:
+                conn.execute("SELECT COUNT(*) FROM companies").fetchone()
+            db_ms = (time.perf_counter() - start) * 1000
+            storage_result = _run_storage_roundtrip(CONFIG.data_dir)
+            st.success(
+                "Checks complete • "
+                f"DB query {db_ms:.1f} ms • "
+                f"Storage round-trip {storage_result['duration_ms']} ms"
+            )
+        except Exception as exc:
+            st.error(f"Performance checks failed: {exc}")
+
     st.subheader("Upload diagnostics")
     st.caption(f"Max upload size: {_format_bytes(MAX_UPLOAD_BYTES)}")
     diag_upload = st.file_uploader(
@@ -3100,6 +3176,15 @@ def render_system_diagnostics_sales() -> None:
             path = CONFIG.data_dir / relative_path
             if path.exists():
                 _render_sales_upload_preview(path, path.name)
+
+    st.subheader("Upload data checks")
+    if st.button("Scan for missing uploads", use_container_width=True):
+        missing = _scan_missing_uploads_sales()
+        if not missing:
+            st.success("No missing upload files found in database references.")
+        else:
+            st.warning(f"Missing uploads found: {len(missing)}")
+            st.dataframe(pd.DataFrame(missing), use_container_width=True)
 
     st.subheader("Backup diagnostics")
     if st.button("Create diagnostic backup", use_container_width=True):
