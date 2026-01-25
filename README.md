@@ -52,6 +52,17 @@ For cloud deployments, point the data directory at your Linode volume so backups
 
 Automatic monthly backups are written under `<data dir>/backups`. To keep a second copy, set `PS_CRM_BACKUP_MIRROR_DIR` or `PS_SALES_BACKUP_MIRROR_DIR` to another mounted volume or backup path. Each backup archive includes the SQLite database (staff accounts included), an SQL dump, Excel exports, and all stored files, plus a `checksums.txt` file for integrity verification—store these archives securely to preserve privacy.
 
+### Deep troubleshooting & restore (Linode-friendly)
+1. **Run system diagnostics:** set `DEBUG_DIAG=1` and restart the app. A **System Diagnostics** page appears with upload tests, backup checks, missing-file scans, and performance probes. Turn `DEBUG_DIAG` off after troubleshooting.
+2. **Restore from a backup archive:** use the CLI helper and point it at your Linode data volume (or set the same env vars as your deployment):
+
+   ```bash
+   python restore_from_backup.py --app crm --backup /path/to/ps_crm_backup.zip --data-dir /data/ps-business-suites
+   python restore_from_backup.py --app sales --backup /path/to/ps_sales_backup.zip --data-dir /data/ps-sales
+   ```
+
+   Add `--dry-run` to see what will be restored before writing. The script overwrites the target database after saving a timestamped `.bak_*` copy alongside it.
+
 ## Troubleshooting
 - If Python is not installed or not on your `PATH`, install it from [python.org](https://www.python.org/downloads/) (Windows) or via your package manager (macOS/Linux).
 - To reset everything, delete the `.venv` folder and rerun the launcher to recreate a clean environment.
