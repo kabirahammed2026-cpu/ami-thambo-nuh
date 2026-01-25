@@ -8373,7 +8373,7 @@ def init_ui():
         """
         <style>
         :root {
-            --ps-top-nav-height: 3.2rem;
+            --ps-top-nav-height: 5.4rem;
         }
         html,
         body,
@@ -8469,8 +8469,8 @@ def init_ui():
         }
         .ps-top-nav-links [role="radiogroup"] {
             display: flex;
-            flex-wrap: nowrap;
-            gap: 0.5rem;
+            flex-wrap: wrap;
+            gap: 0.5rem 0.85rem;
             justify-content: center;
         }
         .ps-top-nav-links label {
