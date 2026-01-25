@@ -8497,6 +8497,13 @@ def init_ui():
         .ps-top-nav-links [data-testid="stRadio"] {
             margin: 0 !important;
         }
+        .ps-top-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
+            display: flex !important;
+            flex-direction: row !important;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.5rem 0.85rem;
+        }
         .ps-top-nav-actions {
             display: flex;
             justify-content: flex-end;
@@ -8504,8 +8511,20 @@ def init_ui():
             gap: 0.5rem;
         }
         @media (max-width: 900px) {
+            .ps-top-nav {
+                flex-wrap: wrap;
+                gap: 0.35rem;
+            }
             .ps-top-nav-links {
-                display: none;
+                width: 100%;
+                justify-content: flex-start;
+            }
+            .ps-top-nav-links .ps-top-nav-menu-label {
+                width: 100%;
+            }
+            .ps-top-nav-actions {
+                width: 100%;
+                justify-content: flex-end;
             }
         }
         </style>
