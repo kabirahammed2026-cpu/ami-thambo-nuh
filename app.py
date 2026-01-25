@@ -196,6 +196,15 @@ def _looks_like_date_column(column_name: str) -> bool:
     return "date" in lowered or lowered.endswith("_at") or lowered.endswith("_on")
 
 
+def _strip_warranty_tag(note: Optional[str]) -> str:
+    text = clean_text(note) or ""
+    if text.startswith("[Warranty #"):
+        closing = text.find("]")
+        if closing != -1:
+            return text[closing + 1 :].strip()
+    return text
+
+
 def normalize_editor_df(
     df: pd.DataFrame,
     *,
@@ -2133,6 +2142,35 @@ def _count_cached(db_path: str, query: str, params: tuple, version: int) -> int:
         return 0
     return int(df.iloc[0].get("c") or 0)
 
+
+@st.cache_data(show_spinner=False)
+def _load_operations_customers(
+    db_path: str,
+    where_clause: str,
+    params: tuple,
+    version: int,
+) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    try:
+        return pd.read_sql_query(
+            f"""
+            SELECT customer_id,
+                   name,
+                   company_name,
+                   phone,
+                   address,
+                   delivery_address,
+                   sales_person
+            FROM customers
+            {where_clause}
+            ORDER BY LOWER(COALESCE(name, '')), customer_id
+            """,
+            conn,
+            params=params,
+        )
+    finally:
+        conn.close()
+
 def fmt_dates(df: pd.DataFrame, cols):
     df = df.copy()
     for c in cols:
@@ -3382,7 +3420,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                 warranty_label = f"{warranty_label} SN {serial_label}".strip()
             alerts.append(
                 {
-                    "title": warranty_label or f"Warranty #{row.get('warranty_id')}",
+                    "title": warranty_label or "Warranty follow-up",
                     "message": f"Warranty follow-up due {follow_label}",
                     "severity": severity,
                 }
@@ -3484,6 +3522,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
         dedent(
             f"""
             SELECT c.name AS customer,
+                   c.company_name AS company,
                    p.name AS product,
                    p.model,
                    w.serial,
@@ -3624,9 +3663,7 @@ def log_activity(
             message = description_text or description or label or "Activity logged"
             details: list[str] = []
             if entity_type and entity_id:
-                details.append(
-                    f"{clean_text(entity_type).title()} #{entity_id}" if clean_text(entity_type) else f"Record #{entity_id}"
-                )
+                details.append(clean_text(entity_type).title() if clean_text(entity_type) else "Record")
             push_runtime_notification(
                 label or "Activity logged",
                 f"{actor_label or 'Team member'}: {message}",
@@ -4176,7 +4213,7 @@ class _QuotationEditorRequestHandler(http.server.SimpleHTTPRequestHandler):
         if len(path_parts) >= 2 and path_parts[0] == "api" and path_parts[1] == "quotation":
             quotation_id = self._parse_quotation_id(path_parts)
             if quotation_id is None:
-                self._send_json(400, {"error": "Invalid quotation ID"})
+                self._send_json(400, {"error": "Invalid quotation reference"})
                 return
 
             conn = get_conn()
@@ -4213,7 +4250,7 @@ class _QuotationEditorRequestHandler(http.server.SimpleHTTPRequestHandler):
         if len(path_parts) >= 3 and path_parts[0] == "api" and path_parts[1] == "quotation":
             quotation_id = self._parse_quotation_id(path_parts)
             if quotation_id is None:
-                self._send_json(400, {"error": "Invalid quotation ID"})
+                self._send_json(400, {"error": "Invalid quotation reference"})
                 return
 
             payload = self._read_json() or {}
@@ -5439,7 +5476,7 @@ def build_customer_groups(conn, only_complete: bool = True):
         primary = ids[0]
         raw_name = clean_text(group.iloc[0].get("name"))
         count = len(ids)
-        base_label = raw_name or f"Customer #{primary}"
+        base_label = raw_name or "Customer record"
         if raw_name and count > 1:
             display_label = f"{base_label} ({count} records)"
         else:
@@ -5961,7 +5998,7 @@ def delete_customer_record(conn, customer_id: int) -> None:
         summary_bits.append(name_val)
     if phone_val:
         summary_bits.append(f"phone {phone_val}")
-    description = "; ".join(summary_bits) or f"ID #{cid}"
+    description = "; ".join(summary_bits) or "Unknown customer"
     log_activity(
         conn,
         event_type="customer_deleted",
@@ -6005,7 +6042,7 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
     work["expiry_dt"] = expiry_dt
 
     grouped = (
-        work.groupby("customer", dropna=False)
+        work.groupby(["customer", "company"], dropna=False)
         .apply(
             lambda g: pd.Series(
                 {
@@ -6024,6 +6061,7 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
     grouped.rename(
         columns={
             "customer": "Customer",
+            "company": "Company",
             "description": "Description",
             "issue_date": "Issue date",
             "expiry_date": "Expiry date",
@@ -6042,8 +6080,8 @@ def _build_customers_export(conn) -> pd.DataFrame:
     where_sql = f"WHERE {scope_clause}" if scope_clause else ""
     query = dedent(
         f"""
-        SELECT c.customer_id,
-               c.name,
+        SELECT c.name,
+               c.company_name,
                c.phone,
                c.address,
                c.amount_spent,
@@ -6063,8 +6101,8 @@ def _build_customers_export(conn) -> pd.DataFrame:
     df = fmt_dates(df, ["purchase_date", "created_at"])
     return df.rename(
         columns={
-            "customer_id": "Customer ID",
             "name": "Customer",
+            "company_name": "Company",
             "phone": "Phone",
             "address": "Address",
             "amount_spent": "Amount spent",
@@ -6083,6 +6121,7 @@ def _build_delivery_orders_export(conn) -> pd.DataFrame:
         """
         SELECT d.do_number,
                COALESCE(c.name, '(unknown)') AS customer,
+               c.company_name AS company,
                d.description,
                d.sales_person,
                 d.remarks,
@@ -6100,6 +6139,7 @@ def _build_delivery_orders_export(conn) -> pd.DataFrame:
         columns={
             "do_number": "DO number",
             "customer": "Customer",
+            "company": "Company",
             "description": "Description",
             "sales_person": "Sales person",
             "remarks": "Remarks",
@@ -6111,8 +6151,8 @@ def _build_delivery_orders_export(conn) -> pd.DataFrame:
 def _build_warranties_export(conn) -> pd.DataFrame:
     query = dedent(
         """
-        SELECT w.warranty_id,
-               COALESCE(c.name, '(unknown)') AS customer,
+        SELECT COALESCE(c.name, '(unknown)') AS customer,
+               c.company_name AS company,
                COALESCE(p.name, '') AS product,
                p.model,
                w.serial,
@@ -6132,8 +6172,8 @@ def _build_warranties_export(conn) -> pd.DataFrame:
         df["status"] = df["status"].fillna("Active").apply(lambda x: str(x).title())
     return df.rename(
         columns={
-            "warranty_id": "Warranty ID",
             "customer": "Customer",
+            "company": "Company",
             "product": "Product",
             "model": "Model",
             "serial": "Serial",
@@ -6148,9 +6188,9 @@ def _build_warranties_export(conn) -> pd.DataFrame:
 def _build_services_export(conn) -> pd.DataFrame:
     query = dedent(
         """
-        SELECT s.service_id,
-               s.do_number,
+        SELECT s.do_number,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company,
                s.service_date,
                s.service_start_date,
                s.service_end_date,
@@ -6177,9 +6217,9 @@ def _build_services_export(conn) -> pd.DataFrame:
         df["status"] = df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
     return df.rename(
         columns={
-            "service_id": "Service ID",
             "do_number": "DO number",
             "customer": "Customer",
+            "company": "Company",
             "service_date": "Service date",
             "service_start_date": "Service start date",
             "service_end_date": "Service end date",
@@ -6199,9 +6239,9 @@ def _build_services_export(conn) -> pd.DataFrame:
 def _build_maintenance_export(conn) -> pd.DataFrame:
     query = dedent(
         """
-        SELECT m.maintenance_id,
-               m.do_number,
+        SELECT m.do_number,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company,
                m.maintenance_date,
                m.maintenance_start_date,
                m.maintenance_end_date,
@@ -6224,9 +6264,9 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
         df["status"] = df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
     return df.rename(
         columns={
-            "maintenance_id": "Maintenance ID",
             "do_number": "DO number",
             "customer": "Customer",
+            "company": "Company",
             "maintenance_date": "Maintenance date",
             "maintenance_start_date": "Maintenance start date",
             "maintenance_end_date": "Maintenance end date",
@@ -6242,8 +6282,8 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
 def _build_customer_notes_export(conn) -> pd.DataFrame:
     query = dedent(
         """
-        SELECT n.note_id,
-               COALESCE(c.name, '(unknown)') AS customer,
+        SELECT COALESCE(c.name, '(unknown)') AS customer,
+               c.company_name AS company,
                c.phone,
                n.note,
                n.remind_on,
@@ -6261,8 +6301,8 @@ def _build_customer_notes_export(conn) -> pd.DataFrame:
         df["is_done"] = df["is_done"].apply(lambda v: "Yes" if int_or_none(v) else "No")
     return df.rename(
         columns={
-            "note_id": "Note ID",
             "customer": "Customer",
+            "company": "Company",
             "phone": "Phone",
             "note": "Remark",
             "remind_on": "Reminder date",
@@ -6277,8 +6317,7 @@ def _build_quotations_export(conn) -> pd.DataFrame:
     scope_clause, scope_params = _quotation_scope_filter()
     query = dedent(
         f"""
-        SELECT quotation_id,
-               reference,
+        SELECT reference,
                quote_date,
                customer_company,
                customer_name,
@@ -6310,7 +6349,6 @@ def _build_quotations_export(conn) -> pd.DataFrame:
     df = fmt_dates(df, ["quote_date", "follow_up_date", "created_at", "updated_at"])
     return df.rename(
         columns={
-            "quotation_id": "Quotation ID",
             "reference": "Reference",
             "quote_date": "Quote date",
             "customer_company": "Customer",
@@ -7302,7 +7340,7 @@ def _build_report_coverage_summary(conn: sqlite3.Connection) -> pd.DataFrame:
     df = df_query(
         conn,
         """
-        SELECT COALESCE(u.username, 'User #' || wr.user_id) AS username,
+        SELECT COALESCE(u.username, 'Team member') AS username,
                wr.period_type,
                COUNT(*) AS report_count
         FROM work_reports wr
@@ -7335,7 +7373,7 @@ def _build_admin_kpi_snapshot(conn: sqlite3.Connection) -> pd.DataFrame:
         conn,
         dedent(
             """
-            SELECT user_id, COALESCE(username, 'User #' || user_id) AS username
+            SELECT user_id, COALESCE(username, 'Team member') AS username
             FROM users
             WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
             ORDER BY LOWER(username)
@@ -7438,7 +7476,7 @@ def _build_admin_kpi_snapshot(conn: sqlite3.Connection) -> pd.DataFrame:
         kpi_rows.append(
             {
                 "Team member": clean_text(row.get("Team member"))
-                or f"User #{int(row.get('user_id'))}",
+                or "Team member",
                 "Monthly KPI": f"{monthly_score:,.0f}",
                 "Lifetime KPI": f"{lifetime_score:,.0f}",
             }
@@ -7712,6 +7750,7 @@ def fetch_warranty_window(conn, start_days: int, end_days: int) -> pd.DataFrame:
     query = dedent(
         f"""
         SELECT c.name AS customer,
+               c.company_name AS company,
                p.name AS product,
                p.model,
                w.serial,
@@ -7765,6 +7804,7 @@ def format_warranty_table(df: pd.DataFrame) -> pd.DataFrame:
         work.drop(columns=["status"], inplace=True)
     rename_map = {
         "customer": "Customer",
+        "company": "Company",
         "issue_date": "Issue date",
         "expiry_date": "Expiry date",
         "remarks": "Remarks",
@@ -8827,7 +8867,7 @@ def _render_admin_record_history(conn):
                 uid = int(row.get("user_id"))
             except Exception:
                 continue
-            label = clean_text(row.get("username")) or f"User #{uid}"
+            label = clean_text(row.get("username")) or "Team member"
             member_options.append(uid)
             member_labels[uid] = label
 
@@ -8890,7 +8930,7 @@ def _render_admin_kpi_panel(conn) -> None:
         conn,
         dedent(
             """
-            SELECT user_id, COALESCE(username, 'User #' || user_id) AS username
+            SELECT user_id, COALESCE(username, 'Team member') AS username
             FROM users
             WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
             ORDER BY LOWER(username)
@@ -8996,7 +9036,7 @@ def _render_admin_kpi_panel(conn) -> None:
         kpi_rows.append(
             {
                 "Team member": clean_text(row.get("Team member"))
-                or f"User #{int(row.get('user_id'))}",
+                or "Team member",
                 "Monthly KPI": f"{monthly_score:,.0f}",
                 "Lifetime KPI": f"{lifetime_score:,.0f}",
             }
@@ -9142,7 +9182,7 @@ def dashboard(conn):
                    wr.period_end,
                    wr.created_at,
                    wr.report_template,
-                   COALESCE(u.username, 'User #' || wr.user_id) AS owner
+                   COALESCE(u.username, 'Team member') AS owner
             FROM work_reports wr
             LEFT JOIN users u ON u.user_id = wr.user_id
             {report_scope}
@@ -9204,7 +9244,7 @@ def dashboard(conn):
                    wr.period_start,
                    wr.period_end,
                    wr.report_template,
-                   COALESCE(u.username, 'User #' || wr.user_id) AS owner,
+                   COALESCE(u.username, 'Team member') AS owner,
                    wr.created_at
             FROM work_reports wr
             LEFT JOIN users u ON u.user_id = wr.user_id
@@ -9296,11 +9336,8 @@ def dashboard(conn):
                    quote_date,
                    total_amount,
                    status,
-                   COALESCE(
-                       NULLIF(TRIM(customer_company), ''),
-                       NULLIF(TRIM(customer_name), ''),
-                       '—'
-                   ) AS customer,
+                   COALESCE(NULLIF(TRIM(customer_name), ''), '—') AS customer_name,
+                   COALESCE(NULLIF(TRIM(customer_company), ''), '—') AS company,
                    COALESCE(
                        NULLIF(TRIM(subject), ''),
                        NULLIF(TRIM(remarks_internal), '')
@@ -9336,7 +9373,10 @@ def dashboard(conn):
         st.info("No quotations available for the selected scope yet.")
     else:
         quotes_df = fmt_dates(quotes_df, ["quote_date"])
-        quotes_df["customer"] = quotes_df["customer"].apply(
+        quotes_df["customer_name"] = quotes_df["customer_name"].apply(
+            lambda value: clean_text(value) or "—"
+        )
+        quotes_df["company"] = quotes_df["company"].apply(
             lambda value: clean_text(value) or "—"
         )
         quotes_df["product_details"] = quotes_df["product_details"].apply(
@@ -9352,7 +9392,8 @@ def dashboard(conn):
                     "quote_date": "Date",
                     "total_amount": "Total (BDT)",
                     "status": "Status",
-                    "customer": "Customer",
+                    "customer_name": "Customer",
+                    "company": "Company",
                     "product_details": "Product details",
                 }
             ),
@@ -9422,7 +9463,7 @@ def dashboard(conn):
         else:
             staff_df["user_id"] = staff_df["user_id"].apply(lambda val: int(float(val)))
             staff_df["username"] = staff_df.apply(
-                lambda row: clean_text(row.get("username")) or f"User #{int(row['user_id'])}",
+                lambda row: clean_text(row.get("username")) or "Team member",
                 axis=1,
             )
             submitted_df = df_query(
@@ -9496,13 +9537,13 @@ def dashboard(conn):
                         staff_options,
                         index=default_index,
                         format_func=lambda uid: staff_labels.get(
-                            int(uid), f"User #{int(uid)}"
+                            int(uid), "Team member"
                         ),
                         key="dashboard_daily_report_user",
                     )
                 )
                 selected_staff_name = staff_labels.get(
-                    selected_staff_id, f"User #{selected_staff_id}"
+                    selected_staff_id, "Team member"
                 )
                 report_detail = df_query(
                     conn,
@@ -9716,7 +9757,8 @@ def dashboard(conn):
                    d.total_amount,
                    d.status,
                    d.created_at,
-                   COALESCE(c.company_name, c.name, '(customer)') AS customer
+                   COALESCE(c.name, '(customer)') AS customer,
+                   c.company_name AS company
             FROM delivery_orders d
             LEFT JOIN customers c ON c.customer_id = d.customer_id
             WHERE d.deleted_at IS NULL
@@ -9742,7 +9784,8 @@ def dashboard(conn):
                    s.bill_amount,
                    s.payment_status,
                    s.updated_at,
-                   COALESCE(c.company_name, c.name, '(customer)') AS customer
+                   COALESCE(c.name, '(customer)') AS customer,
+                   c.company_name AS company
             FROM services s
             LEFT JOIN customers c ON c.customer_id = s.customer_id
             WHERE s.deleted_at IS NULL
@@ -9762,7 +9805,8 @@ def dashboard(conn):
                    m.total_amount,
                    m.payment_status,
                    m.updated_at,
-                   COALESCE(c.company_name, c.name, '(customer)') AS customer
+                   COALESCE(c.name, '(customer)') AS customer,
+                   c.company_name AS company
             FROM maintenance_records m
             LEFT JOIN customers c ON c.customer_id = m.customer_id
             WHERE m.deleted_at IS NULL
@@ -9815,6 +9859,7 @@ def dashboard(conn):
                     [
                         "Reference",
                         "customer",
+                        "company",
                         "Products",
                         "Sales date",
                         "Total (BDT)",
@@ -9822,13 +9867,13 @@ def dashboard(conn):
                         "When",
                         "sort_date",
                     ]
-                ].rename(columns={"customer": "Customer"})
+                ].rename(columns={"customer": "Customer", "company": "Company"})
             )
 
         if not staff_service_df.empty:
             staff_service_df["Reference"] = staff_service_df.apply(
                 lambda row: clean_text(row.get("do_number"))
-                or f"Service #{int(row.get('service_id'))}"
+                or "Service record"
                 if pd.notna(row.get("service_id"))
                 else "Service",
                 axis=1,
@@ -9855,6 +9900,7 @@ def dashboard(conn):
                     [
                         "Reference",
                         "customer",
+                        "company",
                         "Products",
                         "Sales date",
                         "Total (BDT)",
@@ -9862,13 +9908,13 @@ def dashboard(conn):
                         "When",
                         "sort_date",
                     ]
-                ].rename(columns={"customer": "Customer"})
+                ].rename(columns={"customer": "Customer", "company": "Company"})
             )
 
         if not staff_maintenance_df.empty:
             staff_maintenance_df["Reference"] = staff_maintenance_df.apply(
                 lambda row: clean_text(row.get("do_number"))
-                or f"Maintenance #{int(row.get('maintenance_id'))}"
+                or "Maintenance record"
                 if pd.notna(row.get("maintenance_id"))
                 else "Maintenance",
                 axis=1,
@@ -9899,6 +9945,7 @@ def dashboard(conn):
                     [
                         "Reference",
                         "customer",
+                        "company",
                         "Products",
                         "Sales date",
                         "Total (BDT)",
@@ -9906,7 +9953,7 @@ def dashboard(conn):
                         "When",
                         "sort_date",
                     ]
-                ].rename(columns={"customer": "Customer"})
+                ].rename(columns={"customer": "Customer", "company": "Company"})
             )
 
         if not sales_frames:
@@ -9922,6 +9969,7 @@ def dashboard(conn):
                     [
                         "Reference",
                         "Customer",
+                        "Company",
                         "Products",
                         "Sales date",
                         "Total (BDT)",
@@ -9948,7 +9996,7 @@ def dashboard(conn):
                        wr.attachment_path,
                        wr.import_file_path,
                        wr.created_at,
-                       COALESCE(u.username, 'User #' || wr.user_id) AS owner
+                       COALESCE(u.username, 'Team member') AS owner
                 FROM work_reports wr
                 LEFT JOIN users u ON u.user_id = wr.user_id
                 WHERE LOWER(COALESCE(wr.report_template, '')) IN ('service', 'sales', 'follow_up')
@@ -10034,7 +10082,7 @@ def dashboard(conn):
                        q.follow_up_notes,
                        q.salesperson_name,
                        q.updated_at,
-                       COALESCE(u.username, 'User #' || q.created_by) AS owner
+                       COALESCE(u.username, 'Team member') AS owner
                 FROM quotations q
                 LEFT JOIN users u ON u.user_id = q.created_by
                 WHERE q.document_path IS NOT NULL AND q.document_path != ''
@@ -10064,7 +10112,7 @@ def dashboard(conn):
                 selected_quote_id = st.selectbox(
                     "Select a quotation to inspect",
                     quote_options,
-                    format_func=lambda qid: option_labels.get(qid, f"Quotation #{qid}"),
+                    format_func=lambda qid: option_labels.get(qid, "Quotation record"),
                     key="dashboard_uploaded_quote_selector",
                 )
 
@@ -10578,6 +10626,7 @@ def dashboard(conn):
                 SELECT d.do_number,
                        COALESCE(d.record_type, 'delivery_order') AS record_type,
                        COALESCE(c.name, '(unknown)') AS customer,
+                       c.company_name AS company,
                        d.description,
                        d.file_path,
                        d.payment_receipt_path,
@@ -10616,7 +10665,8 @@ def dashboard(conn):
                 """
                 SELECT d.document_id,
                        d.customer_id,
-                       COALESCE(c.name, c.company_name, '(customer)') AS customer,
+                       COALESCE(c.name, '(customer)') AS customer,
+                       c.company_name AS company,
                        d.doc_type,
                        d.original_name,
                        d.file_path,
@@ -10656,7 +10706,8 @@ def dashboard(conn):
                 """
                 SELECT o.document_id,
                        o.customer_id,
-                       COALESCE(c.name, c.company_name, '(customer)') AS customer,
+                       COALESCE(c.name, '(customer)') AS customer,
+                       c.company_name AS company,
                        o.description,
                        o.original_name,
                        o.file_path,
@@ -10846,6 +10897,7 @@ def dashboard(conn):
                    d.customer_id AS do_customer_id,
                    s.service_date,
                    COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+                   COALESCE(c.company_name, cdo.company_name) AS company,
                    s.description
             FROM services s
             LEFT JOIN customers c ON c.customer_id = s.customer_id
@@ -10882,6 +10934,7 @@ def dashboard(conn):
                     "do_number": "DO Serial",
                     "service_date": "Service date",
                     "customer": "Customer",
+                    "company": "Company",
                     "description": "Description",
                 }
             ).drop(columns=["customer_id", "do_customer_id"], errors="ignore"),
@@ -10902,6 +10955,7 @@ def dashboard(conn):
                    d.customer_id AS do_customer_id,
                    m.maintenance_date,
                    COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+                   COALESCE(c.company_name, cdo.company_name) AS company,
                    m.description
             FROM maintenance_records m
             LEFT JOIN customers c ON c.customer_id = m.customer_id
@@ -10938,6 +10992,7 @@ def dashboard(conn):
                     "do_number": "DO Serial",
                     "maintenance_date": "Maintenance date",
                     "customer": "Customer",
+                    "company": "Company",
                     "description": "Description",
                 }
             ).drop(columns=["customer_id", "do_customer_id"], errors="ignore"),
@@ -10961,6 +11016,7 @@ def dashboard(conn):
                    d.file_path,
                    d.payment_receipt_path,
                    COALESCE(c.name, '(unknown)') AS customer,
+                   c.company_name AS company,
                    d.description
             FROM delivery_orders d
             LEFT JOIN customers c ON c.customer_id = d.customer_id
@@ -10989,15 +11045,16 @@ def dashboard(conn):
             )
             st.dataframe(
                 recent_delivery_orders.rename(
-                    columns={
-                        "do_number": "DO Serial",
-                        "created_at": "Created",
-                        "status": "Status",
-                        "total_amount": "Total",
-                        "customer": "Customer",
-                        "description": "Description",
-                    }
-                ).drop(
+                columns={
+                    "do_number": "DO Serial",
+                    "created_at": "Created",
+                    "status": "Status",
+                    "total_amount": "Total",
+                    "customer": "Customer",
+                    "company": "Company",
+                    "description": "Description",
+                }
+            ).drop(
                     columns=["customer_id", "file_path", "payment_receipt_path"],
                     errors="ignore",
                 ),
@@ -11026,6 +11083,7 @@ def dashboard(conn):
                    d.file_path,
                    d.payment_receipt_path,
                    COALESCE(c.name, '(unknown)') AS customer,
+                   c.company_name AS company,
                    d.description
             FROM delivery_orders d
             LEFT JOIN customers c ON c.customer_id = d.customer_id
@@ -11052,15 +11110,16 @@ def dashboard(conn):
             )
             st.dataframe(
                 recent_work_orders.rename(
-                    columns={
-                        "do_number": "Work order",
-                        "created_at": "Created",
-                        "status": "Status",
-                        "total_amount": "Total",
-                        "customer": "Customer",
-                        "description": "Description",
-                    }
-                ).drop(
+                columns={
+                    "do_number": "Work order",
+                    "created_at": "Created",
+                    "status": "Status",
+                    "total_amount": "Total",
+                    "customer": "Customer",
+                    "company": "Company",
+                    "description": "Description",
+                }
+            ).drop(
                     columns=["customer_id", "file_path", "payment_receipt_path"],
                     errors="ignore",
                 ),
@@ -11091,7 +11150,8 @@ def show_expiry_notifications(conn):
                COALESCE(s.service_start_date, s.service_date) AS start_date,
                s.status,
                s.description,
-               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company
         FROM services s
         LEFT JOIN customers c ON c.customer_id = s.customer_id
         LEFT JOIN delivery_orders d ON d.do_number = s.do_number
@@ -11112,7 +11172,8 @@ def show_expiry_notifications(conn):
                COALESCE(m.maintenance_start_date, m.maintenance_date) AS start_date,
                m.status,
                m.description,
-               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company
         FROM maintenance_records m
         LEFT JOIN customers c ON c.customer_id = m.customer_id
         LEFT JOIN delivery_orders d ON d.do_number = m.do_number
@@ -11162,7 +11223,8 @@ def show_expiry_notifications(conn):
                n.customer_id,
                n.note,
                n.remind_on,
-               c.name AS customer
+               c.name AS customer,
+               c.company_name AS company
         FROM customer_notes n
         JOIN customers c ON c.customer_id = n.customer_id
         WHERE n.is_done = 0
@@ -11180,11 +11242,12 @@ def show_expiry_notifications(conn):
         notes_display = due_notes.rename(
             columns={
                 "customer": "Customer",
+                "company": "Company",
                 "note": "Remark",
                 "remind_on": "Due date",
             }
         )[
-            ["Customer", "Remark", "Due date"]
+            ["Customer", "Company", "Remark", "Due date"]
         ]
         for record in due_notes.to_dict("records"):
             customer_ref = clean_text(record.get("customer")) or "(unknown)"
@@ -11201,7 +11264,7 @@ def show_expiry_notifications(conn):
             if not do_ref:
                 try:
                     service_identifier = int(record.get("service_id"))
-                    do_ref = f"Service #{service_identifier}"
+                    do_ref = "Service record"
                 except Exception:
                     do_ref = "Service"
             customer_ref = clean_text(record.get("customer")) or "(unknown)"
@@ -11217,6 +11280,7 @@ def show_expiry_notifications(conn):
                 "status": "Status",
                 "description": "Description",
                 "customer": "Customer",
+                "company": "Company",
             }
         )
         service_display.insert(0, "Type", "Service")
@@ -11226,6 +11290,7 @@ def show_expiry_notifications(conn):
                 "Type",
                 "DO Serial",
                 "Customer",
+                "Company",
                 "Start date",
                 "Status",
                 "Description",
@@ -11239,7 +11304,7 @@ def show_expiry_notifications(conn):
             if not do_ref:
                 try:
                     maintenance_identifier = int(record.get("maintenance_id"))
-                    do_ref = f"Maintenance #{maintenance_identifier}"
+                    do_ref = "Maintenance record"
                 except Exception:
                     do_ref = "Maintenance"
             customer_ref = clean_text(record.get("customer")) or "(unknown)"
@@ -11255,6 +11320,7 @@ def show_expiry_notifications(conn):
                 "status": "Status",
                 "description": "Description",
                 "customer": "Customer",
+                "company": "Company",
             }
         )
         maintenance_display.insert(0, "Type", "Maintenance")
@@ -11264,6 +11330,7 @@ def show_expiry_notifications(conn):
                 "Type",
                 "DO Serial",
                 "Customer",
+                "Company",
                 "Start date",
                 "Status",
                 "Description",
@@ -11304,7 +11371,7 @@ def show_expiry_notifications(conn):
         month_expired = int(df_query(conn, month_expired_query, scope_params).iloc[0]["c"])
         expired_recent_query = dedent(
             f"""
-            SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
+            SELECT c.name AS customer, c.company_name AS company, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
             FROM warranties w
             LEFT JOIN customers c ON c.customer_id = w.customer_id
             LEFT JOIN products p ON p.product_id = w.product_id
@@ -11508,7 +11575,7 @@ def render_customer_quick_edit_section(
     show_heading: bool = True,
     show_editor: bool = True,
     show_filters: bool = True,
-    show_id: bool = True,
+    show_id: bool = False,
     enable_pagination: bool = False,
     limit_rows: Optional[int] = None,
     show_do_code: bool = True,
@@ -11632,7 +11699,6 @@ def render_customer_quick_edit_section(
         lead_columns = [
             col
             for col in [
-                "id",
                 "name",
                 "company_name",
                 "phone",
@@ -11648,7 +11714,6 @@ def render_customer_quick_edit_section(
             lead_view,
             use_container_width=True,
             column_config={
-                "id": st.column_config.Column("ID"),
                 "name": st.column_config.TextColumn("Name"),
                 "company_name": st.column_config.TextColumn("Company"),
                 "phone": st.column_config.TextColumn("Phone"),
@@ -11690,7 +11755,7 @@ def render_customer_quick_edit_section(
     column_order = [
         col
         for col in [
-            "id",
+            "id" if show_id else None,
             "name",
             "company_name",
             "phone",
@@ -11899,7 +11964,7 @@ def render_customer_quick_edit_section(
     header_cols = st.columns(tuple(widths))
     header_idx = 0
     if show_id:
-        header_cols[header_idx].write("**ID**")
+        header_cols[header_idx].write("**Ref**")
         header_idx += 1
     header_cols[header_idx + 0].write("**Name**")
     header_cols[header_idx + 1].write("**Company**")
@@ -12181,7 +12246,7 @@ def render_customer_quick_edit_section(
                 continue
             name_val = clean_text(record.get("name")) or "(no name)"
             phone_val = clean_text(record.get("phone")) or "-"
-            delete_labels[cid] = f"#{cid} – {name_val} | {phone_val}"
+            delete_labels[cid] = f"{name_val} | {phone_val}"
         delete_choices = sorted(
             delete_labels.keys(), key=lambda cid: delete_labels[cid].lower()
         )
@@ -12192,9 +12257,7 @@ def render_customer_quick_edit_section(
                 "Select customers to delete",
                 delete_choices,
                 key=delete_state_key,
-                format_func=lambda cid: delete_labels.get(
-                    int(cid), f"Customer #{cid}"
-                ),
+                format_func=lambda cid: delete_labels.get(int(cid), "Customer record"),
                 help="Removes the selected customers and their related records.",
             )
             bulk_delete_submit = st.form_submit_button(
@@ -12212,7 +12275,7 @@ def render_customer_quick_edit_section(
                     delete_customer_record(conn, int(cid))
                     deleted_count += 1
                 except Exception as err:
-                    st.error(f"Unable to delete customer #{cid}: {err}")
+                    st.error(f"Unable to delete customer record: {err}")
             if deleted_count:
                 st.session_state[delete_state_key] = []
                 st.warning(f"Deleted {deleted_count} customer(s).")
@@ -12244,10 +12307,10 @@ def render_customer_quick_edit_section(
                     if can_delete_row:
                         delete_customer_record(conn, cid)
                         deletes += 1
-                    else:
-                        errors.append(
-                            f"Only admins or record owners can delete customers (ID #{cid})."
-                        )
+                else:
+                    errors.append(
+                        "Only admins or record owners can delete customers."
+                    )
                     continue
                 new_name = clean_text(row.get("name"))
                 new_company = clean_text(row.get("company_name"))
@@ -12366,7 +12429,7 @@ def render_customer_quick_edit_section(
                 updates += 1
                 made_updates = True
                 if changes:
-                    display_name = new_name or old_name or f"Customer #{cid}"
+                    display_name = new_name or old_name or "Customer record"
                     summary = ", ".join(changes)
                     activity_events.append(
                         (
@@ -13288,7 +13351,7 @@ def render_customer_document_uploader(
         selected_customer = st.selectbox(
             "Customer",
             customer_choices,
-            format_func=lambda cid: customer_labels.get(cid, f"Customer #{cid}"),
+            format_func=lambda cid: customer_labels.get(cid, "Customer record"),
             key=f"{key_prefix}_customer",
         )
         customer_seed = df_query(
@@ -13554,7 +13617,7 @@ def render_operations_document_uploader(
             index=customer_choices.index(default_customer)
             if default_customer in customer_choices
             else 0,
-            format_func=lambda cid: customer_labels.get(cid, f"Customer #{cid}"),
+            format_func=lambda cid: customer_labels.get(cid, "Customer record"),
             key=f"{key_prefix}_upload_customer",
         )
     else:
@@ -13563,7 +13626,7 @@ def render_operations_document_uploader(
         )
         if selected_customer:
             label = selected_customer_label or customer_labels.get(
-                selected_customer, f"Customer #{selected_customer}"
+                selected_customer, "Customer record"
             )
             if label:
                 st.caption(f"Uploading for: {label}")
@@ -13869,7 +13932,8 @@ def render_operations_document_uploader(
                cd.original_name,
                cd.uploaded_at,
                cd.uploaded_by,
-               COALESCE(c.name, c.company_name, '(customer)') AS customer_name,
+               COALESCE(c.name, '(customer)') AS customer_name,
+               c.company_name AS company,
                COALESCE(u.username, '(user)') AS uploaded_by_name,
                d.do_number,
                d.description AS do_description,
@@ -13921,6 +13985,8 @@ def render_operations_document_uploader(
                         "doc_type",
                         "original_name",
                         "file_path",
+                        "customer_name",
+                        "company",
                         "do_description",
                         "do_remarks",
                         "service_description",
@@ -13957,11 +14023,11 @@ def render_operations_document_uploader(
         if source == "delivery":
             linked_value = clean_text(row.get("do_number"))
         elif source == "service":
-            linked_value = clean_text(row.get("service_do_number")) or f"Service #{int(row['service_id'])}"
+            linked_value = clean_text(row.get("service_do_number")) or "Service record"
         elif source == "maintenance":
-            linked_value = clean_text(row.get("maintenance_do_number")) or f"Maintenance #{int(row['maintenance_id'])}"
+            linked_value = clean_text(row.get("maintenance_do_number")) or "Maintenance record"
         elif source == "other":
-            linked_value = f"Other #{int(row['other_document_id'])}"
+            linked_value = "Other record"
         description = ""
         status = ""
         date_value = ""
@@ -13989,6 +14055,7 @@ def render_operations_document_uploader(
                 "Doc Type": doc_type,
                 "Linked entity": linked_value,
                 "Customer": clean_text(row.get("customer_name")) or "(customer)",
+                "Company": clean_text(row.get("company")) or "",
                 "Title / filename": clean_text(row.get("original_name")) or "(file)",
                 "Remarks / description": description,
                 "Date": date_value,
@@ -14023,6 +14090,7 @@ def render_operations_document_uploader(
             "Doc Type",
             "Linked entity",
             "Customer",
+            "Company",
             "Title / filename",
             "Remarks / description",
             "Date",
@@ -14049,6 +14117,7 @@ def render_operations_document_uploader(
             "Doc Type",
             "Linked entity",
             "Customer",
+            "Company",
             "Title / filename",
             "Uploaded",
             "Uploaded by",
@@ -14462,7 +14531,8 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
                o.updated_at,
                o.uploaded_by,
                o.updated_by,
-               COALESCE(c.name, c.company_name, '(customer)') AS customer,
+               COALESCE(c.name, '(customer)') AS customer_name,
+               c.company_name AS company,
                COALESCE(u.username, '(user)') AS uploaded_by_name,
                COALESCE(uu.username, '(user)') AS updated_by_name
         FROM operations_other_documents o
@@ -14481,7 +14551,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             other_df.apply(
                 lambda row: any(
                     needle in str(row.get(col, "")).lower()
-                    for col in ["description", "original_name", "customer"]
+                    for col in ["description", "original_name", "customer_name", "company"]
                 ),
                 axis=1,
             )
@@ -14520,7 +14590,8 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
     display_df = display_df.rename(
         columns={
             "description": "Description",
-            "customer": "Customer",
+            "customer_name": "Customer",
+            "company": "Company",
             "items_summary": "Items",
             "uploaded_at": "Uploaded",
             "updated_at": "Updated",
@@ -14533,6 +14604,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             [
                 "Description",
                 "Customer",
+                "Company",
                 "Items",
                 "Uploaded",
                 "Updated",
@@ -14550,8 +14622,9 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
         int(row["document_id"]): " • ".join(
             part
             for part in [
-                clean_text(row.get("description")) or f"Other #{int(row['document_id'])}",
-                clean_text(row.get("customer")),
+                clean_text(row.get("description")) or "Other record",
+                clean_text(row.get("customer_name")),
+                clean_text(row.get("company")),
             ]
             if part
         )
@@ -14563,7 +14636,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
     selected_id = st.selectbox(
         "Select a record",
         record_choices,
-        format_func=lambda rid: record_labels.get(rid, f"Other #{rid}"),
+        format_func=lambda rid: record_labels.get(rid, "Other record"),
         key=f"{key_prefix}_other_edit_select",
     )
     selected_record = next(
@@ -14690,7 +14763,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
         log_activity(
             conn,
             event_type="operations_other_updated",
-            description=f"Other record #{int(selected_id)} updated",
+            description="Other record updated",
             entity_type="operations_other",
             entity_id=int(selected_id),
             user_id=actor_id,
@@ -14727,7 +14800,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
         log_activity(
             conn,
             event_type="operations_other_deleted",
-            description=f"Other record #{int(selected_id)} deleted",
+            description="Other record deleted",
             entity_type="operations_other",
             entity_id=int(selected_id),
             user_id=actor_id,
@@ -14768,32 +14841,30 @@ def operations_page(conn):
         where_parts.append(scope_clause)
         params.extend(scope_params)
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    customers_df = df_query(
-        conn,
-        f"""
-        SELECT customer_id, name, company_name, phone, address, delivery_address, sales_person
-        FROM customers
-        {where_clause}
-        ORDER BY LOWER(COALESCE(name, '')), customer_id
-        """,
+    version = get_data_version(conn, "customers")
+    customers_df = _load_operations_customers(
+        DB_PATH,
+        where_clause,
         tuple(params),
+        version,
     )
     selected_customer_id = None
     selected_customer_label = None
     if customers_df.empty:
         st.info("No customers match that search.")
     else:
+        customer_ids = customers_df["customer_id"].astype(int)
         table_df = pd.DataFrame(
             {
                 "Select": False,
-                "ID": customers_df["customer_id"].astype(int),
                 "Customer": customers_df["name"].fillna(""),
                 "Company": customers_df["company_name"].fillna(""),
                 "Phone": customers_df["phone"].fillna(""),
                 "Sales rep": customers_df["sales_person"].fillna(""),
                 "Address": customers_df["address"].fillna(""),
                 "Delivery address": customers_df["delivery_address"].fillna(""),
-            }
+            },
+            index=customer_ids,
         )
         state_key = "operations_customer_table_state"
         previous_table = st.session_state.get(state_key)
@@ -14802,23 +14873,15 @@ def operations_page(conn):
         if previous_table is None:
             st.session_state[state_key] = table_df
         else:
-            previous_ids = previous_table.get("ID") if "ID" in previous_table else None
-            current_ids = table_df.get("ID")
-            previous_list = (
-                previous_ids.tolist() if isinstance(previous_ids, pd.Series) else []
-            )
-            current_list = (
-                current_ids.tolist() if isinstance(current_ids, pd.Series) else []
-            )
+            previous_list = previous_table.index.tolist()
+            current_list = table_df.index.tolist()
             if previous_list != current_list:
                 selected_ids = set()
-                if "Select" in previous_table and "ID" in previous_table:
-                    selected_ids = set(
-                        previous_table.loc[previous_table["Select"], "ID"].tolist()
-                    )
+                if "Select" in previous_table:
+                    selected_ids = set(previous_table.index[previous_table["Select"]].tolist())
                 refreshed_table = table_df.copy()
                 if selected_ids:
-                    refreshed_table["Select"] = refreshed_table["ID"].isin(selected_ids)
+                    refreshed_table["Select"] = refreshed_table.index.isin(selected_ids)
                 st.session_state[state_key] = refreshed_table
         table_source = table_df.copy()
         if previous_table is not None and "Select" in previous_table:
@@ -14838,7 +14901,6 @@ def operations_page(conn):
                     "Select",
                     help="Choose a customer to upload operations documents.",
                 ),
-                "ID": st.column_config.NumberColumn("ID", disabled=True),
             },
             key="operations_customer_table",
         )
@@ -14867,7 +14929,7 @@ def operations_page(conn):
             st.rerun()
         st.session_state[state_key] = edited_table
         if not selected_rows.empty:
-            selected_customer_id = int(selected_rows.iloc[0]["ID"])
+            selected_customer_id = int(selected_rows.index[0])
             selected_row = customers_df[
                 customers_df["customer_id"] == selected_customer_id
             ]
@@ -15058,8 +15120,8 @@ def customers_page(conn):
                         help="Add model or variant details to help identify the product.",
                     ),
                     "serial": st.column_config.TextColumn(
-                        "Serial / ID",
-                        help="Serial number or unique identifier (optional).",
+                        "Serial / reference",
+                        help="Serial number or reference (optional).",
                     ),
                     "quantity": st.column_config.NumberColumn(
                         "Quantity",
@@ -15832,7 +15894,7 @@ def customers_page(conn):
                 if phone_val:
                     recalc_customer_duplicate_flag(conn, phone_val)
                     conn.commit()
-                display_name = name_val or f"Customer #{int(cid)}"
+                display_name = name_val or "Customer record"
                 product_count = len(
                     [prod for prod in cleaned_products if prod.get("name")]
                 )
@@ -16083,7 +16145,7 @@ def customers_page(conn):
                         follow_up_source = st.session_state.get(
                             f"customer_note_reminder_{selected_customer_id}__raw"
                         )
-                        message = f"Customer #{selected_customer_id} follow-up"
+                        message = "Customer follow-up"
                         if note_value:
                             message = f"{message}: {note_value}"
                         sync_follow_up_reminder(
@@ -16120,6 +16182,7 @@ def customers_page(conn):
                     if parse_date_value(value) is not None
                     else ""
                 )
+                editor_df["note"] = editor_df["note"].apply(_strip_warranty_tag)
                 editor_df["created_at"] = pd.to_datetime(editor_df["created_at"], errors="coerce")
                 editor_df["updated_at"] = pd.to_datetime(editor_df["updated_at"], errors="coerce")
                 editor_df["Done"] = editor_df.get("is_done", 0).fillna(0).astype(int).apply(lambda v: bool(v))
@@ -16137,14 +16200,13 @@ def customers_page(conn):
                     ]
                     if col in editor_df.columns
                 ]
-                editor_view = editor_df[column_order]
+                editor_view = editor_df[column_order].set_index("note_id")
                 note_editor_state = safe_data_editor(
                     editor_view,
                     hide_index=True,
                     num_rows="fixed",
                     use_container_width=True,
                     column_config={
-                        "note_id": st.column_config.Column("ID", disabled=True),
                         "note": st.column_config.TextColumn("Remark"),
                         "remind_on": st.column_config.DateColumn(
                             "Reminder date",
@@ -16178,8 +16240,8 @@ def customers_page(conn):
                     else:
                         changes = False
                         errors: list[str] = []
-                        for row in note_result.to_dict("records"):
-                            note_id = int_or_none(row.get("note_id"))
+                        for note_id, row in note_result.iterrows():
+                            note_id = int_or_none(note_id)
                             if note_id is None or note_id not in notes_original:
                                 continue
                             action = str(row.get("Action") or "Keep").strip().lower()
@@ -16198,12 +16260,12 @@ def customers_page(conn):
                                 continue
                             new_note_text = clean_text(row.get("note"))
                             if not new_note_text:
-                                errors.append(f"Remark #{note_id} cannot be empty.")
+                                errors.append("Remark text cannot be empty.")
                                 continue
                             reminder_text = clean_text(row.get("remind_on"))
                             if reminder_text and parse_human_date(reminder_text) is None:
                                 errors.append(
-                                    f"Remark #{note_id} has an invalid reminder date. Use YYYY-MM-DD or 'tomorrow'."
+                                    "A remark has an invalid reminder date. Use YYYY-MM-DD or 'tomorrow'."
                                 )
                                 continue
                             reminder_iso = to_iso_date(reminder_text)
@@ -16238,7 +16300,7 @@ def customers_page(conn):
                                 entity_id=note_id,
                                 follow_up_text=clean_text(row.get("remind_on")),
                                 fallback_date=reminder_iso,
-                                message=f"Customer #{selected_customer_id} follow-up: {new_note_text}",
+                                message=f"Customer follow-up: {new_note_text}",
                                 status="done" if completed_flag else "pending",
                             )
                             changes = True
@@ -16303,7 +16365,7 @@ def warranties_page(conn):
 
     base = dedent(
         """
-        SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial,
+        SELECT w.warranty_id as id, c.name as customer, c.company_name AS company, p.name as product, p.model, w.serial,
                w.issue_date, w.expiry_date, w.status, w.remarks, w.dup_flag,
                COALESCE(c.sales_person, u.username) AS staff
         FROM warranties w
@@ -16315,14 +16377,14 @@ def warranties_page(conn):
         """
     )
 
-    search_filter = "(? = '' OR c.name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')"
+    search_filter = "(? = '' OR c.name LIKE '%'||?||'%' OR c.company_name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')"
     status_filter = "COALESCE(w.status, 'active') NOT IN ('deleted', 'completed')"
     product_filter = "(p.name IS NOT NULL AND TRIM(p.name) != '')"
     scope_clause, scope_params = customer_scope_filter("c")
 
     def build_filters(date_condition: str) -> tuple[str, tuple[object, ...]]:
         clauses = [search_filter, status_filter, product_filter, date_condition]
-        params = [q, q, q, q, q]
+        params = [q, q, q, q, q, q]
         if scope_clause:
             clauses.append(scope_clause)
             params.extend(scope_params)
@@ -16379,6 +16441,7 @@ def warranties_page(conn):
             SELECT w.warranty_id,
                    w.customer_id,
                    c.name AS customer,
+                   c.company_name AS company,
                    p.name AS product,
                    p.model,
                    w.serial,
@@ -16434,7 +16497,7 @@ def warranties_page(conn):
         selected_warranty = st.selectbox(
             "Select warranty",
             options=list(warranty_labels.keys()),
-            format_func=lambda wid: warranty_labels.get(wid, f"Warranty #{wid}"),
+            format_func=lambda wid: warranty_labels.get(wid, "Warranty record"),
         )
         selected_record = next(
             record
@@ -16534,7 +16597,7 @@ def warranties_page(conn):
                 follow_up_source = st.session_state.get(
                     f"warranty_followup_reminder_{selected_warranty}__raw"
                 )
-                message = f"Warranty #{selected_warranty} follow-up"
+                message = "Warranty follow-up"
                 if note_value:
                     message = f"{message}: {note_value}"
                 sync_follow_up_reminder(
@@ -16577,7 +16640,8 @@ def warranties_page(conn):
                n.remind_on,
                n.is_done,
                n.created_at,
-               c.name AS customer
+               c.name AS customer,
+               c.company_name AS company
         FROM customer_notes n
         LEFT JOIN customers c ON c.customer_id = n.customer_id
         WHERE n.note LIKE '[Warranty #%'
@@ -16596,7 +16660,7 @@ def warranties_page(conn):
             warranty_id, note_text = _parse_warranty_followup_note(row.get("note"))
             if not warranty_id:
                 continue
-            warranty_label = warranty_labels.get(warranty_id, f"Warranty #{warranty_id}")
+            warranty_label = warranty_labels.get(warranty_id, "Warranty record")
             reminder_label = format_period_range(row.get("remind_on"), row.get("remind_on"))
             created_label = format_period_range(row.get("created_at"), row.get("created_at"))
             note_id = int_or_none(row.get("note_id"))
@@ -16606,9 +16670,10 @@ def warranties_page(conn):
             group = grouped_followups.get(warranty_id)
             if not group:
                 group = {
-                    "Warranty ID": warranty_id,
+                    "Warranty ref": warranty_id,
                     "Warranty": warranty_label,
                     "Customer": clean_text(row.get("customer")) or "(unknown)",
+                    "Company": clean_text(row.get("company")) or "",
                     "Reminder date": reminder_label,
                     "Status": status_label,
                     "Remark": note_text,
@@ -16628,7 +16693,7 @@ def warranties_page(conn):
             group["Status"] = "Pending" if group.get("has_pending") else "Completed"
             group.pop("has_pending", None)
             followup_rows.append(group)
-        followup_df = pd.DataFrame(followup_rows).set_index("Warranty ID")
+        followup_df = pd.DataFrame(followup_rows).set_index("Warranty ref")
         editable_df = followup_df.copy()
         edited_followups = safe_data_editor(
             editable_df,
@@ -16750,7 +16815,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 or customer_label_map.get(default_customer)
                 or label_by_id.get(default_customer)
                 or do_customer_name_map.get(selected_do)
-                or f"Customer #{default_customer}"
+                or "Customer record"
             )
             st.text_input("Customer", value=customer_label, disabled=True)
         else:
@@ -16974,7 +17039,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 conn.commit()
                 service_label = do_labels.get(selected_do) if selected_do else None
                 if not service_label:
-                    service_label = f"Service #{service_id}"
+                    service_label = "Service record"
                 customer_name = None
                 if selected_customer is not None:
                     customer_name = (
@@ -17022,6 +17087,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                s.updated_at,
                s.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company,
                COUNT(sd.document_id) AS doc_count
         FROM services s
         LEFT JOIN customers c ON c.customer_id = s.customer_id
@@ -17102,6 +17168,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "attachment_display": "Attachment",
                 "payment_receipt_display": "Receipt",
                 "customer": "Customer",
+                "company": "Company",
                 "doc_count": "Documents",
             }
         )
@@ -17311,7 +17378,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     ),
                 )
                 conn.commit()
-                label_text = labels.get(int(selected_service_id), f"Service #{int(selected_service_id)}")
+                label_text = labels.get(int(selected_service_id), "Service record")
                 status_label = clean_text(new_status) or DEFAULT_SERVICE_STATUS
                 message_summary = label_text
                 if status_label:
@@ -17419,7 +17486,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
             selected_delete_id = st.selectbox(
                 "Select a service entry to delete",
                 delete_options,
-                format_func=lambda val: delete_labels.get(val, f"Service #{val}"),
+                format_func=lambda val: delete_labels.get(val, "Service record"),
                 key="service_delete_select",
             )
             confirm_delete = st.checkbox(
@@ -17446,7 +17513,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 log_activity(
                     conn,
                     event_type="service_deleted",
-                    description=f"Service #{selected_delete_id} deleted",
+                    description="Service record deleted",
                     entity_type="service",
                     entity_id=int(selected_delete_id),
                     user_id=actor_id,
@@ -18578,7 +18645,7 @@ def _update_quotation_records(
                 new_company=new_customer_company,
                 new_phone=new_customer_contact,
             )
-        reference_label = clean_text(new_reference) or f"Quotation #{quotation_id}"
+        reference_label = clean_text(new_reference) or "Quotation record"
         if status_value == "paid":
             sync_follow_up_reminder(
                 conn,
@@ -18773,7 +18840,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             )
         with basic_cols[1]:
             reference_value = st.text_input(
-                "Reference / Quotation #",
+                "Reference / Quotation",
                 value=st.session_state.get("quotation_reference", ""),
                 key="quotation_reference",
             )
@@ -19063,7 +19130,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
         if record_id:
             follow_up_source = st.session_state.get("quotation_follow_up_date__raw")
             customer_label = clean_text(customer_company) or clean_text(customer_contact_name)
-            reference_label = clean_text(reference_value) or f"Quotation #{record_id}"
+            reference_label = clean_text(reference_value) or "Quotation record"
             message = (
                 f"{reference_label} follow-up"
                 if not customer_label
@@ -19442,7 +19509,7 @@ def _render_quotation_management(conn):
             detail_id = int(row.get("quotation_id"))
         except Exception:
             continue
-        reference = clean_text(row.get("reference")) or f"Quotation #{detail_id}"
+        reference = clean_text(row.get("reference")) or "Quotation record"
         customer = clean_text(row.get("customer_company")) or clean_text(
             row.get("customer_name")
         ) or clean_text(row.get("customer_contact"))
@@ -19458,7 +19525,7 @@ def _render_quotation_management(conn):
     selected_detail_id = st.selectbox(
         "Select a quotation",
         detail_choices,
-        format_func=lambda val: detail_labels.get(val, f"Quotation #{val}"),
+        format_func=lambda val: detail_labels.get(val, "Quotation record"),
         key="quotation_detail_select",
     )
 
@@ -19615,7 +19682,7 @@ def _render_quotation_management(conn):
         )
         follow_up_source = st.session_state.get("quotation_detail_follow_up_date__raw")
         if follow_up_iso:
-            message = f"Quotation #{selected_detail_id} follow-up"
+            message = "Quotation follow-up"
         else:
             message = None
         sync_follow_up_reminder(
@@ -19631,7 +19698,7 @@ def _render_quotation_management(conn):
         log_activity(
             conn,
             event_type="quotation_updated",
-            description=f"Quotation #{selected_detail_id} details updated",
+            description="Quotation details updated",
             entity_type="quotation",
             entity_id=int(selected_detail_id),
             user_id=current_user_id(),
@@ -19655,7 +19722,7 @@ def _render_quotation_management(conn):
             quote_id = int(row.get("quotation_id"))
         except Exception:
             continue
-        reference = clean_text(row.get("reference")) or f"Quotation #{quote_id}"
+        reference = clean_text(row.get("reference")) or "Quotation record"
         customer = clean_text(row.get("customer_company")) or clean_text(
             row.get("customer_name")
         ) or clean_text(row.get("customer_contact"))
@@ -19664,7 +19731,7 @@ def _render_quotation_management(conn):
     selected_delete_id = st.selectbox(
         "Select a quotation to delete",
         delete_options,
-        format_func=lambda val: delete_labels.get(val, f"Quotation #{val}"),
+        format_func=lambda val: delete_labels.get(val, "Quotation record"),
         key="quotation_delete_select",
     )
     confirm_delete = st.checkbox(
@@ -19757,14 +19824,14 @@ def advanced_search_page(conn):
 
     staff_df = df_query(conn, "SELECT user_id, username FROM users ORDER BY LOWER(username)")
     staff_map = {
-        int(row["user_id"]): clean_text(row.get("username")) or f"User #{int(row['user_id'])}"
+        int(row["user_id"]): clean_text(row.get("username")) or "Team member"
         for _, row in staff_df.iterrows()
     }
     staff_choices = list(staff_map.keys())
     staff_filter = st.multiselect(
         "Staff filter",
         staff_choices,
-        format_func=lambda uid: staff_map.get(uid, f"User #{uid}"),
+        format_func=lambda uid: staff_map.get(uid, "Team member"),
         key="advanced_search_staff",
     )
 
@@ -19868,7 +19935,7 @@ def advanced_search_page(conn):
             "Service",
             "service_start_date",
             lambda row: {
-                "title": clean_text(row.get("description")) or f"Service #{row.get('service_id')}",
+                "title": clean_text(row.get("description")) or "Service record",
                 "details": clean_text(row.get("service_product_info")),
                 "date": row.get("service_start_date") or row.get("service_end_date"),
                 "status": clean_text(row.get("status")),
@@ -19893,7 +19960,7 @@ def advanced_search_page(conn):
             "Maintenance",
             "maintenance_start_date",
             lambda row: {
-                "title": clean_text(row.get("description")) or f"Maintenance #{row.get('maintenance_id')}",
+                "title": clean_text(row.get("description")) or "Maintenance record",
                 "details": clean_text(row.get("maintenance_product_info")),
                 "date": row.get("maintenance_start_date") or row.get("maintenance_end_date"),
                 "status": clean_text(row.get("status")),
@@ -19980,7 +20047,7 @@ def advanced_search_page(conn):
     history_staff = st.selectbox(
         "Team member",
         staff_choices,
-        format_func=lambda uid: staff_map.get(uid, f"User #{uid}"),
+        format_func=lambda uid: staff_map.get(uid, "Team member"),
         key="advanced_search_history_staff",
     )
     history_range = render_flexible_date_range(
@@ -20109,7 +20176,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 or customer_label_map.get(default_customer)
                 or label_by_id.get(default_customer)
                 or do_customer_name_map.get(selected_do)
-                or f"Customer #{default_customer}"
+                or "Customer record"
             )
             st.text_input("Customer", value=customer_label, disabled=True)
         else:
@@ -20312,7 +20379,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             conn.commit()
             maintenance_label = do_labels.get(selected_do) if selected_do else None
             if not maintenance_label:
-                maintenance_label = f"Maintenance #{maintenance_id}"
+                maintenance_label = "Maintenance record"
                 customer_name = None
                 if selected_customer is not None:
                     customer_name = (
@@ -20356,6 +20423,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                m.updated_at,
                m.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company,
                COUNT(md.document_id) AS doc_count
         FROM maintenance_records m
         LEFT JOIN customers c ON c.customer_id = m.customer_id
@@ -20434,6 +20502,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 "attachment_display": "Attachment",
                 "payment_receipt_display": "Receipt",
                 "customer": "Customer",
+                "company": "Company",
                 "doc_count": "Documents",
             }
         )
@@ -20625,7 +20694,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 conn.commit()
                 label_text = labels.get(
                     int(selected_maintenance_id),
-                    f"Maintenance #{int(selected_maintenance_id)}",
+                    "Maintenance record",
                 )
                 status_label = clean_text(new_status) or DEFAULT_SERVICE_STATUS
                 summary = f"{label_text} → {status_label}" if status_label else label_text
@@ -20732,7 +20801,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             selected_delete_id = st.selectbox(
                 "Select a maintenance entry to delete",
                 delete_options,
-                format_func=lambda val: delete_labels.get(val, f"Maintenance #{val}"),
+                format_func=lambda val: delete_labels.get(val, "Maintenance record"),
                 key="maintenance_delete_select",
             )
             confirm_delete = st.checkbox(
@@ -20759,7 +20828,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 log_activity(
                     conn,
                     event_type="maintenance_deleted",
-                    description=f"Maintenance #{selected_delete_id} deleted",
+                    description="Maintenance record deleted",
                     entity_type="maintenance",
                     entity_id=int(selected_delete_id),
                     user_id=actor_id,
@@ -21727,7 +21796,7 @@ def customer_summary_page(conn):
     warr = df_query(
         conn,
         f"""
-        SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.remarks, w.dup_flag
+        SELECT w.warranty_id as id, c.name as customer, c.company_name AS company, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.remarks, w.dup_flag
         FROM warranties w
         LEFT JOIN customers c ON c.customer_id = w.customer_id
         LEFT JOIN products p ON p.product_id = w.product_id
@@ -21757,6 +21826,7 @@ def customer_summary_page(conn):
                s.bill_document_path,
                s.payment_receipt_path,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company,
                COUNT(sd.document_id) AS doc_count
         FROM services s
         LEFT JOIN customers c ON c.customer_id = s.customer_id
@@ -21792,6 +21862,7 @@ def customer_summary_page(conn):
                m.remarks,
                m.payment_receipt_path,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COALESCE(c.company_name, cdo.company_name) AS company,
                COUNT(md.document_id) AS doc_count
         FROM maintenance_records m
         LEFT JOIN customers c ON c.customer_id = m.customer_id
@@ -21822,6 +21893,7 @@ def customer_summary_page(conn):
         f"""
         SELECT d.do_number,
                COALESCE(c.name, '(unknown)') AS customer,
+               c.company_name AS company,
                d.description,
                d.sales_person,
                d.remarks,
@@ -21861,6 +21933,7 @@ def customer_summary_page(conn):
             f"""
             SELECT d.do_number,
                    COALESCE(c.name, '(unknown)') AS customer,
+                   c.company_name AS company,
                    d.description,
                    d.sales_person,
                    d.remarks,
@@ -21895,6 +21968,7 @@ def customer_summary_page(conn):
                     columns={
                         "do_number": "DO Serial",
                         "customer": "Customer",
+                        "company": "Company",
                         "description": "Description",
                         "sales_person": "Sales person",
                         "remarks": "Remarks",
@@ -21929,6 +22003,7 @@ def customer_summary_page(conn):
                 "description": "Description",
                 "remarks": "Remarks",
                 "customer": "Customer",
+                "company": "Company",
                 "doc_count": "Documents",
             }
         )
@@ -21955,6 +22030,7 @@ def customer_summary_page(conn):
                 "description": "Description",
                 "remarks": "Remarks",
                 "customer": "Customer",
+                "company": "Company",
                 "doc_count": "Documents",
             }
         )
@@ -21994,7 +22070,7 @@ def customer_summary_page(conn):
             documents.append(
                 {
                     "source": "Customer",
-                    "reference": f"Customer #{customer_id}",
+                    "reference": "Customer record",
                     "display": display_name,
                     "path": path,
                     "archive_name": archive_name,
@@ -22029,7 +22105,7 @@ def customer_summary_page(conn):
             documents.append(
                 {
                     "source": doc_type,
-                    "reference": f"Customer #{customer_id}",
+                    "reference": "Customer record",
                     "display": display_name,
                     "path": path,
                     "archive_name": "/".join(
@@ -22112,7 +22188,7 @@ def customer_summary_page(conn):
                 continue
             service_id = int(doc_row.get("service_id"))
             record = service_lookup.get(service_id, {})
-            reference = clean_text(record.get("do_number")) or f"Service #{service_id}"
+            reference = clean_text(record.get("do_number")) or "Service record"
             display_name = clean_text(doc_row.get("original_name")) or path.name
             uploaded = pd.to_datetime(doc_row.get("uploaded_at"), errors="coerce")
             uploaded_fmt = uploaded.strftime("%d-%m-%Y %H:%M") if pd.notna(uploaded) else None
@@ -22138,7 +22214,7 @@ def customer_summary_page(conn):
             if pd.isna(row.get("service_id")):
                 continue
             service_id = int(row.get("service_id"))
-            reference = clean_text(row.get("do_number")) or f"Service #{service_id}"
+            reference = clean_text(row.get("do_number")) or "Service record"
             bill_path = resolve_upload_path(row.get("bill_document_path"))
             if bill_path and bill_path.exists():
                 bill_name = bill_path.name
@@ -22205,7 +22281,7 @@ def customer_summary_page(conn):
                 continue
             maintenance_id = int(doc_row.get("maintenance_id"))
             record = maintenance_lookup.get(maintenance_id, {})
-            reference = clean_text(record.get("do_number")) or f"Maintenance #{maintenance_id}"
+            reference = clean_text(record.get("do_number")) or "Maintenance record"
             display_name = clean_text(doc_row.get("original_name")) or path.name
             uploaded = pd.to_datetime(doc_row.get("uploaded_at"), errors="coerce")
             uploaded_fmt = uploaded.strftime("%d-%m-%Y %H:%M") if pd.notna(uploaded) else None
@@ -22231,7 +22307,7 @@ def customer_summary_page(conn):
             if pd.isna(row.get("maintenance_id")):
                 continue
             maintenance_id = int(row.get("maintenance_id"))
-            reference = clean_text(row.get("do_number")) or f"Maintenance #{maintenance_id}"
+            reference = clean_text(row.get("do_number")) or "Maintenance record"
             receipt_path = resolve_upload_path(row.get("payment_receipt_path"))
             if receipt_path and receipt_path.exists():
                 receipt_name = receipt_path.name
@@ -22291,7 +22367,7 @@ def customer_summary_page(conn):
         if not quotation_docs.empty:
             for _, row in quotation_docs.iterrows():
                 quote_id = int(row.get("quotation_id"))
-                reference = clean_text(row.get("reference")) or f"Quotation #{quote_id}"
+                reference = clean_text(row.get("reference")) or "Quotation record"
                 doc_path = resolve_upload_path(row.get("document_path"))
                 if doc_path and doc_path.exists():
                     doc_name = doc_path.name
@@ -22602,7 +22678,7 @@ def scraps_page(conn):
                 SELECT a.created_at,
                        a.event_type,
                        a.description,
-                       COALESCE(u.username, 'User #' || a.user_id) AS actor
+                       COALESCE(u.username, 'Team member') AS actor
                 FROM activity_log a
                 LEFT JOIN users u ON u.user_id = a.user_id
                 WHERE a.event_type LIKE '%_deleted'
@@ -22914,7 +22990,7 @@ def _build_reminder_alerts(
         if remind_dt:
             due = remind_dt <= now
         message = clean_text(record.get("message"))
-        entity_label = f"{record.get('entity_type')} #{record.get('entity_id')}"
+        entity_label = clean_text(record.get("entity_type")) or "Record"
         title = "Reminder due" if due else "Upcoming reminder"
         alerts.append(
             {
@@ -23251,7 +23327,7 @@ def manual_merge_section(conn, customers_df: pd.DataFrame) -> None:
             date_label = date_dt.strftime(DATE_FMT)
         else:
             date_label = clean_text(row.get("purchase_date")) or "-"
-        return f"#{row['id']} – {name_val} | Phone: {phone_val} | Date: {date_label} | Product: {product_val} | DO: {do_val}"
+        return f"{name_val} | Phone: {phone_val} | Date: {date_label} | Product: {product_val} | DO: {do_val}"
 
     work_df["_label"] = work_df.apply(build_label, axis=1)
     def _compose_search_blob(row) -> str:
@@ -23309,7 +23385,7 @@ def manual_merge_section(conn, customers_df: pd.DataFrame) -> None:
         selected_ids = st.multiselect(
             "Select customer records to merge",
             options=options,
-            format_func=lambda cid: label_map.get(cid, f"#{cid}"),
+            format_func=lambda cid: label_map.get(cid, "Customer record"),
         )
 
         preview_df = work_df[work_df["id"].isin(selected_ids)]
@@ -23321,7 +23397,6 @@ def manual_merge_section(conn, customers_df: pd.DataFrame) -> None:
             preview_cols = [
                 col
                 for col in [
-                    "id",
                     "name",
                     "phone",
                     "address",
@@ -23336,7 +23411,6 @@ def manual_merge_section(conn, customers_df: pd.DataFrame) -> None:
                 preview_df[preview_cols]
                 .rename(
                     columns={
-                        "id": "ID",
                         "name": "Name",
                         "phone": "Phone",
                         "address": "Address",
@@ -23346,7 +23420,7 @@ def manual_merge_section(conn, customers_df: pd.DataFrame) -> None:
                         "created_at": "Created",
                     }
                 )
-                .sort_values("ID"),
+                .sort_values("Name"),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -23709,7 +23783,7 @@ def duplicates_page(conn):
                                 delete_customer_record(conn, cid)
                                 deletes += 1
                             else:
-                                errors.append(f"Only admins can delete customers (ID #{cid}).")
+                                errors.append("Only admins can delete customers.")
                             continue
                         new_name = clean_text(row.get("name"))
                         new_company = clean_text(row.get("company_name"))
@@ -23919,15 +23993,41 @@ def users_admin_page(conn):
                     st.error("Username already exists")
 
     with st.expander("Reset password / delete"):
-        uid = st.number_input("User ID", min_value=1, step=1)
+        all_users = df_query(
+            conn,
+            """
+            SELECT user_id, username
+            FROM users
+            ORDER BY LOWER(COALESCE(username, ''))
+            """,
+        )
+        uid = None
+        if all_users.empty:
+            st.caption("No user accounts available.")
+        else:
+            user_map = {
+                int(row["user_id"]): clean_text(row.get("username")) or "Team member"
+                for _, row in all_users.iterrows()
+            }
+            uid = st.selectbox(
+                "User",
+                options=list(user_map.keys()),
+                format_func=lambda val: user_map.get(val, "Team member"),
+            )
         newp = st.text_input("New password", type="password")
         col1, col2 = st.columns(2)
         if col1.button("Set new password"):
+            if uid is None:
+                st.error("Select a user to reset the password.")
+                return
             h = hashlib.sha256(newp.encode("utf-8")).hexdigest()
             conn.execute("UPDATE users SET pass_hash=? WHERE user_id=?", (h, int(uid)))
             conn.commit()
             st.success("Password updated")
         if col2.button("Delete user"):
+            if uid is None:
+                st.error("Select a user to delete.")
+                return
             role_row = conn.execute(
                 "SELECT role FROM users WHERE user_id=?",
                 (int(uid),),
@@ -23954,14 +24054,14 @@ def users_admin_page(conn):
             st.caption("No staff accounts available.")
         else:
             staff_map = {
-                int(row["user_id"]): clean_text(row["username"]) or f"User #{int(row['user_id'])}"
+                int(row["user_id"]): clean_text(row["username"]) or "Staff member"
                 for _, row in staff_users.iterrows()
             }
             staff_choices = list(staff_map.keys())
             selected_staff = st.selectbox(
                 "Staff account",
                 staff_choices,
-                format_func=lambda val: staff_map.get(val, f"User #{val}"),
+                format_func=lambda val: staff_map.get(val, "Staff member"),
                 key="delete_staff_with_uploads_select",
             )
             confirm_delete = st.checkbox(
@@ -24483,7 +24583,7 @@ def delete_work_report(
     cadence_label = format_period_label(period_type)
     period_label = format_period_range(period_start, period_end)
     owner_text = owner_label or (
-        f"User #{int(owner_id)}" if owner_id is not None else "team member"
+        "Team member" if owner_id is not None else "team member"
     )
     description = (
         f"Deleted {template_label.lower()} {cadence_label.lower()} report for "
@@ -24818,7 +24918,7 @@ def upsert_work_report(
             owner_label = clean_text(owner_row[0])
     except sqlite3.Error:
         owner_label = None
-    actor = owner_label or f"User #{user_id}"
+    actor = owner_label or "Team member"
     event_type = "report_submitted" if created_new else "report_updated"
     verb = "submitted" if created_new else "updated"
     description = f"{actor} {verb} {cadence_label.lower()} report ({period_label})"
@@ -24855,6 +24955,7 @@ def manage_import_history(conn):
         SELECT ih.*, c.name AS live_customer_name, c.address AS live_address, c.phone AS live_phone,
                c.purchase_date AS live_purchase_date, c.product_info AS live_product_info,
                c.delivery_order_code AS live_do_code, c.delivery_address AS live_delivery_address,
+               c.company_name AS live_company,
                c.attachment_path AS live_attachment_path, c.created_by AS live_created_by
         FROM import_history ih
         LEFT JOIN customers c ON c.customer_id = ih.customer_id
@@ -24869,8 +24970,8 @@ def manage_import_history(conn):
         return
 
     display_cols = [
-        "import_id",
         "customer_name",
+        "live_company",
         "phone",
         "delivery_address",
         "product_label",
@@ -24882,8 +24983,8 @@ def manage_import_history(conn):
     display = display[display_cols]
     display.rename(
         columns={
-            "import_id": "ID",
             "customer_name": "Customer",
+            "live_company": "Company",
             "phone": "Phone",
             "delivery_address": "Delivery address",
             "product_label": "Product",
@@ -24901,7 +25002,7 @@ def manage_import_history(conn):
     for _, row in hist.iterrows():
         name = clean_text(row.get("customer_name")) or clean_text(row.get("live_customer_name")) or "(no name)"
         tag = clean_text(row.get("import_tag")) or "import"
-        label_map[int(row["import_id"])] = f"#{int(row['import_id'])} – {name} ({tag})"
+        label_map[int(row["import_id"])] = f"{name} ({tag})"
 
     selected_id = st.selectbox(
         "Select an import entry",
@@ -25050,20 +25151,20 @@ def reports_page(conn):
                 uid = int(row["user_id"])
             except Exception:
                 continue
-            username = clean_text(row.get("username")) or f"User #{uid}"
+            username = clean_text(row.get("username")) or "Team member"
             role_label = clean_text(row.get("role"))
             if role_label == "admin":
                 username = f"{username} (admin)"
             user_labels[uid] = username
     if viewer_id not in user_labels:
-        user_labels[viewer_id] = clean_text(user.get("username")) or f"User #{viewer_id}"
+        user_labels[viewer_id] = clean_text(user.get("username")) or "Team member"
 
     sorted_users = sorted(user_labels.items(), key=lambda item: item[1].lower())
     user_ids = [uid for uid, _ in sorted_users]
     label_map = {uid: label for uid, label in sorted_users}
     if not user_ids:
         user_ids = [viewer_id]
-        label_map[viewer_id] = clean_text(user.get("username")) or f"User #{viewer_id}"
+        label_map[viewer_id] = clean_text(user.get("username")) or "Team member"
 
     report_owner_id = viewer_id
     if not is_admin:
@@ -25162,7 +25263,7 @@ def reports_page(conn):
 
     def _format_report_choice(value):
         try:
-            return record_labels.get(int(value), f"Report #{int(value)}")
+            return record_labels.get(int(value), "Report")
         except Exception:
             return "Report"
 
@@ -25216,7 +25317,7 @@ def reports_page(conn):
             owner_id = int(_coerce_float(owner_seed, -1))
             if owner_id < 0:
                 owner_id = None
-        owner_label = label_map.get(owner_id, f"User #{owner_id}") if owner_id else None
+        owner_label = label_map.get(owner_id, "Team member") if owner_id else None
         can_delete = is_admin
         if can_delete:
             with st.expander("Delete report", expanded=False):
@@ -25803,7 +25904,7 @@ def reports_page(conn):
         def _history_label(uid: Optional[int]) -> str:
             if uid is None:
                 return "All team members"
-            return label_map.get(uid, f"User #{uid}")
+            return label_map.get(uid, "Team member")
 
         default_history_index = (
             history_options.index(report_owner_id)
@@ -25895,7 +25996,7 @@ def reports_page(conn):
 
     history_df["report_id"] = history_df["report_id"].apply(lambda val: int(float(val)))
     history_df["username"] = history_df.apply(
-        lambda row: clean_text(row.get("username")) or f"User #{int(row['user_id'])}",
+        lambda row: clean_text(row.get("username")) or "Team member",
         axis=1,
     )
 
@@ -25931,7 +26032,7 @@ def reports_page(conn):
     entry_records: list[dict[str, object]] = []
     download_records: list[dict[str, object]] = []
     for _, record in history_df.iterrows():
-        owner = record.get("username") or f"User #{int(record.get('user_id'))}"
+        owner = record.get("username") or "Team member"
         cadence_label = format_period_label(record.get("period_type"))
         period_label = format_period_range(
             record.get("period_start"), record.get("period_end")
