@@ -8374,6 +8374,7 @@ def init_ui():
         <style>
         :root {
             --ps-top-nav-height: 5.4rem;
+            --ps-top-ribbon-height: 3rem;
         }
         html,
         body,
@@ -8456,7 +8457,7 @@ def init_ui():
             width: 100%;
         }
         .ps-top-nav-spacer {
-            height: var(--ps-top-nav-height);
+            height: calc(var(--ps-top-nav-height) + var(--ps-top-ribbon-height));
         }
         .ps-top-nav-brand {
             display: inline-flex;
@@ -8510,6 +8511,42 @@ def init_ui():
             align-items: center;
             gap: 0.5rem;
         }
+        .ps-top-ribbon {
+            position: fixed;
+            top: var(--ps-top-nav-height);
+            left: 0;
+            right: 0;
+            z-index: 2050;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.85rem;
+            min-height: var(--ps-top-ribbon-height);
+            background: var(--ps-bg);
+            border-bottom: 1px solid var(--ps-panel-border);
+            padding: 0.25rem 0.75rem;
+        }
+        .ps-top-ribbon .ps-top-nav-menu-label {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--ps-muted);
+        }
+        .ps-top-ribbon [role="radiogroup"] {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem 0.85rem;
+            justify-content: center;
+        }
+        .ps-top-ribbon [data-testid="stRadio"] {
+            margin: 0 !important;
+        }
+        .ps-top-ribbon [data-testid="stRadio"] > div[role="radiogroup"] {
+            display: flex !important;
+            flex-direction: row !important;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.5rem 0.85rem;
+        }
         @media (max-width: 900px) {
             .ps-top-nav {
                 flex-wrap: wrap;
@@ -8525,6 +8562,12 @@ def init_ui():
             .ps-top-nav-actions {
                 width: 100%;
                 justify-content: flex-end;
+            }
+            .ps-top-ribbon {
+                display: none;
+            }
+            .ps-top-nav-spacer {
+                height: var(--ps-top-nav-height);
             }
         }
         </style>
@@ -26619,17 +26662,7 @@ def main():
                 unsafe_allow_html=True,
             )
     with nav_cols[1]:
-        st.markdown('<div class="ps-top-nav-links">', unsafe_allow_html=True)
-        st.markdown('<div class="ps-top-nav-menu-label">Menu</div>', unsafe_allow_html=True)
-        st.radio(
-            "Navigate",
-            pages,
-            key="nav_selection_top",
-            on_change=lambda: _sync_nav_choice("nav_selection_top"),
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('<div class="ps-top-nav-links"></div>', unsafe_allow_html=True)
     with nav_cols[2]:
         st.markdown('<div class="ps-top-nav-actions">', unsafe_allow_html=True)
         if hasattr(st, "popover"):
@@ -26657,6 +26690,17 @@ def main():
                     _request_logout()
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="ps-top-ribbon">', unsafe_allow_html=True)
+    st.markdown('<div class="ps-top-nav-menu-label">Menu</div>', unsafe_allow_html=True)
+    st.radio(
+        "Navigate",
+        pages,
+        key="nav_selection_top",
+        on_change=lambda: _sync_nav_choice("nav_selection_top"),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown('<div class="ps-top-nav-spacer"></div>', unsafe_allow_html=True)
 
