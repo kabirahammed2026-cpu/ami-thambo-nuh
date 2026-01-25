@@ -8456,6 +8456,17 @@ def init_ui():
             width: auto;
             display: block;
         }
+        .ps-top-nav-links {
+            display: flex;
+            align-items: center;
+            gap: 0.65rem;
+            justify-content: center;
+        }
+        .ps-top-nav-links .ps-top-nav-menu-label {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--ps-muted);
+        }
         .ps-top-nav-links [role="radiogroup"] {
             display: flex;
             flex-wrap: nowrap;
@@ -26569,6 +26580,7 @@ def main():
             )
     with nav_cols[1]:
         st.markdown('<div class="ps-top-nav-links">', unsafe_allow_html=True)
+        st.markdown('<div class="ps-top-nav-menu-label">Menu</div>', unsafe_allow_html=True)
         st.radio(
             "Navigate",
             pages,
@@ -26581,7 +26593,7 @@ def main():
     with nav_cols[2]:
         st.markdown('<div class="ps-top-nav-actions">', unsafe_allow_html=True)
         if hasattr(st, "popover"):
-            with st.popover("☰"):
+            with st.popover("☰ Menu"):
                 st.radio(
                     "Navigate",
                     pages,
