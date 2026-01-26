@@ -2167,6 +2167,7 @@ def _load_operations_customers(
                    address,
                    delivery_address,
                    sales_person,
+                   remarks,
                    created_at
             FROM customers
             {where_clause}
@@ -2187,6 +2188,7 @@ def _load_operations_customers(
         "sales_person",
         "address",
         "delivery_address",
+        "remarks",
     ]
     for col in display_columns:
         if col not in customers_df.columns:
@@ -5671,6 +5673,32 @@ def _render_file_action_links(
             "</div>"
         ),
         unsafe_allow_html=True,
+    )
+
+
+def _render_file_download_button(
+    container,
+    *,
+    path_value: Optional[str],
+    key: str,
+    label: str = "⬇️",
+) -> None:
+    if not path_value:
+        container.write("")
+        return
+    resolved = resolve_upload_path(path_value)
+    if not resolved or not resolved.exists():
+        container.caption("Missing")
+        return
+    payload = _safe_read_bytes(resolved)
+    if not payload:
+        container.caption("Unreadable")
+        return
+    container.download_button(
+        label,
+        data=payload,
+        file_name=resolved.name,
+        key=key,
     )
 
 
@@ -15454,6 +15482,7 @@ def operations_page(conn):
             "phone",
             "address",
             "delivery_address",
+            "remarks",
         ]:
             if col in display_customers.columns:
                 display_customers[col] = display_customers[col].map(
@@ -15462,14 +15491,24 @@ def operations_page(conn):
         customer_name = display_customers["name"].fillna("")
         company_name = display_customers["company_name"].fillna("")
         phone_value = display_customers["phone"].fillna("")
+        remarks_value = display_customers.get("remarks")
+        if remarks_value is None:
+            remarks_value = pd.Series([""] * len(display_customers), index=display_customers.index)
+        lead_status = remarks_value.map(
+            lambda value: _strip_lead_tag(value)
+            or ("Lead / chasing" if _is_lead_customer(value) else clean_text(value) or "")
+        )
         customer_display = customer_name.where(customer_name != "", company_name)
         customer_display = customer_display.where(customer_display != "", phone_value)
+        customer_display = customer_display.where(customer_display != "", lead_status)
         company_display = company_name.where(company_name != "", customer_name)
+        company_display = company_display.where(company_display != "", lead_status)
         table_df = pd.DataFrame(
             {
                 "Select": False,
                 "Customer": customer_display.fillna(""),
                 "Company": company_display.fillna(""),
+                "Lead status": lead_status.fillna(""),
                 "Phone": phone_value,
                 "Address": display_customers["address"].fillna(""),
                 "Delivery address": display_customers["delivery_address"].fillna(""),
@@ -22359,7 +22398,7 @@ def delivery_orders_page(
 
             do_df["total_amount"] = do_df["total_amount"].apply(_format_total_value)
         st.markdown(f"#### {record_label} records")
-        header_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.7, 1.2))
+        header_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.7, 0.9, 1.2))
         header_cols[0].write(f"**{number_label}**")
         header_cols[1].write("**Customer**")
         header_cols[2].write("**Description**")
@@ -22367,14 +22406,15 @@ def delivery_orders_page(
         header_cols[4].write("**Status**")
         header_cols[5].write("**Attachment**")
         header_cols[6].write("**Receipt**")
-        header_cols[7].write("**Upload receipt**")
+        header_cols[7].write("**Receipt download**")
+        header_cols[8].write("**Upload receipt**")
 
         for _, row in do_df.iterrows():
             do_number = clean_text(row.get("do_number"))
             if not do_number:
                 continue
             row_key = f"{record_type_key}_{do_number}"
-            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.7, 1.2))
+            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.7, 0.9, 1.2))
             is_highlight = highlight_target and do_number == highlight_target
             def _render_cell(col, value: str) -> None:
                 if is_highlight:
@@ -22401,7 +22441,12 @@ def delivery_orders_page(
                 row_cols[6],
                 path_value=receipt_path_value,
             )
-            upload_receipt = row_cols[7].file_uploader(
+            _render_file_download_button(
+                row_cols[7],
+                path_value=receipt_path_value,
+                key=f"do_row_receipt_download_{row_key}",
+            )
+            upload_receipt = row_cols[8].file_uploader(
                 "Upload receipt",
                 type=["pdf", "png", "jpg", "jpeg", "webp"],
                 label_visibility="collapsed",
@@ -22414,7 +22459,7 @@ def delivery_orders_page(
                     label=f"{record_label} row receipt OCR",
                 )
             save_label = f"💾 Save {record_label}"
-            save_doc = row_cols[7].button(
+            save_doc = row_cols[8].button(
                 save_label, type="secondary", key=f"do_row_save_{row_key}"
             )
             if _guard_double_submit(f"do_row_save_{row_key}", save_doc):
