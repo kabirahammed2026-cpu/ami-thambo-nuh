@@ -8373,7 +8373,7 @@ def init_ui():
         """
         <style>
         :root {
-            --ps-top-nav-height: 4.8rem;
+            --ps-top-nav-height: 4.25rem;
         }
         html,
         body,
@@ -8436,16 +8436,19 @@ def init_ui():
             right: 0;
             z-index: 9999;
             background: #fff;
-            padding: 0.4rem 1.5rem;
+            padding: 0 1rem;
             border-bottom: 1px solid var(--ps-panel-border);
             box-shadow: 0 0.35rem 0.75rem rgba(16, 24, 40, 0.06);
+            height: var(--ps-top-nav-height);
+            display: flex;
+            align-items: center;
         }
         .ps-top-nav {
             width: 100%;
             min-height: var(--ps-top-nav-height);
         }
         .ps-nav-row {
-            padding: 0.35rem 0;
+            padding: 0.1rem 0;
         }
         .ps-top-nav [data-testid="stHorizontalBlock"],
         .ps-nav-row [data-testid="stHorizontalBlock"] {
@@ -8469,13 +8472,13 @@ def init_ui():
         .ps-top-nav-brand {
             display: inline-flex;
             align-items: center;
-            gap: 0.4rem;
-            padding: 0.2rem 0.25rem;
+            gap: 0.35rem;
+            padding: 0.1rem 0.2rem;
             color: var(--ps-text);
             text-decoration: none;
         }
         .ps-top-nav-logo img {
-            height: clamp(18px, 2vw, 22px);
+            height: clamp(16px, 1.6vw, 20px);
             width: auto;
             display: block;
         }
@@ -8483,33 +8486,38 @@ def init_ui():
         .ps-nav-links {
             display: flex;
             align-items: center;
-            gap: 0.65rem;
+            gap: 0.5rem;
             justify-content: center;
-            min-height: calc(var(--ps-top-nav-height) - 0.6rem);
+            min-height: calc(var(--ps-top-nav-height) - 0.4rem);
         }
         .ps-top-nav-links .ps-top-nav-menu-label,
         .ps-nav-links .ps-top-nav-menu-label {
             font-size: 0.85rem;
             font-weight: 600;
             color: var(--ps-muted);
+            margin: 0;
         }
         .ps-top-nav-links [role="radiogroup"],
         .ps-nav-links [role="radiogroup"] {
             display: flex;
             flex-wrap: nowrap;
-            gap: 0.5rem 0.85rem;
+            gap: 0.35rem 0.65rem;
             justify-content: center;
             width: auto !important;
             overflow-x: auto;
             scrollbar-width: thin;
+            margin: 0;
+            padding: 0;
         }
         .ps-top-nav-links label,
         .ps-nav-links label {
             margin-right: 0 !important;
+            margin-bottom: 0 !important;
         }
         .ps-top-nav-links [data-testid="stRadio"],
         .ps-nav-links [data-testid="stRadio"] {
             margin: 0 !important;
+            padding: 0 !important;
         }
         .ps-top-nav-links [data-testid="stRadio"] > div[role="radiogroup"],
         .ps-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
@@ -8517,9 +8525,11 @@ def init_ui():
             flex-direction: row !important;
             flex-wrap: nowrap;
             align-items: center;
-            gap: 0.5rem 0.85rem;
+            gap: 0.35rem 0.65rem;
             overflow-x: auto;
             scrollbar-width: thin;
+            margin: 0;
+            padding: 0;
         }
         .ps-top-nav-actions,
         .ps-nav-actions {
@@ -8529,8 +8539,11 @@ def init_ui():
             gap: 0.5rem;
         }
         @media (max-width: 900px) {
+            :root {
+                --ps-top-nav-height: 3.75rem;
+            }
             .ps-nav-row {
-                gap: 0.35rem;
+                gap: 0.25rem;
             }
             .ps-nav-links {
                 justify-content: flex-start;
