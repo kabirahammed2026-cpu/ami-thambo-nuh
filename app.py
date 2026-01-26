@@ -8440,18 +8440,22 @@ def init_ui():
             border-bottom: 1px solid var(--ps-panel-border);
             box-shadow: 0 0.35rem 0.75rem rgba(16, 24, 40, 0.06);
             min-height: var(--ps-top-nav-height);
-            display: flex;
-            align-items: center;
         }
-        .ps-top-nav [data-testid="stHorizontalBlock"] {
+        .ps-nav-row {
+            padding: 0.2rem 0 0.35rem;
+        }
+        .ps-top-nav [data-testid="stHorizontalBlock"],
+        .ps-nav-row [data-testid="stHorizontalBlock"] {
             align-items: center;
             margin: 0;
         }
-        .ps-top-nav [data-testid="column"] {
+        .ps-top-nav [data-testid="column"],
+        .ps-nav-row [data-testid="column"] {
             display: flex;
             align-items: center;
         }
-        .ps-top-nav [data-testid="column"] > div {
+        .ps-top-nav [data-testid="column"] > div,
+        .ps-nav-row [data-testid="column"] > div {
             display: flex;
             align-items: center;
             width: 100%;
@@ -8472,7 +8476,8 @@ def init_ui():
             width: auto;
             display: block;
         }
-        .ps-top-nav-links {
+        .ps-top-nav-links,
+        .ps-nav-links {
             display: flex;
             align-items: center;
             gap: 0.65rem;
@@ -8480,49 +8485,54 @@ def init_ui():
             flex-wrap: wrap;
             min-height: calc(var(--ps-top-nav-height) - 0.6rem);
         }
-        .ps-top-nav-links .ps-top-nav-menu-label {
+        .ps-top-nav-links .ps-top-nav-menu-label,
+        .ps-nav-links .ps-top-nav-menu-label {
             font-size: 0.85rem;
             font-weight: 600;
             color: var(--ps-muted);
         }
-        .ps-top-nav-links [role="radiogroup"] {
+        .ps-top-nav-links [role="radiogroup"],
+        .ps-nav-links [role="radiogroup"] {
             display: flex;
             flex-wrap: wrap;
             gap: 0.5rem 0.85rem;
             justify-content: center;
             width: auto !important;
         }
-        .ps-top-nav-links label {
+        .ps-top-nav-links label,
+        .ps-nav-links label {
             margin-right: 0 !important;
         }
-        .ps-top-nav-links [data-testid="stRadio"] {
+        .ps-top-nav-links [data-testid="stRadio"],
+        .ps-nav-links [data-testid="stRadio"] {
             margin: 0 !important;
         }
-        .ps-top-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
+        .ps-top-nav-links [data-testid="stRadio"] > div[role="radiogroup"],
+        .ps-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
             display: flex !important;
             flex-direction: row !important;
             flex-wrap: wrap;
             align-items: center;
             gap: 0.5rem 0.85rem;
         }
-        .ps-top-nav-actions {
+        .ps-top-nav-actions,
+        .ps-nav-actions {
             display: flex;
             justify-content: flex-end;
             align-items: center;
             gap: 0.5rem;
         }
         @media (max-width: 900px) {
-            .ps-top-nav {
-                flex-wrap: wrap;
+            .ps-nav-row {
                 gap: 0.35rem;
             }
-            .ps-top-nav-links {
+            .ps-nav-links {
                 display: none;
             }
-            .ps-top-nav-links .ps-top-nav-menu-label {
+            .ps-nav-links .ps-top-nav-menu-label {
                 width: 100%;
             }
-            .ps-top-nav-actions {
+            .ps-nav-actions {
                 width: 100%;
                 justify-content: flex-end;
             }
@@ -26603,7 +26613,10 @@ def main():
         st.session_state["nav_selection_mobile"] = current_page
 
     nav_logo_uri = st.session_state.get("nav_logo_uri")
-    st.markdown('<div class="ps-top-nav">', unsafe_allow_html=True)
+    st.markdown('<div class="ps-top-nav"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="ps-top-nav-spacer"></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="ps-nav-row">', unsafe_allow_html=True)
     nav_cols = st.columns([2.2, 6.8, 1.4])
     with nav_cols[0]:
         if nav_logo_uri:
@@ -26622,7 +26635,7 @@ def main():
                 unsafe_allow_html=True,
             )
     with nav_cols[1]:
-        st.markdown('<div class="ps-top-nav-links">', unsafe_allow_html=True)
+        st.markdown('<div class="ps-nav-links">', unsafe_allow_html=True)
         st.markdown('<div class="ps-top-nav-menu-label">Menu</div>', unsafe_allow_html=True)
         st.radio(
             "Navigate",
@@ -26634,7 +26647,7 @@ def main():
         )
         st.markdown("</div>", unsafe_allow_html=True)
     with nav_cols[2]:
-        st.markdown('<div class="ps-top-nav-actions">', unsafe_allow_html=True)
+        st.markdown('<div class="ps-nav-actions">', unsafe_allow_html=True)
         if hasattr(st, "popover"):
             with st.popover("☰ Menu"):
                 st.radio(
@@ -26661,7 +26674,6 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown('<div class="ps-top-nav-spacer"></div>', unsafe_allow_html=True)
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
