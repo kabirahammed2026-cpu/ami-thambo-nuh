@@ -8373,7 +8373,7 @@ def init_ui():
         """
         <style>
         :root {
-            --ps-top-nav-height: 5.4rem;
+            --ps-top-nav-height: 4.8rem;
         }
         html,
         body,
@@ -8434,15 +8434,16 @@ def init_ui():
             top: 0;
             left: 0;
             right: 0;
-            z-index: 2100;
-            background: var(--ps-bg);
-            padding: 0.1rem 0 0.35rem;
+            width: 100%;
+            z-index: 9999;
+            background: #fff;
+            padding: 0;
             border-bottom: 1px solid var(--ps-panel-border);
             box-shadow: 0 0.35rem 0.75rem rgba(16, 24, 40, 0.06);
             min-height: var(--ps-top-nav-height);
         }
         .ps-nav-row {
-            padding: 0.2rem 0 0.35rem;
+            padding: 0.35rem 0;
         }
         .ps-top-nav [data-testid="stHorizontalBlock"],
         .ps-nav-row [data-testid="stHorizontalBlock"] {
@@ -26613,9 +26614,7 @@ def main():
         st.session_state["nav_selection_mobile"] = current_page
 
     nav_logo_uri = st.session_state.get("nav_logo_uri")
-    st.markdown('<div class="ps-top-nav"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="ps-top-nav-spacer"></div>', unsafe_allow_html=True)
-
+    st.markdown('<div class="ps-top-nav">', unsafe_allow_html=True)
     st.markdown('<div class="ps-nav-row">', unsafe_allow_html=True)
     nav_cols = st.columns([2.2, 6.8, 1.4])
     with nav_cols[0]:
@@ -26674,6 +26673,8 @@ def main():
                     st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="ps-top-nav-spacer"></div>', unsafe_allow_html=True)
 
     page = st.session_state.get("nav_page", pages[0])
     st.session_state.page = page
