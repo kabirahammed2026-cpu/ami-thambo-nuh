@@ -8429,17 +8429,19 @@ def init_ui():
             margin-top: 0 !important;
             max-width: 100% !important;
         }
-        .ps-top-nav {
+        [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] #ps_nav_anchor) {
             position: fixed;
             top: 0;
             left: 0;
             right: 0;
-            width: 100%;
             z-index: 9999;
             background: #fff;
-            padding: 0;
+            padding: 0.4rem 1.5rem;
             border-bottom: 1px solid var(--ps-panel-border);
             box-shadow: 0 0.35rem 0.75rem rgba(16, 24, 40, 0.06);
+        }
+        .ps-top-nav {
+            width: 100%;
             min-height: var(--ps-top-nav-height);
         }
         .ps-nav-row {
@@ -8483,7 +8485,6 @@ def init_ui():
             align-items: center;
             gap: 0.65rem;
             justify-content: center;
-            flex-wrap: wrap;
             min-height: calc(var(--ps-top-nav-height) - 0.6rem);
         }
         .ps-top-nav-links .ps-top-nav-menu-label,
@@ -8495,10 +8496,12 @@ def init_ui():
         .ps-top-nav-links [role="radiogroup"],
         .ps-nav-links [role="radiogroup"] {
             display: flex;
-            flex-wrap: wrap;
+            flex-wrap: nowrap;
             gap: 0.5rem 0.85rem;
             justify-content: center;
             width: auto !important;
+            overflow-x: auto;
+            scrollbar-width: thin;
         }
         .ps-top-nav-links label,
         .ps-nav-links label {
@@ -8512,9 +8515,11 @@ def init_ui():
         .ps-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
             display: flex !important;
             flex-direction: row !important;
-            flex-wrap: wrap;
+            flex-wrap: nowrap;
             align-items: center;
             gap: 0.5rem 0.85rem;
+            overflow-x: auto;
+            scrollbar-width: thin;
         }
         .ps-top-nav-actions,
         .ps-nav-actions {
@@ -8528,7 +8533,8 @@ def init_ui():
                 gap: 0.35rem;
             }
             .ps-nav-links {
-                display: none;
+                justify-content: flex-start;
+                overflow-x: auto;
             }
             .ps-nav-links .ps-top-nav-menu-label {
                 width: 100%;
@@ -8816,7 +8822,7 @@ def login_box(conn, *, render_id=None):
             background-color: transparent;
         }}
         section.main > div {{
-            padding-top: 6rem;
+            padding-top: var(--ps-top-nav-height);
         }}
         div[data-testid="stForm"] {{
             background: {panel_bg};
@@ -26614,66 +26620,69 @@ def main():
         st.session_state["nav_selection_mobile"] = current_page
 
     nav_logo_uri = st.session_state.get("nav_logo_uri")
-    st.markdown('<div class="ps-top-nav">', unsafe_allow_html=True)
-    st.markdown('<div class="ps-nav-row">', unsafe_allow_html=True)
-    nav_cols = st.columns([2.2, 6.8, 1.4])
-    with nav_cols[0]:
-        if nav_logo_uri:
-            st.markdown(
-                (
-                    '<div class="ps-top-nav-brand ps-top-nav-logo" '
-                    'aria-label="PS Engineering Business Suites">'
-                    f'<img src="{nav_logo_uri}" alt="PS Engineering Business Suites" />'
-                    "</div>"
-                ),
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                '<div class="ps-top-nav-brand">PS Engineering • Business Suites</div>',
-                unsafe_allow_html=True,
-            )
-    with nav_cols[1]:
-        st.markdown('<div class="ps-nav-links">', unsafe_allow_html=True)
-        st.markdown('<div class="ps-top-nav-menu-label">Menu</div>', unsafe_allow_html=True)
-        st.radio(
-            "Navigate",
-            pages,
-            key="nav_selection_top",
-            on_change=lambda: _sync_nav_choice("nav_selection_top"),
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-    with nav_cols[2]:
-        st.markdown('<div class="ps-nav-actions">', unsafe_allow_html=True)
-        if hasattr(st, "popover"):
-            with st.popover("☰ Menu"):
-                st.radio(
-                    "Navigate",
-                    pages,
-                    key="nav_selection_mobile",
-                    on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+    nav_container = st.container()
+    with nav_container:
+        st.markdown('<div id="ps_nav_anchor"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="ps-top-nav">', unsafe_allow_html=True)
+        st.markdown('<div class="ps-nav-row">', unsafe_allow_html=True)
+        nav_cols = st.columns([2.2, 6.8, 1.4])
+        with nav_cols[0]:
+            if nav_logo_uri:
+                st.markdown(
+                    (
+                        '<div class="ps-top-nav-brand ps-top-nav-logo" '
+                        'aria-label="PS Engineering Business Suites">'
+                        f'<img src="{nav_logo_uri}" alt="PS Engineering Business Suites" />'
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
                 )
-                if st.button("Logout", key="mobile_logout", use_container_width=True):
-                    _request_logout()
-                    st.rerun()
-        else:
-            with st.expander("☰ Menu", expanded=False):
-                st.radio(
-                    "Navigate",
-                    pages,
-                    key="nav_selection_mobile",
-                    on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+            else:
+                st.markdown(
+                    '<div class="ps-top-nav-brand">PS Engineering • Business Suites</div>',
+                    unsafe_allow_html=True,
                 )
-                if st.button(
-                    "Logout", key="mobile_logout_expander", use_container_width=True
-                ):
-                    _request_logout()
-                    st.rerun()
+        with nav_cols[1]:
+            st.markdown('<div class="ps-nav-links">', unsafe_allow_html=True)
+            st.markdown('<div class="ps-top-nav-menu-label">Menu</div>', unsafe_allow_html=True)
+            st.radio(
+                "Navigate",
+                pages,
+                key="nav_selection_top",
+                on_change=lambda: _sync_nav_choice("nav_selection_top"),
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+        with nav_cols[2]:
+            st.markdown('<div class="ps-nav-actions">', unsafe_allow_html=True)
+            if hasattr(st, "popover"):
+                with st.popover("☰ Menu"):
+                    st.radio(
+                        "Navigate",
+                        pages,
+                        key="nav_selection_mobile",
+                        on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+                    )
+                    if st.button("Logout", key="mobile_logout", use_container_width=True):
+                        _request_logout()
+                        st.rerun()
+            else:
+                with st.expander("☰ Menu", expanded=False):
+                    st.radio(
+                        "Navigate",
+                        pages,
+                        key="nav_selection_mobile",
+                        on_change=lambda: _sync_nav_choice("nav_selection_mobile"),
+                    )
+                    if st.button(
+                        "Logout", key="mobile_logout_expander", use_container_width=True
+                    ):
+                        _request_logout()
+                        st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     st.markdown('<div class="ps-top-nav-spacer"></div>', unsafe_allow_html=True)
 
     page = st.session_state.get("nav_page", pages[0])
