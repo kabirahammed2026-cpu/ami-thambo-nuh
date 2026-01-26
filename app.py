@@ -2191,7 +2191,7 @@ def _load_operations_customers(
     for col in display_columns:
         if col not in customers_df.columns:
             customers_df[col] = ""
-        customers_df[col] = customers_df[col].fillna("").astype(str)
+        customers_df[col] = customers_df[col].map(lambda value: clean_text(value) or "")
     return customers_df
 
 
@@ -2551,6 +2551,8 @@ def clean_text(value):
     except Exception:
         pass
     value = str(value).strip()
+    if value.lower() in {"none", "null", "nan"}:
+        return None
     return value or None
 
 
@@ -14155,12 +14157,6 @@ def render_operations_document_uploader(
                     help="Upload the delivery order PDF or image.",
                     disabled=not upload_enabled,
                 )
-                _apply_ocr_autofill(
-                    upload=do_file,
-                    ocr_key_prefix=f"{key_prefix}_do_file",
-                    doc_type="Delivery order",
-                    details_key_prefix=f"{key_prefix}_do_details",
-                )
                 do_details = _render_doc_detail_inputs(
                     "Delivery order",
                     key_prefix=f"{key_prefix}_do_details",
@@ -14199,12 +14195,6 @@ def render_operations_document_uploader(
                     key=f"{key_prefix}_work_done_file",
                     help="Upload completed work slips or PDFs.",
                     disabled=not upload_enabled,
-                )
-                _apply_ocr_autofill(
-                    upload=work_done_file,
-                    ocr_key_prefix=f"{key_prefix}_work_done_file",
-                    doc_type="Work done",
-                    details_key_prefix=f"{key_prefix}_work_done_details",
                 )
                 work_done_details = _render_doc_detail_inputs(
                     "Work done",
@@ -14247,12 +14237,6 @@ def render_operations_document_uploader(
                     help="Upload service documents.",
                     disabled=not upload_enabled,
                 )
-                _apply_ocr_autofill(
-                    upload=service_file,
-                    ocr_key_prefix=f"{key_prefix}_service_file",
-                    doc_type="Service",
-                    details_key_prefix=f"{key_prefix}_service_details",
-                )
                 service_details = _render_doc_detail_inputs(
                     "Service",
                     key_prefix=f"{key_prefix}_service_details",
@@ -14291,12 +14275,6 @@ def render_operations_document_uploader(
                     key=f"{key_prefix}_maintenance_file",
                     help="Upload maintenance documents.",
                     disabled=not upload_enabled,
-                )
-                _apply_ocr_autofill(
-                    upload=maintenance_file,
-                    ocr_key_prefix=f"{key_prefix}_maintenance_file",
-                    doc_type="Maintenance",
-                    details_key_prefix=f"{key_prefix}_maintenance_details",
                 )
                 maintenance_details = _render_doc_detail_inputs(
                     "Maintenance",
@@ -14338,12 +14316,6 @@ def render_operations_document_uploader(
                     key=f"{key_prefix}_other_file",
                     help="Upload any other operational documents.",
                     disabled=not upload_enabled,
-                )
-                _apply_ocr_autofill(
-                    upload=other_file,
-                    ocr_key_prefix=f"{key_prefix}_other_file",
-                    doc_type="Other",
-                    details_key_prefix=f"{key_prefix}_other_details",
                 )
                 other_details = _render_doc_detail_inputs(
                     "Other",
@@ -15357,14 +15329,26 @@ def operations_page(conn):
         st.info("No customers match that search.")
     else:
         customer_ids = customers_df["customer_id"].astype(int)
+        display_customers = customers_df.copy()
+        for col in [
+            "name",
+            "company_name",
+            "phone",
+            "address",
+            "delivery_address",
+        ]:
+            if col in display_customers.columns:
+                display_customers[col] = display_customers[col].map(
+                    lambda value: clean_text(value) or ""
+                )
         table_df = pd.DataFrame(
             {
                 "Select": False,
-                "Customer": customers_df["name"].fillna(""),
-                "Company": customers_df["company_name"].fillna(""),
-                "Phone": customers_df["phone"].fillna(""),
-                "Address": customers_df["address"].fillna(""),
-                "Delivery address": customers_df["delivery_address"].fillna(""),
+                "Customer": display_customers["name"].fillna(""),
+                "Company": display_customers["company_name"].fillna(""),
+                "Phone": display_customers["phone"].fillna(""),
+                "Address": display_customers["address"].fillna(""),
+                "Delivery address": display_customers["delivery_address"].fillna(""),
             },
             index=customer_ids,
         )
@@ -15469,6 +15453,7 @@ def operations_page(conn):
             record_type_label="Delivery order",
             record_type_key="delivery_order",
             highlight_record=deep_record if deep_tab == "delivery_orders" else None,
+            enable_receipt_ocr=False,
         )
     elif selected_tab == "Work done":
         st.markdown("### Work done")
@@ -15478,6 +15463,7 @@ def operations_page(conn):
             record_type_label="Work done",
             record_type_key="work_done",
             highlight_record=deep_record if deep_tab == "work_done" else None,
+            enable_receipt_ocr=False,
         )
     elif selected_tab == "Service":
         st.markdown("### Service records")
@@ -21637,6 +21623,7 @@ def delivery_orders_page(
     record_type_label: str = "Delivery order",
     record_type_key: str = "delivery_order",
     highlight_record: Optional[str] = None,
+    enable_receipt_ocr: bool = True,
 ):
     if show_heading:
         st.subheader("🚚 Delivery orders")
@@ -21856,11 +21843,12 @@ def delivery_orders_page(
                 key=f"{record_type_key}_receipt_upload",
                 help=receipt_help,
             )
-            _render_upload_ocr_preview(
-                receipt_upload,
-                key_prefix=f"{record_type_key}_receipt",
-                label=f"{record_label} receipt OCR",
-            )
+            if enable_receipt_ocr:
+                _render_upload_ocr_preview(
+                    receipt_upload,
+                    key_prefix=f"{record_type_key}_receipt",
+                    label=f"{record_label} receipt OCR",
+                )
             if current_receipt_path:
                 receipt_file = resolve_upload_path(current_receipt_path)
                 if receipt_file and receipt_file.exists():
@@ -21990,6 +21978,9 @@ def delivery_orders_page(
                         identifier=f"{receipt_identifier}_receipt",
                         target_dir=DELIVERY_RECEIPT_DIR,
                     )
+                    if not receipt_path:
+                        st.error("Receipt upload failed. Please use a PDF or image file.")
+                        return
                 if not receipt_path:
                     missing_label = "advance" if status_value == "advanced" else "full payment"
                     st.warning(
@@ -22288,11 +22279,12 @@ def delivery_orders_page(
                 label_visibility="collapsed",
                 key=f"do_row_receipt_upload_{row_key}",
             )
-            _render_upload_ocr_preview(
-                upload_receipt,
-                key_prefix=f"do_row_receipt_upload_{row_key}",
-                label=f"{record_label} row receipt OCR",
-            )
+            if enable_receipt_ocr:
+                _render_upload_ocr_preview(
+                    upload_receipt,
+                    key_prefix=f"do_row_receipt_upload_{row_key}",
+                    label=f"{record_label} row receipt OCR",
+                )
             save_label = f"💾 Save {record_label}"
             save_doc = row_cols[7].button(
                 save_label, type="secondary", key=f"do_row_save_{row_key}"
@@ -22309,6 +22301,9 @@ def delivery_orders_page(
                             identifier=f"{receipt_identifier}_receipt",
                             target_dir=DELIVERY_RECEIPT_DIR,
                         )
+                        if not receipt_path:
+                            st.error("Receipt upload failed. Please use a PDF or image file.")
+                            continue
                         updates["payment_receipt_path"] = receipt_path
                     if updates:
                         set_clause = ", ".join(f"{col}=?" for col in updates)
@@ -23859,6 +23854,24 @@ def import_page(conn):
         df = pd.read_csv(f)
     else:
         df = pd.read_excel(f)
+    serial_headers = {
+        "sl",
+        "sl.",
+        "s/l",
+        "s/l.",
+        "serial",
+        "serial no",
+        "serial no.",
+        "serial number",
+        "sl no",
+        "sl no.",
+    }
+    for col in list(df.columns):
+        header = str(col).strip().lower()
+        if header in serial_headers:
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            if numeric.notna().mean() >= 0.9:
+                df = df.drop(columns=[col])
     st.write("Preview:", df.head())
 
     guess = map_headers_guess(list(df.columns))
@@ -27319,11 +27332,8 @@ def main():
     user = st.session_state.user or {}
     role = user.get("role")
     health_warnings = st.session_state.get("health_warnings") or []
-    if role == "admin" and health_warnings:
-        with st.expander("System health checks", expanded=False):
-            for warning in health_warnings:
-                st.warning(warning)
     if role == "admin":
+        # Health warnings are collected for diagnostics only; no admin panel is shown here.
         pages = [
             "Dashboard",
             "Customers",
