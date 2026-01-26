@@ -7,4 +7,5 @@ reportlab>=3.6
 pillow
 pypdf
 pytesseract
+pdfplumber
 dateparser

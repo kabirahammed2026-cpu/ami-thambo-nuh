@@ -2148,7 +2148,7 @@ def _load_operations_customers(
     db_path: str,
     where_clause: str,
     params: tuple,
-    version: int,
+    version: object,
 ) -> pd.DataFrame:
     conn = sqlite3.connect(db_path)
     try:
@@ -2170,6 +2170,20 @@ def _load_operations_customers(
         )
     finally:
         conn.close()
+
+
+def _refresh_customer_caches() -> None:
+    try:
+        _load_operations_customers.clear()
+    except Exception:
+        pass
+    try:
+        _load_customer_group_rows.clear()
+    except Exception:
+        pass
+    st.session_state.pop("operations_customer_table_state", None)
+    st.session_state.pop("operations_customer_table", None)
+    st.session_state["customers_updated_at"] = datetime.utcnow().isoformat()
 
 def fmt_dates(df: pd.DataFrame, cols):
     df = df.copy()
@@ -2507,14 +2521,20 @@ def clean_text(value):
     return value or None
 
 
-def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
+def _extract_text_from_quotation_bytes(
+    file_bytes: bytes,
+    suffix: str,
+    *,
+    ocr_all_pages: bool = False,
+    skip_ocr: bool = False,
+    strong_ocr: bool = False,
+    ocr_dpi: int = 180,
+) -> tuple[str, list[str]]:
     """Return extracted text and warnings from an uploaded quotation file."""
 
     warnings: list[str] = []
     text_content = ""
     table_hints: list[str] = []
-    suffix = Path(upload.name).suffix.lower()
-    file_bytes = upload.getvalue()
 
     def _ensure_ocr_engine_available() -> bool:
         global _OCR_ENGINE_AVAILABLE
@@ -2537,7 +2557,7 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
             _OCR_ENGINE_AVAILABLE = False
             return False
 
-    def _ocr_image(image: Image.Image) -> str:
+    def _ocr_image(image: Image.Image, *, strong_ocr: bool) -> str:
         if not _ensure_ocr_engine_available():
             return ""
 
@@ -2546,22 +2566,29 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
             boosted = ImageOps.autocontrast(grayscale)
             boosted = ImageEnhance.Contrast(boosted).enhance(1.8)
             boosted = ImageEnhance.Sharpness(boosted).enhance(1.2)
-            configs = [
-                "--oem 3 --psm 6 -c preserve_interword_spaces=1",
-                "--oem 3 --psm 4 -c preserve_interword_spaces=1",
-                "--oem 3 --psm 11",
-            ]
+            base_config = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
+            configs = (
+                [
+                    base_config,
+                    "--oem 3 --psm 4 -c preserve_interword_spaces=1",
+                    "--oem 3 --psm 11",
+                ]
+                if strong_ocr
+                else [base_config]
+            )
             results = [
                 pytesseract.image_to_string(boosted, config=config) for config in configs
             ]
             primary_text = max(results, key=lambda value: len(value.strip())) if results else ""
+            if not strong_ocr:
+                return primary_text
             if len(primary_text.strip()) >= 12:
                 return primary_text
 
             inverted = ImageOps.invert(grayscale)
             inverted = ImageEnhance.Contrast(inverted).enhance(1.6)
             alt_text = pytesseract.image_to_string(
-                inverted, config="--oem 3 --psm 6 -c preserve_interword_spaces=1"
+                inverted, config=base_config
             )
             return alt_text if len(alt_text.strip()) > len(primary_text.strip()) else primary_text
         except pytesseract.TesseractNotFoundError:
@@ -2628,75 +2655,161 @@ def _extract_text_from_quotation_upload(upload) -> tuple[str, list[str]]:
                 table_lines.append(row_text)
         return table_lines
 
-    def _ocr_image_with_tables(image: Image.Image) -> tuple[str, list[str]]:
-        text = _ocr_image(image)
-        table_lines = _extract_table_lines(image)
+    def _ocr_image_with_tables(image: Image.Image, *, strong_ocr: bool) -> tuple[str, list[str]]:
+        text = _ocr_image(image, strong_ocr=strong_ocr)
+        table_lines = _extract_table_lines(image) if strong_ocr else []
         return text, table_lines
 
+    def _fast_pdf_text(max_pages: int) -> tuple[str, Optional[int]]:
+        text_pages: list[str] = []
+        page_count = None
+        try:
+            import pdfplumber
+
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                page_count = len(pdf.pages)
+                last_page = min(page_count, max_pages)
+                for idx in range(last_page):
+                    page = pdf.pages[idx]
+                    text_pages.append(page.extract_text() or "")
+        except Exception as exc:  # pragma: no cover - optional dependency
+            warnings.append(f"Fast PDF text extraction failed: {exc}")
+        return "\n".join(text_pages).strip(), page_count
+
     if suffix == ".pdf":
+        max_pages = 9999 if ocr_all_pages else 1
+        text_content, page_count = _fast_pdf_text(max_pages)
+        if text_content.strip():
+            return text_content, warnings
+        if skip_ocr:
+            warnings.append("OCR skipped. No readable text was found in the uploaded PDF.")
+            return "", warnings
+
+        if page_count is None:
+            try:
+                reader = PdfReader(io.BytesIO(file_bytes))
+                page_count = len(reader.pages)
+            except Exception:
+                page_count = 1
+        last_page = page_count if ocr_all_pages else min(page_count, 1)
         pages: list[str] = []
         try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            for page in reader.pages:
-                try:
-                    text_block = page.extract_text() or ""
-                except Exception:
-                    text_block = ""
-                image_ocr: list[str] = []
-                for image_file in getattr(page, "images", []):
-                    try:
-                        pil_image = Image.open(io.BytesIO(image_file.data))
-                        image_text, table_rows = _ocr_image_with_tables(pil_image)
-                        if image_text:
-                            image_ocr.append(image_text)
-                        table_hints.extend(table_rows)
-                    except Exception:
-                        continue
-                if image_ocr:
-                    text_block = "\n".join([text_block, *image_ocr]).strip()
-                pages.append(text_block)
-            text_content = "\n".join(pages)
-            if not text_content.strip():
-                warnings.append("No readable text found in the uploaded PDF.")
-        except Exception as exc:  # pragma: no cover - defensive against damaged uploads
-            warnings.append(f"Could not read PDF: {exc}")
-        if len(text_content.strip()) < 80:
-            try:
-                from pdf2image import convert_from_bytes
+            from pdf2image import convert_from_bytes
 
-                last_page = max(1, min(3, len(pages) or 3))
-                raster_pages = convert_from_bytes(
-                    file_bytes, dpi=300, first_page=1, last_page=last_page
+            raster_pages = convert_from_bytes(
+                file_bytes, dpi=ocr_dpi, first_page=1, last_page=last_page
+            )
+            for image in raster_pages:
+                image_text, table_rows = _ocr_image_with_tables(
+                    image, strong_ocr=strong_ocr
                 )
-                extra_ocr = []
-                for image in raster_pages:
-                    image_text, table_rows = _ocr_image_with_tables(image)
-                    if image_text:
-                        extra_ocr.append(image_text)
-                    table_hints.extend(table_rows)
-                combined = "\n".join([text_content, *extra_ocr]).strip()
-                if combined:
-                    text_content = combined
-            except Exception as exc:  # pragma: no cover - optional dependency
-                warnings.append(
-                    "Add pdf2image with poppler to strengthen OCR for scanned PDFs"
-                )
-                if str(exc).strip():
-                    warnings.append(f"OCR raster fallback failed: {exc}")
+                if image_text:
+                    pages.append(image_text)
+                table_hints.extend(table_rows)
+        except Exception as exc:  # pragma: no cover - optional dependency
+            warnings.append("Add pdf2image with poppler to strengthen OCR for scanned PDFs")
+            if str(exc).strip():
+                warnings.append(f"OCR raster fallback failed: {exc}")
+
+        if not pages:
+            try:
+                reader = PdfReader(io.BytesIO(file_bytes))
+                for page in reader.pages[:last_page]:
+                    image_ocr: list[str] = []
+                    for image_file in getattr(page, "images", []):
+                        try:
+                            pil_image = Image.open(io.BytesIO(image_file.data))
+                            image_text, table_rows = _ocr_image_with_tables(
+                                pil_image, strong_ocr=strong_ocr
+                            )
+                            if image_text:
+                                image_ocr.append(image_text)
+                            table_hints.extend(table_rows)
+                        except Exception:
+                            continue
+                    if image_ocr:
+                        pages.append("\n".join(image_ocr).strip())
+            except Exception as exc:  # pragma: no cover - defensive against damaged uploads
+                warnings.append(f"Could not read PDF: {exc}")
+        text_content = "\n".join(pages).strip()
+        if not text_content:
+            warnings.append("No readable text found in the uploaded PDF.")
     else:
+        if skip_ocr:
+            warnings.append("OCR skipped for the uploaded image.")
+            return "", warnings
         try:
             image = Image.open(io.BytesIO(file_bytes))
         except Exception as exc:  # pragma: no cover - defensive against damaged uploads
             warnings.append(f"Could not open the uploaded image: {exc}")
             return "", warnings
 
-        text_content, table_lines = _ocr_image_with_tables(image)
+        text_content, table_lines = _ocr_image_with_tables(
+            image, strong_ocr=strong_ocr
+        )
         table_hints.extend(table_lines)
 
     if table_hints:
         text_content = "\n".join([text_content, *table_hints]).strip()
 
     return text_content, warnings
+
+
+@st.cache_data(show_spinner=False)
+def _cached_quotation_text_extraction(
+    file_hash: str,
+    suffix: str,
+    file_bytes: bytes,
+    *,
+    ocr_all_pages: bool,
+    skip_ocr: bool,
+    strong_ocr: bool,
+    ocr_dpi: int,
+) -> tuple[str, list[str]]:
+    return _extract_text_from_quotation_bytes(
+        file_bytes,
+        suffix,
+        ocr_all_pages=ocr_all_pages,
+        skip_ocr=skip_ocr,
+        strong_ocr=strong_ocr,
+        ocr_dpi=ocr_dpi,
+    )
+
+
+def _extract_text_from_quotation_upload(
+    upload,
+    *,
+    ocr_all_pages: bool = False,
+    skip_ocr: bool = False,
+    strong_ocr: bool = False,
+    ocr_dpi: int = 180,
+    use_cache: bool = True,
+) -> tuple[str, list[str]]:
+    """Return extracted text and warnings from an uploaded quotation file."""
+
+    if upload is None:
+        return "", []
+    suffix = Path(upload.name).suffix.lower()
+    file_bytes = upload.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    if use_cache:
+        return _cached_quotation_text_extraction(
+            file_hash,
+            suffix,
+            file_bytes,
+            ocr_all_pages=ocr_all_pages,
+            skip_ocr=skip_ocr,
+            strong_ocr=strong_ocr,
+            ocr_dpi=ocr_dpi,
+        )
+    return _extract_text_from_quotation_bytes(
+        file_bytes,
+        suffix,
+        ocr_all_pages=ocr_all_pages,
+        skip_ocr=skip_ocr,
+        strong_ocr=strong_ocr,
+        ocr_dpi=ocr_dpi,
+    )
 
 
 OCR_UPLOAD_SUFFIXES = {
@@ -2718,19 +2831,37 @@ def _ocr_uploads_enabled() -> bool:
     return bool(st.session_state.get("ocr_uploads_enabled", True))
 
 
-def _run_upload_ocr(upload, *, key_prefix: str) -> tuple[str, list[str]]:
+def _run_upload_ocr(
+    upload,
+    *,
+    key_prefix: str,
+    ocr_all_pages: bool = False,
+    skip_ocr: bool = False,
+    strong_ocr: bool = False,
+    ocr_dpi: int = 180,
+) -> tuple[str, list[str]]:
     if upload is None or not _ocr_uploads_enabled():
         return "", []
     suffix = Path(upload.name).suffix.lower() if getattr(upload, "name", None) else ""
     if suffix not in OCR_UPLOAD_SUFFIXES:
         return "", []
-    token = f"{getattr(upload, 'name', '')}:{getattr(upload, 'size', '')}"
+    file_bytes = upload.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    token = f"{file_hash}:{ocr_all_pages}:{skip_ocr}:{strong_ocr}:{ocr_dpi}"
     token_key = f"{key_prefix}_ocr_token"
     text_key = f"{key_prefix}_ocr_text"
     warnings_key = f"{key_prefix}_ocr_warnings"
     if st.session_state.get(token_key) != token:
         with st.spinner("Reading document for OCR auto-fill..."):
-            text_content, warnings = _extract_text_from_quotation_upload(upload)
+            text_content, warnings = _cached_quotation_text_extraction(
+                file_hash,
+                suffix,
+                file_bytes,
+                ocr_all_pages=ocr_all_pages,
+                skip_ocr=skip_ocr,
+                strong_ocr=strong_ocr,
+                ocr_dpi=ocr_dpi,
+            )
         st.session_state[token_key] = token
         st.session_state[text_key] = text_content
         st.session_state[warnings_key] = warnings
@@ -8373,7 +8504,7 @@ def init_ui():
         """
         <style>
         :root {
-            --ps-top-nav-height: 3.2rem;
+            --ps-top-nav-height: 3.25rem;
         }
         html,
         body,
@@ -8441,7 +8572,7 @@ def init_ui():
             box-shadow: 0 0.25rem 0.5rem rgba(16, 24, 40, 0.08);
             height: var(--ps-top-nav-height);
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             gap: 0;
             margin: 0 !important;
         }
@@ -8454,7 +8585,7 @@ def init_ui():
             width: 100%;
             height: var(--ps-top-nav-height);
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             padding: 0;
             margin: 0;
         }
@@ -8465,7 +8596,7 @@ def init_ui():
         }
         .ps-top-nav [data-testid="stHorizontalBlock"],
         .ps-nav-row [data-testid="stHorizontalBlock"] {
-            align-items: flex-start;
+            align-items: center;
             margin: 0 !important;
             padding: 0 !important;
             gap: 0;
@@ -8473,14 +8604,14 @@ def init_ui():
         .ps-top-nav [data-testid="column"],
         .ps-nav-row [data-testid="column"] {
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             margin: 0 !important;
             padding: 0 !important;
         }
         .ps-top-nav [data-testid="column"] > div,
         .ps-nav-row [data-testid="column"] > div {
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             width: 100%;
             margin: 0 !important;
             padding: 0 !important;
@@ -8491,7 +8622,7 @@ def init_ui():
         .ps-top-nav-links,
         .ps-nav-links {
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             gap: 0;
             justify-content: center;
             min-height: 0;
@@ -8500,6 +8631,7 @@ def init_ui():
             padding: 0 !important;
             background: #fff !important;
             position: relative;
+            z-index: 9999;
         }
         .ps-top-nav-links .ps-top-nav-menu-label,
         .ps-nav-links .ps-top-nav-menu-label {
@@ -8522,6 +8654,7 @@ def init_ui():
             background: #fff !important;
             position: relative;
             line-height: normal;
+            z-index: 9999;
         }
         .ps-top-nav-links label,
         .ps-nav-links label {
@@ -8534,13 +8667,14 @@ def init_ui():
             padding: 0 !important;
             background: #fff !important;
             position: relative;
+            z-index: 9999;
         }
         .ps-top-nav-links [data-testid="stRadio"] > div[role="radiogroup"],
         .ps-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
             display: flex !important;
             flex-direction: row !important;
             flex-wrap: nowrap;
-            align-items: flex-start;
+            align-items: center;
             gap: 0.35rem 0.65rem;
             overflow-x: auto;
             scrollbar-width: thin;
@@ -8549,6 +8683,7 @@ def init_ui():
             background: #fff !important;
             position: relative;
             line-height: normal;
+            z-index: 9999;
         }
         .ps-top-nav-actions,
         .ps-nav-actions {
@@ -8559,7 +8694,7 @@ def init_ui():
         }
         @media (max-width: 900px) {
             :root {
-                --ps-top-nav-height: 3rem;
+                --ps-top-nav-height: 3.125rem;
             }
             .ps-nav-row {
                 gap: 0.25rem;
@@ -14954,7 +15089,8 @@ def operations_page(conn):
         where_parts.append(scope_clause)
         params.extend(scope_params)
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    version = get_data_version(conn, "customers")
+    customers_version = get_data_version(conn, "customers")
+    version = (customers_version, st.session_state.get("customers_updated_at"))
     customers_df = _load_operations_customers(
         DB_PATH,
         where_clause,
@@ -16023,6 +16159,7 @@ def customers_page(conn):
                     entity_type="customer",
                     entity_id=int(cid),
                 )
+                _refresh_customer_caches()
                 _reset_new_customer_form_state()
                 st.session_state["new_customer_feedback"] = (
                     "success",
@@ -18888,6 +19025,30 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     st.caption(
         "Upload a quotation (PDF, DOCX, or TXT) to detect customer info, contact details, and line items automatically."
     )
+    ocr_cols = st.columns(3)
+    with ocr_cols[0]:
+        skip_ocr = st.checkbox(
+            "Skip OCR",
+            value=bool(st.session_state.get("quotation_prefill_skip_ocr", False)),
+            key="quotation_prefill_skip_ocr",
+            help="Skip OCR entirely and rely on embedded PDF text only.",
+        )
+    with ocr_cols[1]:
+        ocr_all_pages = st.checkbox(
+            "OCR all pages (slow)",
+            value=bool(st.session_state.get("quotation_prefill_ocr_all_pages", False)),
+            key="quotation_prefill_ocr_all_pages",
+            help="Defaults to page 1 only. Enable this if your quotation has data on every page.",
+        )
+    with ocr_cols[2]:
+        strong_ocr = bool(st.session_state.get("quotation_prefill_strong_ocr", False))
+        toggle_label = "Use standard OCR" if strong_ocr else "Stronger OCR (slow)"
+        if st.button(toggle_label, key="quotation_prefill_strong_ocr_toggle"):
+            strong_ocr = not strong_ocr
+            st.session_state["quotation_prefill_strong_ocr"] = strong_ocr
+        if strong_ocr:
+            st.caption("Stronger OCR enabled for the next scan.")
+    ocr_dpi = 180
     prefill_upload = st.file_uploader(
         "Quotation file",
         type=["pdf", "doc", "docx", "txt"],
@@ -18895,9 +19056,25 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     )
 
     if prefill_upload:
-        prefill_token = f"{prefill_upload.name}:{prefill_upload.size}"
+        file_bytes = prefill_upload.getvalue()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        suffix = Path(prefill_upload.name).suffix.lower()
+        prefill_token = f"{file_hash}:{ocr_all_pages}:{skip_ocr}:{strong_ocr}:{ocr_dpi}"
         if st.session_state.get("quotation_prefill_token") != prefill_token:
-            text, warnings = _extract_text_from_quotation_upload(prefill_upload)
+            progress = st.progress(0, text="Preparing quotation auto-fill...")
+            progress.progress(30, text="Extracting text from the upload...")
+            text, warnings = _cached_quotation_text_extraction(
+                file_hash,
+                suffix,
+                file_bytes,
+                ocr_all_pages=ocr_all_pages,
+                skip_ocr=skip_ocr,
+                strong_ocr=strong_ocr,
+                ocr_dpi=ocr_dpi,
+            )
+            progress.progress(90, text="Applying auto-fill details...")
+            progress.progress(100, text="Auto-fill ready.")
+            progress.empty()
             for warning in warnings:
                 st.warning(warning)
             saved_prefill = save_uploaded_file(
