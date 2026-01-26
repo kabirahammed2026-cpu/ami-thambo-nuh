@@ -8504,7 +8504,7 @@ def init_ui():
         """
         <style>
         :root {
-            --psNavH: 64px;
+            --psNavH: 72px;
             --ps-top-nav-height: var(--psNavH);
         }
         html,
@@ -8568,10 +8568,11 @@ def init_ui():
             right: 0;
             z-index: 9999;
             background: #fff !important;
-            padding: 0 1rem;
+            padding: 12px 16px;
             border-bottom: 1px solid var(--ps-panel-border);
             box-shadow: 0 0.25rem 0.5rem rgba(16, 24, 40, 0.08);
-            height: var(--psNavH);
+            height: auto;
+            min-height: calc(var(--psNavH) - 24px);
             display: flex;
             align-items: center;
             gap: 0;
@@ -8585,7 +8586,8 @@ def init_ui():
         }
         .ps-top-nav {
             width: 100%;
-            height: var(--psNavH);
+            height: auto;
+            min-height: calc(var(--psNavH) - 24px);
             display: flex;
             align-items: center;
             padding: 0;
@@ -8595,6 +8597,8 @@ def init_ui():
             width: 100%;
             margin: 0;
             padding: 0;
+            position: static;
+            top: auto;
         }
         .ps-top-nav [data-testid="stHorizontalBlock"],
         .ps-nav-row [data-testid="stHorizontalBlock"] {
@@ -8632,7 +8636,7 @@ def init_ui():
             margin: 0 !important;
             padding: 0 !important;
             background: #fff !important;
-            position: relative;
+            position: static;
             z-index: 9999;
             overflow: visible;
         }
@@ -8657,7 +8661,7 @@ def init_ui():
             margin: 0 !important;
             padding: 0 !important;
             background: #fff !important;
-            position: relative;
+            position: static;
             line-height: 1.1;
             z-index: 9999;
         }
@@ -8673,7 +8677,7 @@ def init_ui():
             margin: 0 !important;
             padding: 0 !important;
             background: #fff !important;
-            position: relative;
+            position: static;
             z-index: 9999;
             line-height: 1.1;
         }
@@ -8695,7 +8699,7 @@ def init_ui():
             margin: 0 !important;
             padding: 0 !important;
             background: #fff !important;
-            position: relative;
+            position: static;
             line-height: 1.1;
             z-index: 9999;
         }
