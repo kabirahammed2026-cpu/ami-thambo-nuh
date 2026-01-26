@@ -2214,6 +2214,26 @@ def _mark_data_changed(*keys: str) -> None:
     for key in keys:
         if not key:
             continue
+        version_conn = None
+        try:
+            version_conn = sqlite3.connect(DB_PATH)
+            version_conn.execute(
+                "INSERT OR IGNORE INTO data_versions (key, version) VALUES (?, 0)",
+                (key,),
+            )
+            version_conn.execute(
+                "UPDATE data_versions SET version = version + 1, updated_at=datetime('now') WHERE key=?",
+                (key,),
+            )
+            version_conn.commit()
+        except Exception:
+            pass
+        finally:
+            if version_conn is not None:
+                try:
+                    version_conn.close()
+                except Exception:
+                    pass
         st.session_state[f"data_version_{key}"] = timestamp
         if key == "customers":
             _refresh_customer_caches()
@@ -9917,6 +9937,67 @@ def dashboard(conn):
             )
             st.metric("Expired", expired_count)
 
+        st.markdown("#### Warranty follow-ups")
+        warranty_followups = df_query(
+            conn,
+            """
+            SELECT w.warranty_id,
+                   w.follow_up_date,
+                   c.name AS customer,
+                   c.company_name AS company,
+                   p.name AS product,
+                   p.model,
+                   w.serial
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            LEFT JOIN products p ON p.product_id = w.product_id
+            WHERE w.follow_up_date IS NOT NULL
+              AND COALESCE(w.status, 'active') NOT IN ('deleted', 'completed')
+            ORDER BY date(w.follow_up_date) ASC, w.warranty_id ASC
+            LIMIT 20
+            """,
+            )
+        if warranty_followups.empty:
+            st.info("No warranty follow-ups scheduled yet.")
+        else:
+            st.caption("View-only summary of upcoming warranty follow-ups.")
+            warranty_followups = fmt_dates(warranty_followups, ["follow_up_date"])
+            warranty_followups["Customer"] = warranty_followups["customer"].apply(
+                lambda value: clean_text(value) or "(customer)"
+            )
+            warranty_followups["Company"] = warranty_followups["company"].apply(
+                lambda value: clean_text(value) or ""
+            )
+            warranty_followups["Product"] = warranty_followups.apply(
+                lambda row: " ".join(
+                    part
+                    for part in [
+                        clean_text(row.get("product")),
+                        clean_text(row.get("model")),
+                    ]
+                    if part
+                ),
+                axis=1,
+            )
+            warranty_followups["Serial"] = warranty_followups["serial"].apply(
+                lambda value: clean_text(value) or ""
+            )
+            warranty_followups["Follow-up"] = warranty_followups["follow_up_date"]
+            st.dataframe(
+                warranty_followups[
+                    [
+                        "warranty_id",
+                        "Customer",
+                        "Company",
+                        "Product",
+                        "Serial",
+                        "Follow-up",
+                    ]
+                ].rename(columns={"warranty_id": "Warranty #"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
         st.markdown("#### Sales performance")
         sales_cols = st.columns(3)
         sales_cols[0].metric("Daily sales", format_sales_amount(sales_metrics["daily"]))
@@ -13663,6 +13744,17 @@ def _save_customer_document_upload(
                 receipt_path,
             ),
         )
+        event_type = (
+            "work_done_created" if doc_type == "Work done" else "delivery_order_created"
+        )
+        log_activity(
+            conn,
+            event_type=event_type,
+            description=f"{doc_type} {do_number} uploaded for customer #{customer_id}",
+            entity_type="work_done" if doc_type == "Work done" else "delivery_order",
+            entity_id=None,
+            user_id=uploader_id,
+        )
     elif doc_type == "Service":
         items_clean, total_amount = normalize_simple_items(details.get("items") or [])
         if items_clean:
@@ -13720,6 +13812,14 @@ def _save_customer_document_upload(
                 upload_meta.get("file_size"),
                 upload_meta.get("mime_type"),
             ),
+        )
+        log_activity(
+            conn,
+            event_type="service_created",
+            description=f"Service uploaded for customer #{customer_id}",
+            entity_type="service",
+            entity_id=int(service_id) if service_id else None,
+            user_id=uploader_id,
         )
     elif doc_type == "Maintenance":
         items_clean, total_amount = normalize_simple_items(details.get("items") or [])
@@ -13779,10 +13879,18 @@ def _save_customer_document_upload(
                 upload_meta.get("mime_type"),
             ),
         )
+        log_activity(
+            conn,
+            event_type="maintenance_created",
+            description=f"Maintenance uploaded for customer #{customer_id}",
+            entity_type="maintenance",
+            entity_id=int(maintenance_id) if maintenance_id else None,
+            user_id=uploader_id,
+        )
     elif doc_type == "Other":
         items_clean = details.get("items") or []
         items_payload = json.dumps(items_clean, ensure_ascii=False) if items_clean else None
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO operations_other_documents (
                 customer_id, description, items_payload, file_path, original_name, uploaded_by, file_size, mime_type
@@ -13798,6 +13906,15 @@ def _save_customer_document_upload(
                 upload_meta.get("file_size"),
                 upload_meta.get("mime_type"),
             ),
+        )
+        other_id = cur.lastrowid
+        log_activity(
+            conn,
+            event_type="operations_other_created",
+            description=f"Other upload saved for customer #{customer_id}",
+            entity_type="operations_other",
+            entity_id=int(other_id) if other_id else None,
+            user_id=uploader_id,
         )
 
     if new_product_labels:
@@ -22359,6 +22476,13 @@ def delivery_orders_page(
             for _, row in do_df.iterrows()
             if clean_text(row.get("file_path"))
         }
+    receipt_downloads = {}
+    if not do_df.empty:
+        receipt_downloads = {
+            clean_text(row["do_number"]): clean_text(row.get("payment_receipt_path"))
+            for _, row in do_df.iterrows()
+            if clean_text(row.get("payment_receipt_path"))
+        }
     if downloads:
         st.markdown(f"#### Download {record_label.lower()}")
         selected_download = st.selectbox(
@@ -22381,7 +22505,29 @@ def delivery_orders_page(
                 st.warning("Unable to read the selected file.", icon="⚠️")
         else:
             st.info("The selected delivery order file could not be found.")
-    elif st.session_state.get(filter_text_key) or query_text:
+    if receipt_downloads:
+        st.markdown(f"#### Download {record_label_lower} receipts")
+        selected_receipt = st.selectbox(
+            f"Pick a {record_label_lower} receipt",
+            list(receipt_downloads.keys()),
+            key=f"{key_prefix}_receipt_download_select",
+        )
+        receipt_path_value = receipt_downloads.get(selected_receipt)
+        receipt_file = resolve_upload_path(receipt_path_value)
+        if receipt_file and receipt_file.exists():
+            receipt_payload = _safe_read_bytes(receipt_file)
+            if receipt_payload:
+                st.download_button(
+                    f"Download receipt for {selected_receipt}",
+                    data=receipt_payload,
+                    file_name=receipt_file.name,
+                    key=f"{key_prefix}_receipt_download_button",
+                )
+            else:
+                st.warning("Unable to read the selected receipt.", icon="⚠️")
+        else:
+            st.info("The selected receipt file could not be found.")
+    if not downloads and not receipt_downloads and (st.session_state.get(filter_text_key) or query_text):
         st.caption(
             f"No matching {record_label_lower} records found for the applied filters."
         )
