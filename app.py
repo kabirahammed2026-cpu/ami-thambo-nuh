@@ -8504,7 +8504,8 @@ def init_ui():
         """
         <style>
         :root {
-            --ps-top-nav-height: 3.25rem;
+            --psNavH: 64px;
+            --ps-top-nav-height: var(--psNavH);
         }
         html,
         body,
@@ -8565,16 +8566,17 @@ def init_ui():
             top: 0;
             left: 0;
             right: 0;
-            z-index: 99999;
+            z-index: 9999;
             background: #fff !important;
             padding: 0 1rem;
             border-bottom: 1px solid var(--ps-panel-border);
             box-shadow: 0 0.25rem 0.5rem rgba(16, 24, 40, 0.08);
-            height: var(--ps-top-nav-height);
+            height: var(--psNavH);
             display: flex;
             align-items: center;
             gap: 0;
             margin: 0 !important;
+            overflow: visible;
         }
         [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] #ps_nav_anchor)
             > [data-testid="stElementContainer"] {
@@ -8583,7 +8585,7 @@ def init_ui():
         }
         .ps-top-nav {
             width: 100%;
-            height: var(--ps-top-nav-height);
+            height: var(--psNavH);
             display: flex;
             align-items: center;
             padding: 0;
@@ -8617,7 +8619,7 @@ def init_ui():
             padding: 0 !important;
         }
         .ps-top-nav-spacer {
-            height: var(--ps-top-nav-height);
+            height: var(--psNavH);
         }
         .ps-top-nav-links,
         .ps-nav-links {
@@ -8632,6 +8634,7 @@ def init_ui():
             background: #fff !important;
             position: relative;
             z-index: 9999;
+            overflow: visible;
         }
         .ps-top-nav-links .ps-top-nav-menu-label,
         .ps-nav-links .ps-top-nav-menu-label {
@@ -8639,6 +8642,7 @@ def init_ui():
             font-weight: 600;
             color: var(--ps-muted);
             margin: 0;
+            line-height: 1.1;
         }
         .ps-top-nav-links [role="radiogroup"],
         .ps-nav-links [role="radiogroup"] {
@@ -8646,6 +8650,7 @@ def init_ui():
             flex-wrap: nowrap;
             gap: 0.35rem 0.65rem;
             justify-content: center;
+            align-items: center;
             width: auto !important;
             overflow-x: auto;
             scrollbar-width: thin;
@@ -8653,13 +8658,15 @@ def init_ui():
             padding: 0 !important;
             background: #fff !important;
             position: relative;
-            line-height: normal;
+            line-height: 1.1;
             z-index: 9999;
         }
         .ps-top-nav-links label,
         .ps-nav-links label {
             margin-right: 0 !important;
             margin-bottom: 0 !important;
+            padding: 0 !important;
+            line-height: 1.1;
         }
         .ps-top-nav-links [data-testid="stRadio"],
         .ps-nav-links [data-testid="stRadio"] {
@@ -8668,6 +8675,13 @@ def init_ui():
             background: #fff !important;
             position: relative;
             z-index: 9999;
+            line-height: 1.1;
+        }
+        .ps-top-nav-links [data-testid="stRadio"] > div,
+        .ps-nav-links [data-testid="stRadio"] > div {
+            margin: 0 !important;
+            padding: 0 !important;
+            line-height: 1.1;
         }
         .ps-top-nav-links [data-testid="stRadio"] > div[role="radiogroup"],
         .ps-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
@@ -8682,7 +8696,7 @@ def init_ui():
             padding: 0 !important;
             background: #fff !important;
             position: relative;
-            line-height: normal;
+            line-height: 1.1;
             z-index: 9999;
         }
         .ps-top-nav-actions,
@@ -8694,7 +8708,7 @@ def init_ui():
         }
         @media (max-width: 900px) {
             :root {
-                --ps-top-nav-height: 3.125rem;
+                --ps-top-nav-height: var(--psNavH);
             }
             .ps-nav-row {
                 gap: 0.25rem;
@@ -8711,7 +8725,7 @@ def init_ui():
                 justify-content: flex-end;
             }
             .ps-top-nav-spacer {
-                height: var(--ps-top-nav-height);
+                height: var(--psNavH);
             }
         }
         </style>
@@ -25713,11 +25727,28 @@ def reports_page(conn):
     st.markdown("##### Import report data")
     import_payload = st.session_state.get("report_grid_import_payload")
     import_payload_is_new = False
+
+    def _reset_report_import_state(*, clear_uploader: bool = False) -> None:
+        keys_to_clear = [
+            "report_grid_import_payload",
+            "report_grid_mapping_choices",
+            "report_grid_mapping_saved",
+            "report_grid_import_rows",
+            "report_grid_importer_reset",
+            "report_grid_import_df",
+            "report_grid_import_columns",
+            "report_grid_import_file_hash",
+        ]
+        if clear_uploader:
+            keys_to_clear.append("report_grid_importer")
+        for key in keys_to_clear:
+            st.session_state.pop(key, None)
+        for key in list(st.session_state.keys()):
+            if key.startswith("report_map_"):
+                st.session_state.pop(key, None)
+
     if st.session_state.pop("report_grid_importer_reset", False):
-        st.session_state.pop("report_grid_importer", None)
-        st.session_state.pop("report_grid_import_payload", None)
-        st.session_state.pop("report_grid_mapping_choices", None)
-        st.session_state.pop("report_grid_mapping_saved", None)
+        _reset_report_import_state(clear_uploader=True)
 
     import_file = st.file_uploader(
         "Upload report grid (Excel or CSV)",
@@ -25727,20 +25758,32 @@ def reports_page(conn):
     )
     uploaded_df: Optional[pd.DataFrame] = None
     if import_file is not None:
+        import_bytes = import_file.getvalue()
+        file_hash = hashlib.sha256(import_bytes).hexdigest()
+        previous_hash = st.session_state.get("report_grid_import_file_hash")
+        if previous_hash and previous_hash != file_hash:
+            _reset_report_import_state(clear_uploader=False)
         import_payload_is_new = True
         import_payload = {
             "name": import_file.name,
-            "data": import_file.getvalue(),
+            "data": import_bytes,
+            "hash": file_hash,
         }
         st.session_state["report_grid_import_payload"] = import_payload
+        st.session_state["report_grid_import_file_hash"] = file_hash
         st.session_state.pop("report_grid_mapping_choices", None)
         st.session_state["report_grid_mapping_saved"] = False
 
     if import_payload:
+        file_hash = import_payload.get("hash") or st.session_state.get(
+            "report_grid_import_file_hash"
+        )
         uploaded_df = _load_report_grid_dataframe(
             import_payload.get("data", b""), import_payload.get("name", "")
         )
         if uploaded_df is not None:
+            st.session_state["report_grid_import_df"] = uploaded_df
+            st.session_state["report_grid_import_columns"] = list(uploaded_df.columns)
             suggestions = _suggest_report_column_mapping(
                 uploaded_df.columns, template_key=template_key
             )
@@ -25763,13 +25806,14 @@ def reports_page(conn):
                         default_choice = mapping_seed.get(key) or suggestions.get(key)
                         if default_choice not in map_options:
                             default_choice = "(Do not import)"
+                        map_key = f"report_map_{key}_{file_hash}" if file_hash else f"report_map_{key}"
                         choice = st.selectbox(
                             config["label"],
                             options=map_options,
                             index=map_options.index(default_choice)
                             if default_choice in map_options
                             else 0,
-                            key=f"report_map_{key}",
+                            key=map_key,
                             help=f"Select the column that represents '{config['label']}'.",
                         )
                         if choice != "(Do not import)":
@@ -25778,7 +25822,9 @@ def reports_page(conn):
 
             if load_clicked:
                 st.session_state["report_grid_mapping_choices"] = {
-                    key: st.session_state.get(f"report_map_{key}")
+                    key: st.session_state.get(
+                        f"report_map_{key}_{file_hash}" if file_hash else f"report_map_{key}"
+                    )
                     for key in _get_report_grid_fields(template_key).keys()
                 }
                 imported_rows = _import_report_grid_from_dataframe(
@@ -26171,8 +26217,8 @@ def reports_page(conn):
                                     old_import.unlink()
                         st.session_state["report_edit_select_pending"] = saved_id
                         st.session_state.pop("report_attachment_uploader", None)
-                        st.session_state.pop("report_grid_import_payload", None)
-                        _safe_rerun()
+                        _reset_report_import_state(clear_uploader=True)
+                        st.rerun()
 
     st.markdown("---")
     st.markdown("#### Report history")
