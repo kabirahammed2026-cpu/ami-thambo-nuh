@@ -5649,6 +5649,7 @@ def _render_file_action_links(
     *,
     path_value: Optional[str],
     label: str = "📎",
+    download_only: bool = False,
 ) -> None:
     if not path_value:
         container.write("")
@@ -5664,6 +5665,16 @@ def _render_file_action_links(
     preview_link = _build_file_data_uri(resolved, payload)
     if not preview_link:
         container.caption("Unavailable")
+        return
+    if download_only:
+        container.markdown(
+            (
+                "<div class='ps-file-links'>"
+                f"<a href='{preview_link}' download='{resolved.name}'>{label}</a>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
         return
     container.markdown(
         (
@@ -22441,7 +22452,8 @@ def delivery_orders_page(
             _render_file_action_links(
                 row_cols[6],
                 path_value=receipt_path_value,
-                label="📎 View",
+                label="⬇️",
+                download_only=True,
             )
             upload_receipt = row_cols[7].file_uploader(
                 "Upload receipt",
