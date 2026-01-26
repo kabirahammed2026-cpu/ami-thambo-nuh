@@ -5519,8 +5519,9 @@ def store_report_import_file(
 def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
     if not path_str:
         return None
+    normalized = str(path_str).replace("\\", "/")
     logger = _get_logger()
-    path = Path(path_str)
+    path = Path(normalized)
     if path.is_absolute():
         resolved = path.resolve()
     else:
@@ -15341,12 +15342,18 @@ def operations_page(conn):
                 display_customers[col] = display_customers[col].map(
                     lambda value: clean_text(value) or ""
                 )
+        customer_name = display_customers["name"].fillna("")
+        company_name = display_customers["company_name"].fillna("")
+        phone_value = display_customers["phone"].fillna("")
+        customer_display = customer_name.where(customer_name != "", company_name)
+        customer_display = customer_display.where(customer_display != "", phone_value)
+        company_display = company_name.where(company_name != "", customer_name)
         table_df = pd.DataFrame(
             {
                 "Select": False,
-                "Customer": display_customers["name"].fillna(""),
-                "Company": display_customers["company_name"].fillna(""),
-                "Phone": display_customers["phone"].fillna(""),
+                "Customer": customer_display.fillna(""),
+                "Company": company_display.fillna(""),
+                "Phone": phone_value,
                 "Address": display_customers["address"].fillna(""),
                 "Delivery address": display_customers["delivery_address"].fillna(""),
             },
@@ -19001,8 +19008,12 @@ def _upsert_customer_from_manual_quotation(
         updates: dict[str, object] = {}
         if not existing_name and customer_name:
             updates["name"] = customer_name
+        if not existing_name and not customer_name and company_name:
+            updates["name"] = company_name
         if not existing_company and company_name:
             updates["company_name"] = company_name
+        if not existing_company and not company_name and customer_name:
+            updates["company_name"] = customer_name
         if not existing_phone and phone_number:
             updates["phone"] = phone_number
         if not existing_address and street_address:
