@@ -17936,9 +17936,6 @@ def _render_service_section(conn, *, show_heading: bool = True):
             display_df["payment_receipt_display"] = display_df["payment_receipt_path"].apply(
                 _file_data_uri_from_path
             )
-            display_df["receipt_download"] = display_df["payment_receipt_path"].apply(
-                _file_data_uri_from_path
-            )
         display = display_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -17956,7 +17953,6 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "attachment_display": "Attachment",
                 "payment_receipt_display": "Receipt",
                 "attachment_download": "Attachment download",
-                "receipt_download": "Receipt download",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -17974,10 +17970,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "Attachment download": st.column_config.LinkColumn(
                     "Attachment download", display_text="⬇️"
                 ),
-                "Receipt": st.column_config.LinkColumn("Receipt", display_text="📎 View"),
-                "Receipt download": st.column_config.LinkColumn(
-                    "Receipt download", display_text="⬇️"
-                ),
+                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
             },
         )
 
@@ -19201,13 +19194,17 @@ def _upsert_customer_from_manual_quotation(
         remark_parts.append(f"Quotation ref: {reference_label}")
     remarks_value = " | ".join(remark_parts) if remark_parts else None
 
+    display_name = customer_name or company_name
+    if not display_name:
+        display_name = phone_number or reference_label or street_address or district_label
+
     cursor.execute(
         """
         INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, created_by, dup_flag)
         VALUES (?, ?, ?, ?, ?, ?, ?, 0)
         """,
         (
-            customer_name or company_name,
+            display_name,
             company_name,
             phone_number,
             street_address,
@@ -21369,9 +21366,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             display_df["payment_receipt_display"] = display_df["payment_receipt_path"].apply(
                 _file_data_uri_from_path
             )
-            display_df["receipt_download"] = display_df["payment_receipt_path"].apply(
-                _file_data_uri_from_path
-            )
         display = display_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -21387,7 +21381,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 "attachment_display": "Attachment",
                 "payment_receipt_display": "Receipt",
                 "attachment_download": "Attachment download",
-                "receipt_download": "Receipt download",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -21404,10 +21397,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 "Attachment download": st.column_config.LinkColumn(
                     "Attachment download", display_text="⬇️"
                 ),
-                "Receipt": st.column_config.LinkColumn("Receipt", display_text="📎 View"),
-                "Receipt download": st.column_config.LinkColumn(
-                    "Receipt download", display_text="⬇️"
-                ),
+                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
             },
         )
 
@@ -22398,7 +22388,7 @@ def delivery_orders_page(
 
             do_df["total_amount"] = do_df["total_amount"].apply(_format_total_value)
         st.markdown(f"#### {record_label} records")
-        header_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.7, 0.9, 1.2))
+        header_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.9, 1.2))
         header_cols[0].write(f"**{number_label}**")
         header_cols[1].write("**Customer**")
         header_cols[2].write("**Description**")
@@ -22406,15 +22396,14 @@ def delivery_orders_page(
         header_cols[4].write("**Status**")
         header_cols[5].write("**Attachment**")
         header_cols[6].write("**Receipt**")
-        header_cols[7].write("**Receipt download**")
-        header_cols[8].write("**Upload receipt**")
+        header_cols[7].write("**Upload receipt**")
 
         for _, row in do_df.iterrows():
             do_number = clean_text(row.get("do_number"))
             if not do_number:
                 continue
             row_key = f"{record_type_key}_{do_number}"
-            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.7, 0.9, 1.2))
+            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.9, 1.2))
             is_highlight = highlight_target and do_number == highlight_target
             def _render_cell(col, value: str) -> None:
                 if is_highlight:
@@ -22437,16 +22426,12 @@ def delivery_orders_page(
             receipt_path_value = clean_text(row.get("payment_receipt_path")) or clean_text(
                 row.get("receipt_path")
             )
-            _render_file_action_links(
-                row_cols[6],
-                path_value=receipt_path_value,
-            )
             _render_file_download_button(
-                row_cols[7],
+                row_cols[6],
                 path_value=receipt_path_value,
                 key=f"do_row_receipt_download_{row_key}",
             )
-            upload_receipt = row_cols[8].file_uploader(
+            upload_receipt = row_cols[7].file_uploader(
                 "Upload receipt",
                 type=["pdf", "png", "jpg", "jpeg", "webp"],
                 label_visibility="collapsed",
@@ -22459,7 +22444,7 @@ def delivery_orders_page(
                     label=f"{record_label} row receipt OCR",
                 )
             save_label = f"💾 Save {record_label}"
-            save_doc = row_cols[8].button(
+            save_doc = row_cols[7].button(
                 save_label, type="secondary", key=f"do_row_save_{row_key}"
             )
             if _guard_double_submit(f"do_row_save_{row_key}", save_doc):
@@ -22889,7 +22874,7 @@ def customer_summary_page(conn):
         do_df = fmt_dates(do_df, ["created_at"])
         do_df["do_number"] = do_df["do_number"].apply(clean_text)
         do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
-        do_df["Receipt"] = do_df["payment_receipt_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
+        do_df["Receipt"] = do_df["payment_receipt_path"].apply(_file_data_uri_from_path)
 
     do_numbers = set()
     if not do_df.empty and "do_number" in do_df.columns:
@@ -22933,7 +22918,7 @@ def customer_summary_page(conn):
 
     if do_df is not None and not do_df.empty:
         do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
-        do_df["Receipt"] = do_df["payment_receipt_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
+        do_df["Receipt"] = do_df["payment_receipt_path"].apply(_file_data_uri_from_path)
 
     st.markdown("**Delivery orders**")
     if (do_df is None or do_df.empty) and not orphan_dos:
@@ -22955,6 +22940,9 @@ def customer_summary_page(conn):
                     }
                 ).drop(columns=["file_path", "payment_receipt_path"], errors="ignore"),
                 use_container_width=True,
+                column_config={
+                    "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
+                },
             )
         if orphan_dos:
             st.caption("Referenced DO codes without a recorded delivery order: " + ", ".join(orphan_dos))
@@ -22969,6 +22957,7 @@ def customer_summary_page(conn):
     if service_df.empty:
         st.info("No service records found for this customer.")
     else:
+        service_df["Receipt"] = service_df["payment_receipt_path"].apply(_file_data_uri_from_path)
         service_display = service_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -22979,6 +22968,7 @@ def customer_summary_page(conn):
                 "service_product_info": "Products sold",
                 "description": "Description",
                 "remarks": "Remarks",
+                "Receipt": "Receipt",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -22990,12 +22980,16 @@ def customer_summary_page(conn):
                 errors="ignore",
             ),
             use_container_width=True,
+            column_config={
+                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
+            },
         )
 
     st.markdown("**Maintenance records**")
     if maintenance_df.empty:
         st.info("No maintenance records found for this customer.")
     else:
+        maintenance_df["Receipt"] = maintenance_df["payment_receipt_path"].apply(_file_data_uri_from_path)
         maintenance_display = maintenance_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -23006,6 +23000,7 @@ def customer_summary_page(conn):
                 "maintenance_product_info": "Products sold",
                 "description": "Description",
                 "remarks": "Remarks",
+                "Receipt": "Receipt",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -23017,6 +23012,9 @@ def customer_summary_page(conn):
                 errors="ignore",
             ),
             use_container_width=True,
+            column_config={
+                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
+            },
         )
 
     documents = []
