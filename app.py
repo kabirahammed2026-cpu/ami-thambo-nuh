@@ -1701,7 +1701,13 @@ def ensure_schema_upgrades(conn):
 
     ensure_data_version_trigger("customers", "customers")
     ensure_data_version_trigger("quotations", "quotations")
-    for table in ("delivery_orders", "services", "maintenance_records"):
+    for table in (
+        "delivery_orders",
+        "services",
+        "maintenance_records",
+        "customer_documents",
+        "operations_other_documents",
+    ):
         ensure_data_version_trigger(table, "operations")
     add_column("quotations", "payment_receipt_path", "TEXT")
     add_column("quotations", "items_payload", "TEXT")
@@ -2184,6 +2190,16 @@ def _refresh_customer_caches() -> None:
     st.session_state.pop("operations_customer_table_state", None)
     st.session_state.pop("operations_customer_table", None)
     st.session_state["customers_updated_at"] = datetime.utcnow().isoformat()
+
+
+def _mark_data_changed(*keys: str) -> None:
+    timestamp = datetime.utcnow().isoformat()
+    for key in keys:
+        if not key:
+            continue
+        st.session_state[f"data_version_{key}"] = timestamp
+        if key == "customers":
+            _refresh_customer_caches()
 
 def fmt_dates(df: pd.DataFrame, cols):
     df = df.copy()
@@ -3446,6 +3462,7 @@ def push_runtime_notification(
     *,
     severity: str = "info",
     details: Optional[Iterable[str]] = None,
+    deep_link: Optional[dict[str, object]] = None,
 ) -> None:
     if not title and not message:
         return
@@ -3458,6 +3475,8 @@ def push_runtime_notification(
             clean_text(item) for item in (details or []) if clean_text(item)
         ],
     }
+    if deep_link:
+        entry["deep_link"] = deep_link
     buffer = _notification_store()
     buffer.append(entry)
     if len(buffer) > MAX_RUNTIME_NOTIFICATIONS:
@@ -3475,7 +3494,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
         conn,
         dedent(
             """
-            SELECT reference, follow_up_date, reminder_label
+            SELECT quotation_id, reference, follow_up_date, reminder_label
             FROM quotations
             WHERE created_by = ?
               AND follow_up_date IS NOT NULL
@@ -3501,6 +3520,13 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                     "message": clean_text(row.get("reminder_label"))
                     or f"Follow-up scheduled for {follow_label}",
                     "severity": severity,
+                    "deep_link": {
+                        "page": "Quotation",
+                        "record_id": str(int(row.get("quotation_id"))),
+                        "highlight": True,
+                    }
+                    if int_or_none(row.get("quotation_id")) is not None
+                    else None,
                 }
             )
 
@@ -3555,6 +3581,13 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                     "title": warranty_label or "Warranty follow-up",
                     "message": f"Warranty follow-up due {follow_label}",
                     "severity": severity,
+                    "deep_link": {
+                        "page": "Warranties",
+                        "record_id": str(int(row.get("warranty_id"))),
+                        "highlight": True,
+                    }
+                    if int_or_none(row.get("warranty_id")) is not None
+                    else None,
                 }
             )
 
@@ -3619,6 +3652,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
             SELECT n.note_id,
                    n.note,
                    n.remind_on,
+                   n.customer_id,
                    c.name AS customer
             FROM customer_notes n
             LEFT JOIN customers c ON c.customer_id = n.customer_id
@@ -3646,6 +3680,13 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                     "severity": "warning"
                     if reminder_date and reminder_date <= date.today()
                     else "info",
+                    "deep_link": {
+                        "page": "Customers",
+                        "record_id": str(int(row.get("customer_id"))),
+                        "highlight": True,
+                    }
+                    if int_or_none(row.get("customer_id")) is not None
+                    else None,
                 }
             )
 
@@ -3753,6 +3794,35 @@ def _fetch_entity_activity(
     )
 
 
+def _deep_link_for_entity(
+    entity_type: Optional[str],
+    entity_id: Optional[int],
+) -> Optional[dict[str, object]]:
+    if not entity_type or entity_id is None:
+        return None
+    entity_key = clean_text(entity_type)
+    if not entity_key:
+        return None
+    mapping = {
+        "quotation": {"page": "Quotation"},
+        "customer": {"page": "Customers"},
+        "warranty": {"page": "Warranties"},
+        "delivery_order": {"page": "Operations", "tab": "delivery_orders"},
+        "work_done": {"page": "Operations", "tab": "work_done"},
+        "service": {"page": "Operations", "tab": "service"},
+        "maintenance": {"page": "Operations", "tab": "maintenance"},
+        "operations_other": {"page": "Operations", "tab": "other_uploads"},
+        "customer_document": {"page": "Operations", "tab": "documents"},
+    }
+    link = mapping.get(entity_key)
+    if not link:
+        return None
+    link = dict(link)
+    link["record_id"] = str(entity_id)
+    link["highlight"] = True
+    return link
+
+
 def log_activity(
     conn,
     *,
@@ -3796,11 +3866,13 @@ def log_activity(
             details: list[str] = []
             if entity_type and entity_id:
                 details.append(clean_text(entity_type).title() if clean_text(entity_type) else "Record")
+            deep_link = _deep_link_for_entity(entity_type, entity_id)
             push_runtime_notification(
                 label or "Activity logged",
                 f"{actor_label or 'Team member'}: {message}",
                 severity="info",
                 details=details,
+                deep_link=deep_link,
             )
 
 
@@ -5480,6 +5552,17 @@ def render_upload_preview(path: Path, *, label: str, key_prefix: str) -> None:
         except OSError:
             st.warning("Unable to read file for preview.")
             return
+        preview_link = _build_file_data_uri(path, payload)
+        if preview_link:
+            st.markdown(
+                f"<a href='{preview_link}' target='_blank' rel='noopener'>Open preview (new tab)</a>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<a href='{preview_link}' download='{path.name}'>Download</a>",
+                unsafe_allow_html=True,
+            )
+            st.caption("Preview blocked by browser? Use Open preview or Download.")
         if suffix == ".pdf":
             encoded = base64.b64encode(payload).decode("utf-8")
             iframe = (
@@ -5497,6 +5580,58 @@ def render_upload_preview(path: Path, *, label: str, key_prefix: str) -> None:
             file_name=path.name,
             key=f"{preview_key}_download",
         )
+
+
+def _build_file_data_uri(path: Path, payload: bytes) -> Optional[str]:
+    if not payload:
+        return None
+    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    encoded = base64.b64encode(payload).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _file_data_uri_from_path(path_value: Optional[str]) -> Optional[str]:
+    if not path_value:
+        return None
+    resolved = resolve_upload_path(path_value)
+    if not resolved or not resolved.exists():
+        return None
+    payload = _safe_read_bytes(resolved)
+    if not payload:
+        return None
+    return _build_file_data_uri(resolved, payload)
+
+
+def _render_file_action_links(
+    container,
+    *,
+    path_value: Optional[str],
+    label: str = "📎",
+) -> None:
+    if not path_value:
+        container.write("")
+        return
+    resolved = resolve_upload_path(path_value)
+    if not resolved or not resolved.exists():
+        container.caption("Missing")
+        return
+    payload = _safe_read_bytes(resolved)
+    if not payload:
+        container.caption("Unreadable")
+        return
+    preview_link = _build_file_data_uri(resolved, payload)
+    if not preview_link:
+        container.caption("Unavailable")
+        return
+    container.markdown(
+        (
+            "<div class='ps-file-links'>"
+            f"<a href='{preview_link}' target='_blank' rel='noopener'>{label}</a>"
+            f"&nbsp;<a href='{preview_link}' download='{resolved.name}'>⬇️</a>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 _ATTACHMENT_UNCHANGED = object()
@@ -8738,6 +8873,10 @@ def init_ui():
     )
 # ---------- Auth ----------
 SESSION_TOKEN_PARAM = "session"
+DEEP_LINK_PAGE_PARAM = "page"
+DEEP_LINK_TAB_PARAM = "tab"
+DEEP_LINK_ID_PARAM = "id"
+DEEP_LINK_HIGHLIGHT_PARAM = "highlight"
 
 
 def _session_duration_days() -> float:
@@ -8765,6 +8904,64 @@ def _set_session_token_in_url(token: Optional[str]) -> None:
         st.query_params[SESSION_TOKEN_PARAM] = token
     else:
         st.query_params.clear()
+
+
+def _read_query_param(params: dict, key: str) -> Optional[str]:
+    value = params.get(key)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value or None
+
+
+def _build_deep_link_url(
+    *,
+    page: str,
+    tab: Optional[str] = None,
+    record_id: Optional[str] = None,
+    highlight: bool = False,
+) -> str:
+    payload = {
+        DEEP_LINK_PAGE_PARAM: page,
+    }
+    token = st.session_state.get("session_token")
+    if token:
+        payload[SESSION_TOKEN_PARAM] = token
+    if tab:
+        payload[DEEP_LINK_TAB_PARAM] = tab
+    if record_id:
+        payload[DEEP_LINK_ID_PARAM] = record_id
+    if highlight:
+        payload[DEEP_LINK_HIGHLIGHT_PARAM] = "1"
+    return f"?{urllib.parse.urlencode(payload)}"
+
+
+def _extract_deep_link(pages: list[str]) -> Optional[dict[str, str]]:
+    params = st.query_params
+    raw_page = _read_query_param(params, DEEP_LINK_PAGE_PARAM)
+    if not raw_page:
+        return None
+    page_map = {p.lower(): p for p in pages}
+    target_page = page_map.get(raw_page.strip().lower())
+    if not target_page:
+        return None
+    return {
+        "page": target_page,
+        "tab": _read_query_param(params, DEEP_LINK_TAB_PARAM) or "",
+        "record_id": _read_query_param(params, DEEP_LINK_ID_PARAM) or "",
+        "highlight": _read_query_param(params, DEEP_LINK_HIGHLIGHT_PARAM) or "",
+    }
+
+
+def _consume_deep_link(page: str) -> Optional[dict[str, str]]:
+    pending = st.session_state.get("pending_deep_link")
+    if not isinstance(pending, dict) or pending.get("page") != page:
+        return None
+    token = pending.get("token")
+    if token and st.session_state.get("pending_deep_link_consumed") == token:
+        return None
+    if token:
+        st.session_state["pending_deep_link_consumed"] = token
+    return pending
 
 
 def _purge_expired_sessions(conn) -> None:
@@ -11750,6 +11947,18 @@ def _render_notification_entry(entry: dict[str, object], *, include_actor: bool 
     details = entry.get("details") or []
     for detail in list(details)[:5]:
         st.caption(f"• {detail}")
+    deep_link = entry.get("deep_link")
+    if isinstance(deep_link, dict) and deep_link.get("page"):
+        link_url = _build_deep_link_url(
+            page=str(deep_link.get("page")),
+            tab=clean_text(deep_link.get("tab")),
+            record_id=clean_text(deep_link.get("record_id")),
+            highlight=bool(deep_link.get("highlight")),
+        )
+        st.markdown(
+            f"<a href='{link_url}' target='_self'>Open record</a>",
+            unsafe_allow_html=True,
+        )
     footer_bits: list[str] = []
     if include_actor:
         actor = clean_text(entry.get("actor"))
@@ -13592,6 +13801,7 @@ def _save_customer_document_upload(
             )
 
     conn.commit()
+    _mark_data_changed("operations", "customers")
     return True
 
 
@@ -14247,12 +14457,13 @@ def render_operations_document_uploader(
             docs_df.apply(
                 lambda row: any(
                     needle in str(row.get(col, "")).lower()
-                    for col in [
-                        "doc_type",
-                        "original_name",
-                        "file_path",
-                        "customer_name",
-                        "company",
+                        for col in [
+                            "document_id",
+                            "doc_type",
+                            "original_name",
+                            "file_path",
+                            "customer_name",
+                            "company",
                         "do_description",
                         "do_remarks",
                         "service_description",
@@ -14489,6 +14700,7 @@ def render_operations_document_uploader(
                 (actor_id, int(doc_id)),
             )
         conn.commit()
+        _mark_data_changed("operations")
         st.success("Inline edits saved.")
         _safe_rerun()
 
@@ -14699,6 +14911,7 @@ def render_operations_document_uploader(
                             ),
                         )
                 conn.commit()
+                _mark_data_changed("operations")
                 st.success("Document updated.")
                 _safe_rerun()
 
@@ -14759,6 +14972,7 @@ def render_operations_document_uploader(
                         (actor_id, int(row["other_document_id"])),
                     )
                 conn.commit()
+                _mark_data_changed("operations")
                 st.warning("Document deleted.")
                 _safe_rerun()
 
@@ -14850,9 +15064,8 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
     display_df = other_df.copy()
     display_df["items_summary"] = display_df["items_payload"].apply(_summarize_items)
     display_df = fmt_dates(display_df, ["uploaded_at", "updated_at"])
-    display_df["Document"] = display_df["file_path"].apply(
-        lambda fp: "📎" if clean_text(fp) else ""
-    )
+    display_df["Document"] = display_df["file_path"].apply(_file_data_uri_from_path)
+    display_df["Download"] = display_df["file_path"].apply(_file_data_uri_from_path)
     display_df = display_df.rename(
         columns={
             "description": "Description",
@@ -14875,12 +15088,17 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
                 "Uploaded",
                 "Updated",
                 "Document",
+                "Download",
                 "Uploaded by",
                 "Updated by",
             ]
         ],
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Document": st.column_config.LinkColumn("Document", display_text="📎 View"),
+            "Download": st.column_config.LinkColumn("Download", display_text="⬇️"),
+        },
     )
 
     other_records = other_df.to_dict("records")
@@ -15026,6 +15244,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             ),
         )
         conn.commit()
+        _mark_data_changed("operations")
         log_activity(
             conn,
             event_type="operations_other_updated",
@@ -15063,6 +15282,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             (actor_id, int(selected_id)),
         )
         conn.commit()
+        _mark_data_changed("operations")
         log_activity(
             conn,
             event_type="operations_other_deleted",
@@ -15080,6 +15300,18 @@ def operations_page(conn):
     st.caption(
         "Review delivery orders, work done, service, maintenance, and other operational records in one place."
     )
+    deep_link = _consume_deep_link("Operations")
+    deep_tab = clean_text(deep_link.get("tab")) if isinstance(deep_link, dict) else ""
+    deep_record = clean_text(deep_link.get("record_id")) if isinstance(deep_link, dict) else ""
+    if deep_tab == "service" and deep_record:
+        st.session_state["service_edit_select"] = int_or_none(deep_record)
+    if deep_tab == "maintenance" and deep_record:
+        st.session_state["maintenance_edit_select"] = int_or_none(deep_record)
+    if deep_tab == "other_uploads" and deep_record:
+        st.session_state["operations_page_other_edit_select"] = int_or_none(deep_record)
+    if deep_tab == "documents" and deep_record:
+        st.session_state["operations_page_doc_search"] = deep_record
+        st.info(f"Filtered documents to record #{deep_record}.")
     st.markdown("### Customers")
     st.caption(
         "Select a customer from the table below to filter the operations documents."
@@ -15108,7 +15340,11 @@ def operations_page(conn):
         params.extend(scope_params)
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     customers_version = get_data_version(conn, "customers")
-    version = (customers_version, st.session_state.get("customers_updated_at"))
+    version = (
+        customers_version,
+        st.session_state.get("customers_updated_at"),
+        st.session_state.get("data_version_customers"),
+    )
     customers_df = _load_operations_customers(
         DB_PATH,
         where_clause,
@@ -15220,38 +15456,54 @@ def operations_page(conn):
     )
 
     st.markdown("---")
-    tabs = st.tabs(
-        [
-            "Delivery orders",
-            "Work done",
-            "Service",
-            "Maintenance",
-            "Other uploads",
-        ]
+    tab_labels = [
+        "Delivery orders",
+        "Work done",
+        "Service",
+        "Maintenance",
+        "Other uploads",
+    ]
+    tab_lookup = {
+        "delivery_orders": "Delivery orders",
+        "work_done": "Work done",
+        "service": "Service",
+        "maintenance": "Maintenance",
+        "other_uploads": "Other uploads",
+    }
+    if deep_tab in tab_lookup:
+        st.session_state["operations_tab"] = tab_lookup[deep_tab]
+    selected_tab = st.radio(
+        "Operations sections",
+        tab_labels,
+        horizontal=True,
+        key="operations_tab",
+        label_visibility="collapsed",
     )
-    with tabs[0]:
+    if selected_tab == "Delivery orders":
         st.markdown("### Delivery orders")
         delivery_orders_page(
             conn,
             show_heading=False,
             record_type_label="Delivery order",
             record_type_key="delivery_order",
+            highlight_record=deep_record if deep_tab == "delivery_orders" else None,
         )
-    with tabs[1]:
+    elif selected_tab == "Work done":
         st.markdown("### Work done")
         delivery_orders_page(
             conn,
             show_heading=False,
             record_type_label="Work done",
             record_type_key="work_done",
+            highlight_record=deep_record if deep_tab == "work_done" else None,
         )
-    with tabs[2]:
+    elif selected_tab == "Service":
         st.markdown("### Service records")
         _render_service_section(conn, show_heading=False)
-    with tabs[3]:
+    elif selected_tab == "Maintenance":
         st.markdown("### Maintenance records")
         _render_maintenance_section(conn, show_heading=False)
-    with tabs[4]:
+    elif selected_tab == "Other uploads":
         _render_operations_other_manager(conn, key_prefix="operations_page")
 
     if current_user_is_admin():
@@ -15279,6 +15531,13 @@ def operations_page(conn):
 
 def customers_page(conn):
     st.subheader("👥 Customers")
+    deep_link = _consume_deep_link("Customers")
+    deep_customer_id = None
+    if isinstance(deep_link, dict):
+        deep_customer_id = int_or_none(deep_link.get("record_id"))
+        if deep_customer_id is not None:
+            st.session_state["customers_detail_select"] = deep_customer_id
+            st.info(f"Jumped to customer record #{deep_customer_id}.")
     feedback = st.session_state.pop("new_customer_feedback", None)
     if feedback:
         level, message = feedback
@@ -16198,7 +16457,7 @@ def customers_page(conn):
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
     st.markdown("### Detailed editor & attachments")
-    with st.expander("Open detailed editor", expanded=False):
+    with st.expander("Open detailed editor", expanded=deep_customer_id is not None):
         df_form = fmt_dates(df_raw.copy(), ["created_at", "purchase_date"])
         if df_form.empty:
             st.info("No customers to edit yet.")
@@ -16212,10 +16471,16 @@ def customers_page(conn):
                 label_name = clean_text(row.get("name")) or "(no name)"
                 label_phone = clean_text(row.get("phone")) or "-"
                 labels[cid] = f"{label_name} – {label_phone}"
+            if (
+                st.session_state.get("customers_detail_select") is not None
+                and st.session_state.get("customers_detail_select") not in option_ids
+            ):
+                st.session_state.pop("customers_detail_select", None)
             selected_customer_id = st.selectbox(
                 "Select customer",
                 option_ids,
                 format_func=lambda cid: labels.get(int(cid), str(cid)),
+                key="customers_detail_select",
             )
             selected_raw = raw_map[int(selected_customer_id)]
             selected_fmt = next(r for r in records_fmt if int(r["id"]) == int(selected_customer_id))
@@ -16370,6 +16635,7 @@ def customers_page(conn):
                 if new_phone:
                     recalc_customer_duplicate_flag(conn, new_phone)
                 conn.commit()
+                _mark_data_changed("customers")
                 st.success("Customer updated.")
                 _safe_rerun()
             if delete_customer:
@@ -16627,6 +16893,13 @@ def customers_page(conn):
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
     is_admin = current_user_is_admin()
+    deep_link = _consume_deep_link("Warranties")
+    deep_warranty_id = None
+    if isinstance(deep_link, dict):
+        deep_warranty_id = int_or_none(deep_link.get("record_id"))
+        if deep_warranty_id is not None:
+            st.session_state["warranty_followup_select"] = deep_warranty_id
+            st.info(f"Jumped to warranty #{deep_warranty_id}.")
     sort_dir = st.radio("Sort by expiry date", ["Soonest first", "Latest first"], horizontal=True)
     order = "ASC" if sort_dir == "Soonest first" else "DESC"
     q = st.text_input("Search (customer/product/model/serial)")
@@ -16751,6 +17024,11 @@ def warranties_page(conn):
         if expiry_label:
             label_parts.append(f"exp {expiry_label}")
         warranty_labels[warranty_id] = " • ".join(label_parts)
+    if (
+        st.session_state.get("warranty_followup_select") is not None
+        and st.session_state.get("warranty_followup_select") not in warranty_labels
+    ):
+        st.session_state.pop("warranty_followup_select", None)
 
     def _parse_warranty_followup_note(note: Optional[str]) -> tuple[Optional[int], str]:
         text = clean_text(note) or ""
@@ -16766,6 +17044,7 @@ def warranties_page(conn):
             "Select warranty",
             options=list(warranty_labels.keys()),
             format_func=lambda wid: warranty_labels.get(wid, "Warranty record"),
+            key="warranty_followup_select",
         )
         selected_record = next(
             record
@@ -16823,7 +17102,11 @@ def warranties_page(conn):
                 combined_remarks = f"{existing_remarks}\n{note_value}"
             else:
                 combined_remarks = existing_remarks or note_value
-            follow_up_status = "pending" if reminder_iso else "done"
+            follow_up_status = "completed" if not reminder_iso else "pending"
+            if reminder_iso:
+                reminder_dt = pd.to_datetime(reminder_iso, errors="coerce")
+                if pd.notna(reminder_dt) and reminder_dt.date() < date.today():
+                    follow_up_status = "overdue"
             follow_up_history = clean_text(selected_record.get("follow_up_history")) or ""
             history_entry = _build_follow_up_history_entry(
                 follow_up_date=reminder_iso,
@@ -16909,7 +17192,8 @@ def warranties_page(conn):
                n.is_done,
                n.created_at,
                c.name AS customer,
-               c.company_name AS company
+               c.company_name AS company,
+               c.sales_person AS staff
         FROM customer_notes n
         LEFT JOIN customers c ON c.customer_id = n.customer_id
         WHERE n.note LIKE '[Warranty #%'
@@ -16934,6 +17218,8 @@ def warranties_page(conn):
             note_id = int_or_none(row.get("note_id"))
             is_done = bool(int_or_none(row.get("is_done")))
             status_label = "Completed" if is_done else "Pending"
+            remind_on_raw = clean_text(row.get("remind_on")) or ""
+            reminder_dt = pd.to_datetime(remind_on_raw, errors="coerce")
             history_entry = f"{reminder_label or created_label}: {note_text}".strip()
             group = grouped_followups.get(warranty_id)
             if not group:
@@ -16947,11 +17233,20 @@ def warranties_page(conn):
                     "Remark": note_text,
                     "Remarks history": [],
                     "has_pending": not is_done,
+                    "remind_on_raw": remind_on_raw,
+                    "next_due_raw": remind_on_raw,
+                    "next_due_dt": reminder_dt,
+                    "Assigned staff": clean_text(row.get("staff")) or "",
                 }
                 grouped_followups[warranty_id] = group
             group["Remarks history"].append(history_entry)
             if not is_done:
                 group["has_pending"] = True
+                if reminder_dt is not pd.NaT and pd.notna(reminder_dt):
+                    existing_dt = group.get("next_due_dt")
+                    if existing_dt is pd.NaT or pd.isna(existing_dt) or reminder_dt < existing_dt:
+                        group["next_due_dt"] = reminder_dt
+                        group["next_due_raw"] = remind_on_raw
             if note_id is not None:
                 warranty_note_map.setdefault(warranty_id, []).append(int(note_id))
                 note_remind_on_map[int(note_id)] = clean_text(row.get("remind_on"))
@@ -16962,7 +17257,17 @@ def warranties_page(conn):
             group.pop("has_pending", None)
             followup_rows.append(group)
         followup_df = pd.DataFrame(followup_rows).set_index("Warranty ref")
-        editable_df = followup_df.copy()
+        editor_columns = [
+            "Warranty",
+            "Customer",
+            "Company",
+            "Reminder date",
+            "Status",
+            "Remark",
+            "Remarks history",
+            "Assigned staff",
+        ]
+        editable_df = followup_df[[col for col in editor_columns if col in followup_df.columns]].copy()
         edited_followups = safe_data_editor(
             editable_df,
             use_container_width=True,
@@ -16978,6 +17283,7 @@ def warranties_page(conn):
         )
         updates: list[tuple[int, int]] = []
         warranty_updates: list[tuple[str, int]] = []
+        followup_status_updates: list[tuple[str, int]] = []
         if isinstance(edited_followups, pd.DataFrame):
             for warranty_id, row in edited_followups.iterrows():
                 original = clean_text(followup_df.at[warranty_id, "Status"])
@@ -16988,6 +17294,9 @@ def warranties_page(conn):
                         updates.append((is_done_value, int(note_id_value)))
                     status_value = "completed" if updated == "Completed" else "active"
                     warranty_updates.append((status_value, int(warranty_id)))
+                    followup_status_updates.append(
+                        ("completed" if updated == "Completed" else "pending", int(warranty_id))
+                    )
         if updates:
             conn.executemany(
                 "UPDATE customer_notes SET is_done=? WHERE note_id=?",
@@ -17009,10 +17318,72 @@ def warranties_page(conn):
                 "UPDATE warranties SET status=? WHERE warranty_id=?",
                 warranty_updates,
             )
-        if updates or warranty_updates:
+        if followup_status_updates:
+            conn.executemany(
+                "UPDATE warranties SET follow_up_status=? WHERE warranty_id=?",
+                followup_status_updates,
+            )
+        if updates or warranty_updates or followup_status_updates:
             conn.commit()
             st.success("Follow-up status updated.")
             _safe_rerun()
+
+        if is_admin and not followup_df.empty:
+            st.markdown("#### Admin follow-up overview")
+            status_filter = st.selectbox(
+                "Filter by status",
+                options=["All", "Pending", "Completed", "Overdue"],
+                key="warranty_followup_status_filter",
+            )
+            sort_choice = st.selectbox(
+                "Sort by due date",
+                options=["Soonest first", "Latest first"],
+                key="warranty_followup_sort",
+            )
+            today_date = date.today()
+            admin_rows: list[dict[str, object]] = []
+            for _, row in followup_df.reset_index().iterrows():
+                status_label = clean_text(row.get("Status")) or "Pending"
+                due_raw = clean_text(row.get("next_due_raw")) or clean_text(row.get("remind_on_raw"))
+                due_label = format_period_range(due_raw, due_raw) if due_raw else ""
+                due_dt = pd.to_datetime(due_raw, errors="coerce")
+                if status_label != "Completed" and pd.notna(due_dt):
+                    if due_dt.date() < today_date:
+                        status_label = "Overdue"
+                admin_rows.append(
+                    {
+                        "Warranty ref": row.get("Warranty ref"),
+                        "Customer": row.get("Customer"),
+                        "Company": row.get("Company"),
+                        "Item": row.get("Warranty"),
+                        "Due date": due_label,
+                        "Assigned staff": row.get("Assigned staff"),
+                        "Status": status_label,
+                        "Notes": row.get("Remark"),
+                        "_due_raw": due_raw,
+                    }
+                )
+            admin_df = pd.DataFrame(admin_rows)
+            if status_filter != "All":
+                admin_df = admin_df[admin_df["Status"] == status_filter]
+            if not admin_df.empty:
+                admin_df["due_sort"] = pd.to_datetime(admin_df["_due_raw"], errors="coerce")
+                admin_df = admin_df.sort_values(
+                    by="due_sort",
+                    ascending=(sort_choice == "Soonest first"),
+                ).drop(columns=["due_sort", "_due_raw"], errors="ignore")
+            st.dataframe(
+                admin_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Status": st.column_config.SelectboxColumn(
+                        "Status",
+                        options=["Pending", "Completed", "Overdue"],
+                        disabled=True,
+                    )
+                },
+            )
 
 
 def _render_service_section(conn, *, show_heading: bool = True):
@@ -17332,6 +17703,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 if bill_amount_value is not None:
                     message = f"{message} Recorded service amount {format_money(bill_amount_value)}."
                 st.success(message)
+                _mark_data_changed("operations")
                 _safe_rerun()
 
     service_df = df_query(
@@ -17351,12 +17723,14 @@ def _render_service_section(conn, *, show_heading: bool = True):
                s.condition_status,
                s.condition_remarks,
                s.bill_amount,
+               s.bill_document_path,
                 s.payment_receipt_path,
-               s.updated_at,
+                s.updated_at,
                s.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                COALESCE(c.company_name, cdo.company_name) AS company,
-               COUNT(sd.document_id) AS doc_count
+               COUNT(sd.document_id) AS doc_count,
+               MIN(sd.file_path) AS attachment_path
         FROM services s
         LEFT JOIN customers c ON c.customer_id = s.customer_id
         LEFT JOIN delivery_orders d ON d.do_number = s.do_number
@@ -17408,17 +17782,20 @@ def _render_service_section(conn, *, show_heading: bool = True):
             )
         if "bill_amount" in display_df.columns:
             display_df["service_amount_display"] = display_df["bill_amount"].apply(format_money)
-        if "payment_receipt_path" in display_df.columns:
-            display_df["payment_receipt_display"] = display_df["payment_receipt_path"].apply(
-                lambda x: "📎" if clean_text(x) else ""
-            )
-        display_df["attachment_display"] = display_df.apply(
-            lambda row: "📎"
-            if clean_text(row.get("bill_document_path"))
-            or int_or_none(row.get("doc_count"))
-            else "",
+        attachment_source = display_df.apply(
+            lambda row: clean_text(row.get("bill_document_path"))
+            or clean_text(row.get("attachment_path")),
             axis=1,
         )
+        display_df["attachment_display"] = attachment_source.apply(_file_data_uri_from_path)
+        display_df["attachment_download"] = attachment_source.apply(_file_data_uri_from_path)
+        if "payment_receipt_path" in display_df.columns:
+            display_df["payment_receipt_display"] = display_df["payment_receipt_path"].apply(
+                _file_data_uri_from_path
+            )
+            display_df["receipt_download"] = display_df["payment_receipt_path"].apply(
+                _file_data_uri_from_path
+            )
         display = display_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -17435,6 +17812,8 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "service_amount_display": "Service amount",
                 "attachment_display": "Attachment",
                 "payment_receipt_display": "Receipt",
+                "attachment_download": "Attachment download",
+                "receipt_download": "Receipt download",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -17445,11 +17824,28 @@ def _render_service_section(conn, *, show_heading: bool = True):
         st.dataframe(
             display.drop(columns=["updated_at", "service_id"], errors="ignore"),
             use_container_width=True,
+            column_config={
+                "Attachment": st.column_config.LinkColumn(
+                    "Attachment", display_text="📎 View"
+                ),
+                "Attachment download": st.column_config.LinkColumn(
+                    "Attachment download", display_text="⬇️"
+                ),
+                "Receipt": st.column_config.LinkColumn("Receipt", display_text="📎 View"),
+                "Receipt download": st.column_config.LinkColumn(
+                    "Receipt download", display_text="⬇️"
+                ),
+            },
         )
 
         records = service_records
         st.markdown("#### Update status & remarks")
         options = [int(r["service_id"]) for r in records]
+        if (
+            st.session_state.get("service_edit_select") is not None
+            and st.session_state.get("service_edit_select") not in options
+        ):
+            st.session_state.pop("service_edit_select", None)
         def service_label(record):
             do_ref = clean_text(record.get("do_number")) or "(no DO)"
             date_ref = clean_text(record.get("service_period")) or clean_text(
@@ -17468,6 +17864,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
             "Select service entry",
             options,
             format_func=lambda rid: labels.get(rid, str(rid)),
+            key="service_edit_select",
         )
         selected_record = next(r for r in records if int(r["service_id"]) == int(selected_service_id))
         new_status = status_input_widget(
@@ -17646,6 +18043,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     ),
                 )
                 conn.commit()
+                _mark_data_changed("operations")
                 label_text = labels.get(int(selected_service_id), "Service record")
                 status_label = clean_text(new_status) or DEFAULT_SERVICE_STATUS
                 message_summary = label_text
@@ -17723,6 +18121,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 )
                 conn.commit()
                 st.success(f"Uploaded {saved} document(s).")
+                _mark_data_changed("operations")
                 _safe_rerun()
             else:
                 st.info("Select at least one PDF or image to upload.")
@@ -18560,6 +18959,7 @@ def _save_quotation_record(conn, payload: dict) -> Optional[int]:
             (cur.lastrowid,),
         )
         conn.commit()
+        _mark_data_changed("quotations")
     except sqlite3.Error:
         return None
     return int(cur.lastrowid)
@@ -18639,6 +19039,7 @@ def _upsert_customer_from_manual_quotation(
                 (*updates.values(), customer_id),
             )
             conn.commit()
+            _mark_data_changed("customers")
         if phone_number:
             merge_customers_by_phone(conn, phone_number)
         return customer_id
@@ -18669,6 +19070,7 @@ def _upsert_customer_from_manual_quotation(
         ),
     )
     conn.commit()
+    _mark_data_changed("customers")
     if phone_number:
         merge_customers_by_phone(conn, phone_number)
     return cursor.lastrowid
@@ -18752,6 +19154,7 @@ def _sync_customer_from_quotation(
         (*updates.values(), customer_id),
     )
     conn.commit()
+    _mark_data_changed("customers")
 
 
 def _update_quotation_records(
@@ -18960,6 +19363,7 @@ def _update_quotation_records(
                 phone=customer_contact,
             )
     conn.commit()
+    _mark_data_changed("quotations", "customers")
     return {"updated": updated, "locked": locked}
 
 
@@ -19043,29 +19447,38 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     st.caption(
         "Upload a quotation (PDF, DOCX, or TXT) to detect customer info, contact details, and line items automatically."
     )
-    ocr_cols = st.columns(3)
-    with ocr_cols[0]:
-        skip_ocr = st.checkbox(
-            "Skip OCR",
-            value=bool(st.session_state.get("quotation_prefill_skip_ocr", False)),
-            key="quotation_prefill_skip_ocr",
-            help="Skip OCR entirely and rely on embedded PDF text only.",
-        )
-    with ocr_cols[1]:
-        ocr_all_pages = st.checkbox(
-            "OCR all pages (slow)",
-            value=bool(st.session_state.get("quotation_prefill_ocr_all_pages", False)),
-            key="quotation_prefill_ocr_all_pages",
-            help="Defaults to page 1 only. Enable this if your quotation has data on every page.",
-        )
-    with ocr_cols[2]:
-        strong_ocr = bool(st.session_state.get("quotation_prefill_strong_ocr", False))
-        toggle_label = "Use standard OCR" if strong_ocr else "Stronger OCR (slow)"
-        if st.button(toggle_label, key="quotation_prefill_strong_ocr_toggle"):
-            strong_ocr = not strong_ocr
-            st.session_state["quotation_prefill_strong_ocr"] = strong_ocr
-        if strong_ocr:
-            st.caption("Stronger OCR enabled for the next scan.")
+    is_admin = current_user_is_admin()
+    if is_admin:
+        ocr_cols = st.columns(3)
+        with ocr_cols[0]:
+            skip_ocr = st.checkbox(
+                "Skip OCR",
+                value=bool(st.session_state.get("quotation_prefill_skip_ocr", False)),
+                key="quotation_prefill_skip_ocr",
+                help="Skip OCR entirely and rely on embedded PDF text only.",
+            )
+        with ocr_cols[1]:
+            ocr_all_pages = st.checkbox(
+                "OCR all pages (slow)",
+                value=bool(st.session_state.get("quotation_prefill_ocr_all_pages", False)),
+                key="quotation_prefill_ocr_all_pages",
+                help="Defaults to page 1 only. Enable this if your quotation has data on every page.",
+            )
+        with ocr_cols[2]:
+            strong_ocr = bool(st.session_state.get("quotation_prefill_strong_ocr", False))
+            toggle_label = "Use standard OCR" if strong_ocr else "Stronger OCR (slow)"
+            if st.button(toggle_label, key="quotation_prefill_strong_ocr_toggle"):
+                strong_ocr = not strong_ocr
+                st.session_state["quotation_prefill_strong_ocr"] = strong_ocr
+            if strong_ocr:
+                st.caption("Stronger OCR enabled for the next scan.")
+    else:
+        skip_ocr = False
+        ocr_all_pages = False
+        strong_ocr = False
+        st.session_state["quotation_prefill_skip_ocr"] = False
+        st.session_state["quotation_prefill_ocr_all_pages"] = False
+        st.session_state["quotation_prefill_strong_ocr"] = False
     ocr_dpi = 180
     prefill_upload = st.file_uploader(
         "Quotation file",
@@ -19650,6 +20063,17 @@ def _render_quotation_management(conn):
         if not data:
             st.warning(f"{label}: unable to read file.", icon="⚠️")
             return
+        preview_link = _build_file_data_uri(resolved, data)
+        if preview_link:
+            st.markdown(
+                f"<a href='{preview_link}' target='_blank' rel='noopener'>Open {label} (new tab)</a>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<a href='{preview_link}' download='{resolved.name}'>Download {label}</a>",
+                unsafe_allow_html=True,
+            )
+            st.caption("Preview blocked by browser? Use Open or Download.")
         st.download_button(
             f"Download {label}",
             data=data,
@@ -20003,6 +20427,7 @@ def _render_quotation_management(conn):
             status="pending" if follow_up_iso else "done",
         )
         conn.commit()
+        _mark_data_changed("quotations")
         log_activity(
             conn,
             event_type="quotation_updated",
@@ -20057,6 +20482,7 @@ def _render_quotation_management(conn):
             (current_actor, selected_delete_id),
         )
         conn.commit()
+        _mark_data_changed("quotations")
         description = f"Quotation {delete_labels.get(selected_delete_id, selected_delete_id)} deleted"
         log_activity(
             conn,
@@ -20710,6 +21136,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 if saved_docs:
                     message = f"{message} Attached {saved_docs} document(s)."
                 st.success(message)
+                _mark_data_changed("operations")
                 _safe_rerun()
 
     maintenance_df = df_query(
@@ -20732,7 +21159,8 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                m.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                COALESCE(c.company_name, cdo.company_name) AS company,
-               COUNT(md.document_id) AS doc_count
+               COUNT(md.document_id) AS doc_count,
+               MIN(md.file_path) AS attachment_path
         FROM maintenance_records m
         LEFT JOIN customers c ON c.customer_id = m.customer_id
         LEFT JOIN delivery_orders d ON d.do_number = m.do_number
@@ -20787,14 +21215,16 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             display_df["maintenance_amount_display"] = display_df["total_amount"].apply(
                 format_money
             )
+        attachment_source = display_df["attachment_path"].apply(clean_text)
+        display_df["attachment_display"] = attachment_source.apply(_file_data_uri_from_path)
+        display_df["attachment_download"] = attachment_source.apply(_file_data_uri_from_path)
         if "payment_receipt_path" in display_df.columns:
-            display_df["payment_receipt_display"] = display_df[
-                "payment_receipt_path"
-            ].apply(lambda x: "📎" if clean_text(x) else "")
-        display_df["attachment_display"] = display_df.apply(
-            lambda row: "📎" if int_or_none(row.get("doc_count")) else "",
-            axis=1,
-        )
+            display_df["payment_receipt_display"] = display_df["payment_receipt_path"].apply(
+                _file_data_uri_from_path
+            )
+            display_df["receipt_download"] = display_df["payment_receipt_path"].apply(
+                _file_data_uri_from_path
+            )
         display = display_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -20809,6 +21239,8 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 "maintenance_amount_display": "Maintenance amount",
                 "attachment_display": "Attachment",
                 "payment_receipt_display": "Receipt",
+                "attachment_download": "Attachment download",
+                "receipt_download": "Receipt download",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -20818,11 +21250,28 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         st.dataframe(
             display.drop(columns=["updated_at", "maintenance_id"], errors="ignore"),
             use_container_width=True,
+            column_config={
+                "Attachment": st.column_config.LinkColumn(
+                    "Attachment", display_text="📎 View"
+                ),
+                "Attachment download": st.column_config.LinkColumn(
+                    "Attachment download", display_text="⬇️"
+                ),
+                "Receipt": st.column_config.LinkColumn("Receipt", display_text="📎 View"),
+                "Receipt download": st.column_config.LinkColumn(
+                    "Receipt download", display_text="⬇️"
+                ),
+            },
         )
 
         records = maintenance_records
         st.markdown("#### Update status & remarks")
         options = [int(r["maintenance_id"]) for r in records]
+        if (
+            st.session_state.get("maintenance_edit_select") is not None
+            and st.session_state.get("maintenance_edit_select") not in options
+        ):
+            st.session_state.pop("maintenance_edit_select", None)
         def maintenance_label(record):
             do_ref = clean_text(record.get("do_number")) or "(no DO)"
             date_ref = clean_text(record.get("maintenance_period")) or clean_text(
@@ -20841,6 +21290,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             "Select maintenance entry",
             options,
             format_func=lambda rid: labels.get(rid, str(rid)),
+            key="maintenance_edit_select",
         )
         selected_record = next(r for r in records if int(r["maintenance_id"]) == int(selected_maintenance_id))
         new_status = status_input_widget(
@@ -21000,6 +21450,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     ),
                 )
                 conn.commit()
+                _mark_data_changed("operations")
                 label_text = labels.get(
                     int(selected_maintenance_id),
                     "Maintenance record",
@@ -21078,6 +21529,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 )
                 conn.commit()
                 st.success(f"Uploaded {saved} document(s).")
+                _mark_data_changed("operations")
                 _safe_rerun()
             else:
                 st.info("Select at least one PDF or image to upload.")
@@ -21190,6 +21642,7 @@ def delivery_orders_page(
     show_heading: bool = True,
     record_type_label: str = "Delivery order",
     record_type_key: str = "delivery_order",
+    highlight_record: Optional[str] = None,
 ):
     if show_heading:
         st.subheader("🚚 Delivery orders")
@@ -21767,6 +22220,9 @@ def delivery_orders_page(
         do_df["status"] = do_df["status"].apply(
             lambda s: DELIVERY_STATUS_LABELS.get(normalize_delivery_status(s), "Due")
         )
+        highlight_target = clean_text(highlight_record)
+        if highlight_target:
+            st.info(f"Highlighted {record_label} {highlight_target}.")
         if "total_amount" in do_df.columns:
             def _format_total_value(value: object) -> str:
                 if value is None:
@@ -21796,27 +22252,29 @@ def delivery_orders_page(
                 continue
             row_key = f"{record_type_key}_{do_number}"
             row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.7, 1.2))
-            row_cols[0].write(do_number)
-            row_cols[1].write(clean_text(row.get("customer")) or "(unknown)")
-            row_cols[2].write(clean_text(row.get("description")) or "")
-            row_cols[3].write(clean_text(row.get("total_amount")) or "")
-            row_cols[4].write(clean_text(row.get("status")) or "")
-            row_cols[5].write(clean_text(row.get("Document")) or "")
-            receipt_value = clean_text(row.get("payment_receipt_path"))
-            receipt_file = resolve_upload_path(receipt_value) if receipt_value else None
-            if receipt_file and receipt_file.exists():
-                payload = _safe_read_bytes(receipt_file)
-                if payload:
-                    row_cols[6].download_button(
-                        "View",
-                        data=payload,
-                        file_name=receipt_file.name,
-                        key=f"do_receipt_view_{row_key}",
+            is_highlight = highlight_target and do_number == highlight_target
+            def _render_cell(col, value: str) -> None:
+                if is_highlight:
+                    col.markdown(
+                        f"<div style='background:#fef3c7; padding:0.2rem 0.35rem; border-radius:0.35rem;'>{value}</div>",
+                        unsafe_allow_html=True,
                     )
                 else:
-                    row_cols[6].caption("Receipt unreadable")
-            else:
-                row_cols[6].write(clean_text(row.get("Receipt")) or "")
+                    col.write(value)
+
+            _render_cell(row_cols[0], do_number)
+            _render_cell(row_cols[1], clean_text(row.get("customer")) or "(unknown)")
+            _render_cell(row_cols[2], clean_text(row.get("description")) or "")
+            _render_cell(row_cols[3], clean_text(row.get("total_amount")) or "")
+            _render_cell(row_cols[4], clean_text(row.get("status")) or "")
+            _render_file_action_links(
+                row_cols[5],
+                path_value=clean_text(row.get("file_path")),
+            )
+            _render_file_action_links(
+                row_cols[6],
+                path_value=clean_text(row.get("payment_receipt_path")),
+            )
             upload_receipt = row_cols[7].file_uploader(
                 "Upload receipt",
                 type=["pdf", "png", "jpg", "jpeg", "webp"],
@@ -21861,6 +22319,7 @@ def delivery_orders_page(
                             tuple(params),
                         )
                         conn.commit()
+                        _mark_data_changed("operations")
                         if "file_path" in updates:
                             log_activity(
                                 conn,
@@ -21997,6 +22456,12 @@ def delivery_orders_page(
 
 def quotation_page(conn, *, render_id: Optional[int] = None):
     st.subheader("🧾 Quotation")
+    deep_link = _consume_deep_link("Quotation")
+    if isinstance(deep_link, dict):
+        deep_quote_id = int_or_none(deep_link.get("record_id"))
+        if deep_quote_id is not None:
+            st.session_state["quotation_detail_select"] = deep_quote_id
+            st.info(f"Jumped to quotation #{deep_quote_id}.")
     _render_quotation_section(conn, render_id=render_id)
     st.markdown("---")
     _render_quotation_management(conn)
@@ -26853,6 +27318,23 @@ def main():
         ]
     if _debug_diag_enabled():
         pages.append("System Diagnostics")
+
+    deep_link = _extract_deep_link(pages)
+    if deep_link:
+        token = "|".join(
+            [
+                deep_link.get("page", ""),
+                deep_link.get("tab", ""),
+                deep_link.get("record_id", ""),
+                deep_link.get("highlight", ""),
+            ]
+        )
+        deep_link["token"] = token
+        st.session_state["pending_deep_link"] = deep_link
+        st.session_state["nav_page"] = deep_link["page"]
+        st.session_state["page"] = deep_link["page"]
+        st.session_state["nav_selection_top"] = deep_link["page"]
+        st.session_state["nav_selection_mobile"] = deep_link["page"]
 
     if "nav_page" not in st.session_state:
         st.session_state["nav_page"] = st.session_state.get("page", pages[0])
