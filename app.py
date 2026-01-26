@@ -15474,7 +15474,7 @@ def operations_page(conn):
     if customers_df.empty:
         st.info("No customers match that search.")
     else:
-        customer_ids = customers_df["customer_id"].astype(int)
+        customer_ids = customers_df["customer_id"].astype(int).tolist()
         display_customers = customers_df.copy()
         for col in [
             "name",
@@ -15512,8 +15512,7 @@ def operations_page(conn):
                 "Phone": phone_value,
                 "Address": display_customers["address"].fillna(""),
                 "Delivery address": display_customers["delivery_address"].fillna(""),
-            },
-            index=customer_ids,
+            }
         )
         state_key = "operations_customer_table_state"
         previous_table = st.session_state.get(state_key)
@@ -15561,7 +15560,9 @@ def operations_page(conn):
             st.rerun()
         st.session_state[state_key] = edited_table[["Select"]].copy()
         if not selected_rows.empty:
-            selected_customer_id = int(selected_rows.index[0])
+            selected_row_position = int(selected_rows.index[0])
+            if 0 <= selected_row_position < len(customer_ids):
+                selected_customer_id = int(customer_ids[selected_row_position])
             selected_row = customers_df[
                 customers_df["customer_id"].astype(str) == str(selected_customer_id)
             ]
@@ -22426,10 +22427,10 @@ def delivery_orders_page(
             receipt_path_value = clean_text(row.get("payment_receipt_path")) or clean_text(
                 row.get("receipt_path")
             )
-            _render_file_download_button(
+            _render_file_action_links(
                 row_cols[6],
                 path_value=receipt_path_value,
-                key=f"do_row_receipt_download_{row_key}",
+                label="📎 View",
             )
             upload_receipt = row_cols[7].file_uploader(
                 "Upload receipt",
@@ -22508,11 +22509,13 @@ def delivery_orders_page(
         }
     receipt_downloads = {}
     if not do_df.empty:
-        receipt_downloads = {
-            clean_text(row["do_number"]): clean_text(row.get("payment_receipt_path"))
-            for _, row in do_df.iterrows()
-            if clean_text(row.get("payment_receipt_path"))
-        }
+        receipt_downloads = {}
+        for _, row in do_df.iterrows():
+            receipt_path = clean_text(row.get("payment_receipt_path")) or clean_text(
+                row.get("receipt_path")
+            )
+            if receipt_path:
+                receipt_downloads[clean_text(row["do_number"])] = receipt_path
     if downloads:
         st.markdown(f"#### Download {record_label.lower()}")
         selected_download = st.selectbox(
