@@ -9965,67 +9965,6 @@ def dashboard(conn):
             )
             st.metric("Expired", expired_count)
 
-        st.markdown("#### Warranty follow-ups")
-        warranty_followups = df_query(
-            conn,
-            """
-            SELECT w.warranty_id,
-                   w.follow_up_date,
-                   c.name AS customer,
-                   c.company_name AS company,
-                   p.name AS product,
-                   p.model,
-                   w.serial
-            FROM warranties w
-            LEFT JOIN customers c ON c.customer_id = w.customer_id
-            LEFT JOIN products p ON p.product_id = w.product_id
-            WHERE w.follow_up_date IS NOT NULL
-              AND COALESCE(w.status, 'active') NOT IN ('deleted', 'completed')
-            ORDER BY date(w.follow_up_date) ASC, w.warranty_id ASC
-            LIMIT 20
-            """,
-            )
-        if warranty_followups.empty:
-            st.info("No warranty follow-ups scheduled yet.")
-        else:
-            st.caption("View-only summary of upcoming warranty follow-ups.")
-            warranty_followups = fmt_dates(warranty_followups, ["follow_up_date"])
-            warranty_followups["Customer"] = warranty_followups["customer"].apply(
-                lambda value: clean_text(value) or "(customer)"
-            )
-            warranty_followups["Company"] = warranty_followups["company"].apply(
-                lambda value: clean_text(value) or ""
-            )
-            warranty_followups["Product"] = warranty_followups.apply(
-                lambda row: " ".join(
-                    part
-                    for part in [
-                        clean_text(row.get("product")),
-                        clean_text(row.get("model")),
-                    ]
-                    if part
-                ),
-                axis=1,
-            )
-            warranty_followups["Serial"] = warranty_followups["serial"].apply(
-                lambda value: clean_text(value) or ""
-            )
-            warranty_followups["Follow-up"] = warranty_followups["follow_up_date"]
-            st.dataframe(
-                warranty_followups[
-                    [
-                        "warranty_id",
-                        "Customer",
-                        "Company",
-                        "Product",
-                        "Serial",
-                        "Follow-up",
-                    ]
-                ].rename(columns={"warranty_id": "Warranty #"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-
         st.markdown("#### Sales performance")
         sales_cols = st.columns(3)
         sales_cols[0].metric("Daily sales", format_sales_amount(sales_metrics["daily"]))
@@ -11400,6 +11339,78 @@ def dashboard(conn):
                         key=f"{key_prefix}_{safe_key}",
                         mime="application/pdf",
                     )
+
+    if is_admin:
+        st.markdown("#### Warranty follow-ups")
+        warranty_followups = df_query(
+            conn,
+            """
+            SELECT w.warranty_id,
+                   w.follow_up_date,
+                   w.follow_up_notes,
+                   w.follow_up_history,
+                   c.name AS customer,
+                   c.company_name AS company,
+                   p.name AS product,
+                   p.model,
+                   w.serial
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            LEFT JOIN products p ON p.product_id = w.product_id
+            WHERE w.follow_up_date IS NOT NULL
+              AND COALESCE(w.status, 'active') NOT IN ('deleted', 'completed')
+            ORDER BY date(w.follow_up_date) ASC, w.warranty_id ASC
+            LIMIT 20
+            """,
+        )
+        if warranty_followups.empty:
+            st.info("No warranty follow-ups scheduled yet.")
+        else:
+            st.caption("View-only summary of upcoming warranty follow-ups.")
+            warranty_followups = fmt_dates(warranty_followups, ["follow_up_date"])
+            warranty_followups["Customer"] = warranty_followups["customer"].apply(
+                lambda value: clean_text(value) or "(customer)"
+            )
+            warranty_followups["Company"] = warranty_followups["company"].apply(
+                lambda value: clean_text(value) or ""
+            )
+            warranty_followups["Product"] = warranty_followups.apply(
+                lambda row: " ".join(
+                    part
+                    for part in [
+                        clean_text(row.get("product")),
+                        clean_text(row.get("model")),
+                    ]
+                    if part
+                ),
+                axis=1,
+            )
+            warranty_followups["Serial"] = warranty_followups["serial"].apply(
+                lambda value: clean_text(value) or ""
+            )
+            warranty_followups["Follow-up"] = warranty_followups["follow_up_date"]
+            warranty_followups["Remarks"] = warranty_followups["follow_up_notes"].apply(
+                lambda value: clean_text(value) or ""
+            )
+            warranty_followups["Remarks history"] = warranty_followups[
+                "follow_up_history"
+            ].apply(lambda value: clean_text(value) or "")
+            st.dataframe(
+                warranty_followups[
+                    [
+                        "warranty_id",
+                        "Customer",
+                        "Company",
+                        "Product",
+                        "Serial",
+                        "Follow-up",
+                        "Remarks",
+                        "Remarks history",
+                    ]
+                ].rename(columns={"warranty_id": "Warranty #"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     st.markdown("---")
     st.subheader("🔎 Quick snapshots")
