@@ -8434,39 +8434,56 @@ def init_ui():
             top: 0;
             left: 0;
             right: 0;
-            z-index: 9999;
-            background: #fff;
+            z-index: 99999;
+            background: #fff !important;
             padding: 0 1rem;
             border-bottom: 1px solid var(--ps-panel-border);
             box-shadow: 0 0.25rem 0.5rem rgba(16, 24, 40, 0.08);
             height: var(--ps-top-nav-height);
             display: flex;
-            align-items: center;
+            align-items: flex-start;
+            gap: 0;
+            margin: 0 !important;
+        }
+        [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] #ps_nav_anchor)
+            > [data-testid="stElementContainer"] {
+            margin: 0 !important;
+            padding: 0 !important;
         }
         .ps-top-nav {
             width: 100%;
             height: var(--ps-top-nav-height);
             display: flex;
-            align-items: center;
+            align-items: flex-start;
+            padding: 0;
+            margin: 0;
         }
         .ps-nav-row {
             width: 100%;
+            margin: 0;
+            padding: 0;
         }
         .ps-top-nav [data-testid="stHorizontalBlock"],
         .ps-nav-row [data-testid="stHorizontalBlock"] {
-            align-items: center;
-            margin: 0;
+            align-items: flex-start;
+            margin: 0 !important;
+            padding: 0 !important;
+            gap: 0;
         }
         .ps-top-nav [data-testid="column"],
         .ps-nav-row [data-testid="column"] {
             display: flex;
-            align-items: center;
+            align-items: flex-start;
+            margin: 0 !important;
+            padding: 0 !important;
         }
         .ps-top-nav [data-testid="column"] > div,
         .ps-nav-row [data-testid="column"] > div {
             display: flex;
-            align-items: center;
+            align-items: flex-start;
             width: 100%;
+            margin: 0 !important;
+            padding: 0 !important;
         }
         .ps-top-nav-spacer {
             height: var(--ps-top-nav-height);
@@ -8474,11 +8491,15 @@ def init_ui():
         .ps-top-nav-links,
         .ps-nav-links {
             display: flex;
-            align-items: center;
-            gap: 0.5rem;
+            align-items: flex-start;
+            gap: 0;
             justify-content: center;
-            min-height: 100%;
+            min-height: 0;
             width: 100%;
+            margin: 0 !important;
+            padding: 0 !important;
+            background: #fff !important;
+            position: relative;
         }
         .ps-top-nav-links .ps-top-nav-menu-label,
         .ps-nav-links .ps-top-nav-menu-label {
@@ -8496,8 +8517,11 @@ def init_ui():
             width: auto !important;
             overflow-x: auto;
             scrollbar-width: thin;
-            margin: 0;
-            padding: 0;
+            margin: 0 !important;
+            padding: 0 !important;
+            background: #fff !important;
+            position: relative;
+            line-height: normal;
         }
         .ps-top-nav-links label,
         .ps-nav-links label {
@@ -8508,18 +8532,23 @@ def init_ui():
         .ps-nav-links [data-testid="stRadio"] {
             margin: 0 !important;
             padding: 0 !important;
+            background: #fff !important;
+            position: relative;
         }
         .ps-top-nav-links [data-testid="stRadio"] > div[role="radiogroup"],
         .ps-nav-links [data-testid="stRadio"] > div[role="radiogroup"] {
             display: flex !important;
             flex-direction: row !important;
             flex-wrap: nowrap;
-            align-items: center;
+            align-items: flex-start;
             gap: 0.35rem 0.65rem;
             overflow-x: auto;
             scrollbar-width: thin;
-            margin: 0;
-            padding: 0;
+            margin: 0 !important;
+            padding: 0 !important;
+            background: #fff !important;
+            position: relative;
+            line-height: normal;
         }
         .ps-top-nav-actions,
         .ps-nav-actions {
