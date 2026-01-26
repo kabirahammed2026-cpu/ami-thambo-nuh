@@ -6297,6 +6297,10 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     work = df.copy()
+    if "company" not in work.columns:
+        work["company"] = None
+    if "customer" not in work.columns:
+        work["customer"] = None
     work["description"] = work.apply(
         lambda row: dedupe_join(
             [
@@ -11964,18 +11968,6 @@ def _render_notification_entry(entry: dict[str, object], *, include_actor: bool 
     details = entry.get("details") or []
     for detail in list(details)[:5]:
         st.caption(f"• {detail}")
-    deep_link = entry.get("deep_link")
-    if isinstance(deep_link, dict) and deep_link.get("page"):
-        link_url = _build_deep_link_url(
-            page=str(deep_link.get("page")),
-            tab=clean_text(deep_link.get("tab")),
-            record_id=clean_text(deep_link.get("record_id")),
-            highlight=bool(deep_link.get("highlight")),
-        )
-        st.markdown(
-            f"<a href='{link_url}' target='_self'>Open record</a>",
-            unsafe_allow_html=True,
-        )
     footer_bits: list[str] = []
     if include_actor:
         actor = clean_text(entry.get("actor"))
@@ -15371,7 +15363,6 @@ def operations_page(conn):
                 "Customer": customers_df["name"].fillna(""),
                 "Company": customers_df["company_name"].fillna(""),
                 "Phone": customers_df["phone"].fillna(""),
-                "Sales rep": customers_df["sales_person"].fillna(""),
                 "Address": customers_df["address"].fillna(""),
                 "Delivery address": customers_df["delivery_address"].fillna(""),
             },
@@ -15379,29 +15370,16 @@ def operations_page(conn):
         )
         state_key = "operations_customer_table_state"
         previous_table = st.session_state.get(state_key)
-        if not isinstance(previous_table, pd.DataFrame):
-            previous_table = None
-        if previous_table is None:
-            st.session_state[state_key] = table_df
-        else:
-            previous_list = previous_table.index.tolist()
-            current_list = table_df.index.tolist()
-            if previous_list != current_list:
-                selected_ids = set()
-                if "Select" in previous_table:
-                    selected_ids = set(previous_table.index[previous_table["Select"]].tolist())
-                refreshed_table = table_df.copy()
-                if selected_ids:
-                    refreshed_table["Select"] = refreshed_table.index.isin(selected_ids)
-                st.session_state[state_key] = refreshed_table
-        table_source = table_df.copy()
-        if previous_table is not None and "Select" in previous_table:
-            table_source["Select"] = (
+        previous_select = pd.Series(False, index=table_df.index)
+        if isinstance(previous_table, pd.DataFrame) and "Select" in previous_table:
+            previous_select = (
                 previous_table["Select"]
                 .reindex(table_df.index)
                 .fillna(False)
                 .astype(bool)
             )
+        table_source = table_df.copy()
+        table_source["Select"] = previous_select
         edited_table = safe_data_editor(
             table_source,
             hide_index=True,
@@ -15420,11 +15398,7 @@ def operations_page(conn):
             if isinstance(edited_table, pd.DataFrame)
             else pd.DataFrame(edited_table)
         )
-        prev_table = st.session_state.get(state_key, table_df)
-        prev_select = pd.Series(
-            prev_table.get("Select", [False] * len(edited_table)),
-            index=edited_table.index,
-        ).fillna(False)
+        prev_select = pd.Series(previous_select, index=edited_table.index).fillna(False)
         selected_rows = edited_table[edited_table["Select"]]
         if len(selected_rows.index) > 1:
             newly_selected = edited_table[
@@ -15436,9 +15410,9 @@ def operations_page(conn):
                 chosen_idx = selected_rows.index[-1]
             edited_table["Select"] = False
             edited_table.loc[chosen_idx, "Select"] = True
-            st.session_state[state_key] = edited_table
+            st.session_state[state_key] = edited_table[["Select"]].copy()
             st.rerun()
-        st.session_state[state_key] = edited_table
+        st.session_state[state_key] = edited_table[["Select"]].copy()
         if not selected_rows.empty:
             selected_customer_id = int(selected_rows.index[0])
             selected_row = customers_df[
@@ -17105,9 +17079,6 @@ def warranties_page(conn):
         else:
             tagged_note = f"[Warranty #{selected_warranty}] {note_value}"
             reminder_iso = to_iso_date(reminder_date)
-            existing_remark = clean_text(selected_record.get("follow_up_notes")) or clean_text(
-                selected_record.get("remarks")
-            )
             follow_up_status = "completed" if not reminder_iso else "pending"
             if reminder_iso:
                 reminder_dt = pd.to_datetime(reminder_iso, errors="coerce")
@@ -17115,7 +17086,7 @@ def warranties_page(conn):
                     follow_up_status = "overdue"
             follow_up_history = clean_text(selected_record.get("follow_up_history")) or ""
             note_clean = note_value.strip()
-            if note_clean and note_clean != (existing_remark or "").strip():
+            if note_clean:
                 history_entry = f"{date.today().isoformat()}: {note_clean}"
                 follow_up_history = (
                     f"{follow_up_history}\n{history_entry}".strip()
@@ -17196,8 +17167,7 @@ def warranties_page(conn):
                n.is_done,
                n.created_at,
                c.name AS customer,
-               c.company_name AS company,
-               c.sales_person AS staff
+               c.company_name AS company
         FROM customer_notes n
         LEFT JOIN customers c ON c.customer_id = n.customer_id
         WHERE n.note LIKE '[Warranty #%'
@@ -22061,6 +22031,8 @@ def delivery_orders_page(
                 )
                 conn.commit()
                 st.success("Receipt added to locked record.")
+                _mark_data_changed("delivery_orders")
+                _safe_rerun()
                 return
             items_clean, total_amount_value = normalize_delivery_items(
                 st.session_state.get(items_rows_key, [])
@@ -22118,6 +22090,8 @@ def delivery_orders_page(
             if selected_customer:
                 link_delivery_order_to_customer(conn, cleaned_number, int(selected_customer))
             conn.commit()
+            if receipt_upload is not None:
+                _mark_data_changed("delivery_orders")
             if existing.empty:
                 action_label = "created"
             elif existing_deleted_at:
@@ -22352,7 +22326,7 @@ def delivery_orders_page(
                             tuple(params),
                         )
                         conn.commit()
-                        _mark_data_changed("operations")
+                        _mark_data_changed("operations", "delivery_orders")
                         if "file_path" in updates:
                             log_activity(
                                 conn,
@@ -26340,9 +26314,10 @@ def reports_page(conn):
                     uploaded_df, selected_mapping, template_key=template_key
                 )
                 if imported_rows:
-                    imported_df = pd.DataFrame(imported_rows)
-                    st.session_state["reports_import_df"] = imported_df.copy()
                     st.session_state["reports_import_loaded"] = True
+                    st.session_state["reports_import_df"] = pd.DataFrame(imported_rows)
+                    st.session_state["report_grid_editor_state"] = imported_rows
+                    st.session_state.pop("report_grid_editor", None)
                     st.session_state["report_grid_import_rows"] = imported_rows
                     st.success(
                         f"Loaded {len(imported_rows)} row(s) using the selected mapping."
