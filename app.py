@@ -2158,7 +2158,7 @@ def _load_operations_customers(
 ) -> pd.DataFrame:
     conn = sqlite3.connect(db_path)
     try:
-        return pd.read_sql_query(
+        customers_df = pd.read_sql_query(
             f"""
             SELECT customer_id,
                    name,
@@ -2166,16 +2166,33 @@ def _load_operations_customers(
                    phone,
                    address,
                    delivery_address,
-                   sales_person
+                   sales_person,
+                   created_at
             FROM customers
             {where_clause}
-            ORDER BY LOWER(COALESCE(name, '')), customer_id
+            ORDER BY datetime(created_at) DESC, customer_id DESC
             """,
             conn,
             params=params,
         )
     finally:
         conn.close()
+    customers_df = customers_df.copy()
+    if "customer_id" in customers_df.columns:
+        customers_df["customer_id"] = customers_df["customer_id"].astype(str)
+    display_columns = [
+        "name",
+        "company_name",
+        "phone",
+        "sales_person",
+        "address",
+        "delivery_address",
+    ]
+    for col in display_columns:
+        if col not in customers_df.columns:
+            customers_df[col] = ""
+        customers_df[col] = customers_df[col].fillna("").astype(str)
+    return customers_df
 
 
 def _refresh_customer_caches() -> None:
@@ -14728,18 +14745,9 @@ def render_operations_document_uploader(
             else:
                 st.caption("File missing on disk.")
 
-            edit_cols = st.columns(2)
+            doc_type_choice = row.get("Doc Type") or doc_type_options[0]
+            edit_cols = st.columns(1)
             with edit_cols[0]:
-                doc_type_choice = st.selectbox(
-                    "Doc type",
-                    options=doc_type_options,
-                    index=doc_type_options.index(row["Doc Type"])
-                    if row["Doc Type"] in doc_type_options
-                    else 0,
-                    key=f"{key_prefix}_doc_type_{doc_id}",
-                    disabled=not can_edit,
-                )
-            with edit_cols[1]:
                 linked_value = row.get("Linked entity") or ""
                 linked_disabled = row["source"] in {"delivery", "other"}
                 linked_label = (
@@ -15434,7 +15442,7 @@ def operations_page(conn):
         if not selected_rows.empty:
             selected_customer_id = int(selected_rows.index[0])
             selected_row = customers_df[
-                customers_df["customer_id"] == selected_customer_id
+                customers_df["customer_id"].astype(str) == str(selected_customer_id)
             ]
             if not selected_row.empty:
                 name = clean_text(selected_row.iloc[0].get("name"))
@@ -16974,7 +16982,7 @@ def warranties_page(conn):
     st.caption("Add remarks and schedule a reminder before a warranty expires.")
     scope_clause, scope_params = customer_scope_filter("c")
     scope_filter = f" AND {scope_clause}" if scope_clause else ""
-    status_condition = "COALESCE(w.status, 'active') = 'active'"
+    status_condition = "COALESCE(w.status, 'active') NOT IN ('deleted')"
     warranty_followups = df_query(
         conn,
         dedent(
@@ -17097,24 +17105,20 @@ def warranties_page(conn):
         else:
             tagged_note = f"[Warranty #{selected_warranty}] {note_value}"
             reminder_iso = to_iso_date(reminder_date)
-            existing_remarks = clean_text(selected_record.get("remarks"))
-            if existing_remarks and note_value not in existing_remarks:
-                combined_remarks = f"{existing_remarks}\n{note_value}"
-            else:
-                combined_remarks = existing_remarks or note_value
+            existing_remark = clean_text(selected_record.get("follow_up_notes")) or clean_text(
+                selected_record.get("remarks")
+            )
             follow_up_status = "completed" if not reminder_iso else "pending"
             if reminder_iso:
                 reminder_dt = pd.to_datetime(reminder_iso, errors="coerce")
                 if pd.notna(reminder_dt) and reminder_dt.date() < date.today():
                     follow_up_status = "overdue"
             follow_up_history = clean_text(selected_record.get("follow_up_history")) or ""
-            history_entry = _build_follow_up_history_entry(
-                follow_up_date=reminder_iso,
-                follow_up_notes=note_value,
-            )
-            if history_entry and history_entry not in follow_up_history:
+            note_clean = note_value.strip()
+            if note_clean and note_clean != (existing_remark or "").strip():
+                history_entry = f"{date.today().isoformat()}: {note_clean}"
                 follow_up_history = (
-                    f"{follow_up_history}\n{history_entry}"
+                    f"{follow_up_history}\n{history_entry}".strip()
                     if follow_up_history
                     else history_entry
                 )
@@ -17170,7 +17174,7 @@ def warranties_page(conn):
                 WHERE warranty_id=?
                 """,
                 (
-                    combined_remarks,
+                    note_value,
                     follow_up_status,
                     note_value,
                     reminder_iso,
@@ -17204,6 +17208,18 @@ def warranties_page(conn):
     if saved_followups.empty:
         st.caption("No saved warranty reminders yet.")
     else:
+        history_by_warranty = {
+            int(record["warranty_id"]): clean_text(record.get("follow_up_history")) or ""
+            for record in warranty_records
+            if int_or_none(record.get("warranty_id")) is not None
+        }
+        remark_by_warranty = {
+            int(record["warranty_id"]): clean_text(record.get("follow_up_notes"))
+            or clean_text(record.get("remarks"))
+            or ""
+            for record in warranty_records
+            if int_or_none(record.get("warranty_id")) is not None
+        }
         followup_rows: list[dict[str, object]] = []
         warranty_note_map: dict[int, list[int]] = {}
         note_remind_on_map: dict[int, Optional[str]] = {}
@@ -17220,7 +17236,6 @@ def warranties_page(conn):
             status_label = "Completed" if is_done else "Pending"
             remind_on_raw = clean_text(row.get("remind_on")) or ""
             reminder_dt = pd.to_datetime(remind_on_raw, errors="coerce")
-            history_entry = f"{reminder_label or created_label}: {note_text}".strip()
             group = grouped_followups.get(warranty_id)
             if not group:
                 group = {
@@ -17230,16 +17245,14 @@ def warranties_page(conn):
                     "Company": clean_text(row.get("company")) or "",
                     "Reminder date": reminder_label,
                     "Status": status_label,
-                    "Remark": note_text,
-                    "Remarks history": [],
+                    "Remark": remark_by_warranty.get(warranty_id, ""),
+                    "Remarks history": history_by_warranty.get(warranty_id, ""),
                     "has_pending": not is_done,
                     "remind_on_raw": remind_on_raw,
                     "next_due_raw": remind_on_raw,
                     "next_due_dt": reminder_dt,
-                    "Assigned staff": clean_text(row.get("staff")) or "",
                 }
                 grouped_followups[warranty_id] = group
-            group["Remarks history"].append(history_entry)
             if not is_done:
                 group["has_pending"] = True
                 if reminder_dt is not pd.NaT and pd.notna(reminder_dt):
@@ -17251,8 +17264,6 @@ def warranties_page(conn):
                 warranty_note_map.setdefault(warranty_id, []).append(int(note_id))
                 note_remind_on_map[int(note_id)] = clean_text(row.get("remind_on"))
         for group in grouped_followups.values():
-            history_entries = [entry for entry in group.get("Remarks history", []) if entry]
-            group["Remarks history"] = "\n".join(history_entries)
             group["Status"] = "Pending" if group.get("has_pending") else "Completed"
             group.pop("has_pending", None)
             followup_rows.append(group)
@@ -17265,9 +17276,10 @@ def warranties_page(conn):
             "Status",
             "Remark",
             "Remarks history",
-            "Assigned staff",
         ]
-        editable_df = followup_df[[col for col in editor_columns if col in followup_df.columns]].copy()
+        pending_df = followup_df[followup_df["Status"] != "Completed"].copy()
+        completed_df = followup_df[followup_df["Status"] == "Completed"].copy()
+        editable_df = pending_df[[col for col in editor_columns if col in pending_df.columns]].copy()
         edited_followups = safe_data_editor(
             editable_df,
             use_container_width=True,
@@ -17328,6 +17340,19 @@ def warranties_page(conn):
             st.success("Follow-up status updated.")
             _safe_rerun()
 
+        st.markdown("#### Completed follow-ups")
+        if completed_df.empty:
+            st.caption("No completed follow-ups yet.")
+        else:
+            completed_view = completed_df[
+                [col for col in editor_columns if col in completed_df.columns]
+            ].copy()
+            st.dataframe(
+                completed_view,
+                use_container_width=True,
+                hide_index=True,
+            )
+
         if is_admin and not followup_df.empty:
             st.markdown("#### Admin follow-up overview")
             status_filter = st.selectbox(
@@ -17357,7 +17382,6 @@ def warranties_page(conn):
                         "Company": row.get("Company"),
                         "Item": row.get("Warranty"),
                         "Due date": due_label,
-                        "Assigned staff": row.get("Assigned staff"),
                         "Status": status_label,
                         "Notes": row.get("Remark"),
                         "_due_raw": due_raw,
@@ -22216,7 +22240,13 @@ def delivery_orders_page(
                     )
                 ]
         do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
-        do_df["Receipt"] = do_df["payment_receipt_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
+        receipt_paths = do_df["payment_receipt_path"].fillna("")
+        if "receipt_path" in do_df.columns:
+            receipt_paths = receipt_paths.where(
+                receipt_paths.astype(str).str.strip().ne(""),
+                do_df["receipt_path"].fillna(""),
+            )
+        do_df["Receipt"] = receipt_paths.apply(lambda fp: "📎" if clean_text(fp) else "")
         do_df["status"] = do_df["status"].apply(
             lambda s: DELIVERY_STATUS_LABELS.get(normalize_delivery_status(s), "Due")
         )
@@ -22271,9 +22301,12 @@ def delivery_orders_page(
                 row_cols[5],
                 path_value=clean_text(row.get("file_path")),
             )
+            receipt_path_value = clean_text(row.get("payment_receipt_path")) or clean_text(
+                row.get("receipt_path")
+            )
             _render_file_action_links(
                 row_cols[6],
-                path_value=clean_text(row.get("payment_receipt_path")),
+                path_value=receipt_path_value,
             )
             upload_receipt = row_cols[7].file_uploader(
                 "Upload receipt",
@@ -26225,6 +26258,13 @@ def reports_page(conn):
         help="Populate the grid below by importing a spreadsheet with columns matching the report table.",
         key="report_grid_importer",
     )
+    if st.session_state.get("reports_import_df") is not None:
+        if st.button("Clear imported rows", key="report_import_clear"):
+            st.session_state.pop("reports_import_df", None)
+            st.session_state.pop("reports_import_loaded", None)
+            st.session_state.pop("report_grid_editor_state", None)
+            _reset_report_import_state(clear_uploader=True)
+            st.rerun()
     uploaded_df: Optional[pd.DataFrame] = None
     if import_file is not None:
         import_bytes = import_file.getvalue()
@@ -26300,6 +26340,9 @@ def reports_page(conn):
                     uploaded_df, selected_mapping, template_key=template_key
                 )
                 if imported_rows:
+                    imported_df = pd.DataFrame(imported_rows)
+                    st.session_state["reports_import_df"] = imported_df.copy()
+                    st.session_state["reports_import_loaded"] = True
                     st.session_state["report_grid_import_rows"] = imported_rows
                     st.success(
                         f"Loaded {len(imported_rows)} row(s) using the selected mapping."
@@ -26327,10 +26370,14 @@ def reports_page(conn):
         if editing_record
         else []
     )
-    if "report_grid_import_rows" in st.session_state:
-        grid_seed_rows = st.session_state.pop("report_grid_import_rows") or grid_seed_rows
-    elif st.session_state.get("report_grid_editor_state"):
+    if st.session_state.get("report_grid_editor_state"):
         grid_seed_rows = st.session_state["report_grid_editor_state"] or grid_seed_rows
+    elif st.session_state.get("reports_import_df") is not None:
+        imported_df = st.session_state.get("reports_import_df")
+        if isinstance(imported_df, pd.DataFrame) and not imported_df.empty:
+            grid_seed_rows = imported_df.to_dict("records")
+    elif st.session_state.get("report_grid_import_rows") is not None:
+        grid_seed_rows = st.session_state.get("report_grid_import_rows") or grid_seed_rows
     if not grid_seed_rows:
         if template_key == "service":
             fallback_row = _default_report_grid_row(template_key)
@@ -26342,6 +26389,11 @@ def reports_page(conn):
                 fallback_row["product_details"] = legacy_research
             if any(val not in (None, "") for val in fallback_row.values()):
                 grid_seed_rows = [fallback_row]
+    imported_df_state = st.session_state.get("reports_import_df")
+    if st.session_state.get("reports_import_loaded") and (
+        not isinstance(imported_df_state, pd.DataFrame) or imported_df_state.empty
+    ):
+        st.info("No rows loaded yet.")
     existing_attachment_path = (
         resolve_upload_path(existing_attachment_value)
         if existing_attachment_value
