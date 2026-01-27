@@ -5644,6 +5644,94 @@ def _file_data_uri_from_path(path_value: Optional[str]) -> Optional[str]:
     return _build_file_data_uri(resolved, payload)
 
 
+def _build_attachment_bundle_download(
+    attachment_path: Optional[str],
+    receipt_path: Optional[str],
+    *,
+    bundle_label: str,
+) -> Optional[tuple[str, str]]:
+    attachments: list[tuple[str, str, bytes]] = []
+    for doc_type, path_value in (("attachment", attachment_path), ("receipt", receipt_path)):
+        if not path_value:
+            continue
+        resolved = resolve_upload_path(path_value)
+        if not resolved or not resolved.exists():
+            continue
+        payload = _safe_read_bytes(resolved)
+        if not payload:
+            continue
+        attachments.append((doc_type, resolved.name, payload))
+    if not attachments:
+        return None
+    if len(attachments) == 1:
+        _, filename, payload = attachments[0]
+        uri = _build_file_data_uri(Path(filename), payload)
+        if not uri:
+            return None
+        return uri, filename
+    safe_label = _sanitize_path_component(bundle_label) or "attachments"
+    zip_name = f"{safe_label}_attachments.zip"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for doc_type, filename, payload in attachments:
+            arcname = "/".join([doc_type, filename])
+            zf.writestr(arcname, payload)
+    uri = _build_file_data_uri(Path(zip_name), buffer.getvalue())
+    if not uri:
+        return None
+    return uri, zip_name
+
+
+def _render_attachment_bundle_link(
+    container,
+    *,
+    attachment_path: Optional[str],
+    receipt_path: Optional[str],
+    bundle_label: str,
+    label: str = "📎",
+) -> None:
+    result = _build_attachment_bundle_download(
+        attachment_path,
+        receipt_path,
+        bundle_label=bundle_label,
+    )
+    if not result:
+        container.write("")
+        return
+    uri, filename = result
+    container.markdown(
+        (
+            "<div class='ps-file-links'>"
+            f"<a href='{uri}' download='{filename}'>{label}</a>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _resolve_bundle_label(
+    primary: Optional[str],
+    *,
+    fallback_prefix: str,
+    fallback_id: Optional[object],
+) -> str:
+    label = clean_text(primary)
+    if label:
+        return label
+    if fallback_id is not None:
+        try:
+            if pd.isna(fallback_id):
+                fallback_id = None
+        except Exception:
+            pass
+    if fallback_id is not None:
+        try:
+            return f"{fallback_prefix}_{int(fallback_id)}"
+        except Exception:
+            return fallback_prefix
+    return fallback_prefix
+
+
 def _render_file_action_links(
     container,
     *,
@@ -13704,7 +13792,18 @@ def _save_customer_document_upload(
             "items_payload": items_payload,
             "created_by": uploader_id,
         }
-        _save_quotation_record(conn, payload)
+        quotation_id = _save_quotation_record(conn, payload)
+        if not quotation_id:
+            st.error("Unable to record the quotation entry. Please try again.")
+            return False
+        log_activity(
+            conn,
+            event_type="quotation_created",
+            description=f"Quotation uploaded for customer #{customer_id}",
+            entity_type="quotation",
+            entity_id=int(quotation_id),
+            user_id=uploader_id,
+        )
     elif doc_type in ("Delivery order", "Work done"):
         do_number = clean_text(details.get("do_number"))
         status_value = normalize_delivery_status(details.get("status"))
@@ -17954,11 +18053,22 @@ def _render_service_section(conn, *, show_heading: bool = True):
             axis=1,
         )
         display_df["attachment_display"] = attachment_source.apply(_file_data_uri_from_path)
-        display_df["attachment_download"] = attachment_source.apply(_file_data_uri_from_path)
-        if "payment_receipt_path" in display_df.columns:
-            display_df["payment_receipt_display"] = display_df["payment_receipt_path"].apply(
-                _file_data_uri_from_path
-            )
+        display_df["attachment_download"] = display_df.apply(
+            lambda row: (
+                _build_attachment_bundle_download(
+                    clean_text(row.get("bill_document_path"))
+                    or clean_text(row.get("attachment_path")),
+                    clean_text(row.get("payment_receipt_path")),
+                    bundle_label=_resolve_bundle_label(
+                        clean_text(row.get("do_number")),
+                        fallback_prefix="service",
+                        fallback_id=row.get("service_id"),
+                    ),
+                )
+                or (None, None)
+            )[0],
+            axis=1,
+        )
         display = display_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -17974,7 +18084,6 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "condition_remarks": "Condition notes",
                 "service_amount_display": "Service amount",
                 "attachment_display": "Attachment",
-                "payment_receipt_display": "Receipt",
                 "attachment_download": "Attachment download",
                 "customer": "Customer",
                 "company": "Company",
@@ -17993,7 +18102,6 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "Attachment download": st.column_config.LinkColumn(
                     "Attachment download", display_text="⬇️"
                 ),
-                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
             },
         )
 
@@ -21384,11 +21492,21 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             )
         attachment_source = display_df["attachment_path"].apply(clean_text)
         display_df["attachment_display"] = attachment_source.apply(_file_data_uri_from_path)
-        display_df["attachment_download"] = attachment_source.apply(_file_data_uri_from_path)
-        if "payment_receipt_path" in display_df.columns:
-            display_df["payment_receipt_display"] = display_df["payment_receipt_path"].apply(
-                _file_data_uri_from_path
-            )
+        display_df["attachment_download"] = display_df.apply(
+            lambda row: (
+                _build_attachment_bundle_download(
+                    clean_text(row.get("attachment_path")),
+                    clean_text(row.get("payment_receipt_path")),
+                    bundle_label=_resolve_bundle_label(
+                        clean_text(row.get("do_number")),
+                        fallback_prefix="maintenance",
+                        fallback_id=row.get("maintenance_id"),
+                    ),
+                )
+                or (None, None)
+            )[0],
+            axis=1,
+        )
         display = display_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -21402,7 +21520,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 "remarks": "Remarks",
                 "maintenance_amount_display": "Maintenance amount",
                 "attachment_display": "Attachment",
-                "payment_receipt_display": "Receipt",
                 "attachment_download": "Attachment download",
                 "customer": "Customer",
                 "company": "Company",
@@ -21420,7 +21537,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 "Attachment download": st.column_config.LinkColumn(
                     "Attachment download", display_text="⬇️"
                 ),
-                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
             },
         )
 
@@ -22385,13 +22501,6 @@ def delivery_orders_page(
                     )
                 ]
         do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
-        receipt_paths = do_df["payment_receipt_path"].fillna("")
-        if "receipt_path" in do_df.columns:
-            receipt_paths = receipt_paths.where(
-                receipt_paths.astype(str).str.strip().ne(""),
-                do_df["receipt_path"].fillna(""),
-            )
-        do_df["Receipt"] = receipt_paths.apply(lambda fp: "📎" if clean_text(fp) else "")
         do_df["status"] = do_df["status"].apply(
             lambda s: DELIVERY_STATUS_LABELS.get(normalize_delivery_status(s), "Due")
         )
@@ -22411,22 +22520,21 @@ def delivery_orders_page(
 
             do_df["total_amount"] = do_df["total_amount"].apply(_format_total_value)
         st.markdown(f"#### {record_label} records")
-        header_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.9, 1.2))
+        header_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.9, 1.2))
         header_cols[0].write(f"**{number_label}**")
         header_cols[1].write("**Customer**")
         header_cols[2].write("**Description**")
         header_cols[3].write("**Total**")
         header_cols[4].write("**Status**")
         header_cols[5].write("**Attachment**")
-        header_cols[6].write("**Receipt**")
-        header_cols[7].write("**Upload receipt**")
+        header_cols[6].write("**Upload receipt**")
 
         for _, row in do_df.iterrows():
             do_number = clean_text(row.get("do_number"))
             if not do_number:
                 continue
             row_key = f"{record_type_key}_{do_number}"
-            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.7, 0.9, 1.2))
+            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.9, 1.2))
             is_highlight = highlight_target and do_number == highlight_target
             def _render_cell(col, value: str) -> None:
                 if is_highlight:
@@ -22442,20 +22550,16 @@ def delivery_orders_page(
             _render_cell(row_cols[2], clean_text(row.get("description")) or "")
             _render_cell(row_cols[3], clean_text(row.get("total_amount")) or "")
             _render_cell(row_cols[4], clean_text(row.get("status")) or "")
-            _render_file_action_links(
-                row_cols[5],
-                path_value=clean_text(row.get("file_path")),
-            )
             receipt_path_value = clean_text(row.get("payment_receipt_path")) or clean_text(
                 row.get("receipt_path")
             )
-            _render_file_action_links(
-                row_cols[6],
-                path_value=receipt_path_value,
-                label="⬇️",
-                download_only=True,
+            _render_attachment_bundle_link(
+                row_cols[5],
+                attachment_path=clean_text(row.get("file_path")),
+                receipt_path=receipt_path_value,
+                bundle_label=f"{record_label}_{do_number}",
             )
-            upload_receipt = row_cols[7].file_uploader(
+            upload_receipt = row_cols[6].file_uploader(
                 "Upload receipt",
                 type=["pdf", "png", "jpg", "jpeg", "webp"],
                 label_visibility="collapsed",
@@ -22468,7 +22572,7 @@ def delivery_orders_page(
                     label=f"{record_label} row receipt OCR",
                 )
             save_label = f"💾 Save {record_label}"
-            save_doc = row_cols[7].button(
+            save_doc = row_cols[6].button(
                 save_label, type="secondary", key=f"do_row_save_{row_key}"
             )
             if _guard_double_submit(f"do_row_save_{row_key}", save_doc):
@@ -22530,15 +22634,6 @@ def delivery_orders_page(
             for _, row in do_df.iterrows()
             if clean_text(row.get("file_path"))
         }
-    receipt_downloads = {}
-    if not do_df.empty:
-        receipt_downloads = {}
-        for _, row in do_df.iterrows():
-            receipt_path = clean_text(row.get("payment_receipt_path")) or clean_text(
-                row.get("receipt_path")
-            )
-            if receipt_path:
-                receipt_downloads[clean_text(row["do_number"])] = receipt_path
     if downloads:
         st.markdown(f"#### Download {record_label.lower()}")
         selected_download = st.selectbox(
@@ -22546,44 +22641,32 @@ def delivery_orders_page(
             list(downloads.keys()),
             key=f"{key_prefix}_download_select",
         )
-        path_value = downloads.get(selected_download)
-        file_path = resolve_upload_path(path_value)
-        if file_path and file_path.exists():
-            payload = _safe_read_bytes(file_path)
-            if payload:
-                st.download_button(
-                    f"Download {selected_download}",
-                    data=payload,
-                    file_name=file_path.name,
-                    key=f"{key_prefix}_download_button",
+        attachment_path_value = downloads.get(selected_download)
+        receipt_path_value = None
+        if not do_df.empty:
+            receipt_row = do_df[
+                do_df["do_number"].apply(lambda val: clean_text(val) == selected_download)
+            ]
+            if not receipt_row.empty:
+                receipt_path_value = clean_text(receipt_row.iloc[0].get("payment_receipt_path")) or clean_text(
+                    receipt_row.iloc[0].get("receipt_path")
                 )
-            else:
-                st.warning("Unable to read the selected file.", icon="⚠️")
+        bundle = _build_attachment_bundle_download(
+            attachment_path_value,
+            receipt_path_value,
+            bundle_label=f"{record_label}_{selected_download}",
+        )
+        if bundle:
+            uri, filename = bundle
+            st.download_button(
+                f"Download {selected_download}",
+                data=base64.b64decode(uri.split(",", 1)[1]) if uri else b"",
+                file_name=filename,
+                key=f"{key_prefix}_download_button",
+            )
         else:
             st.info("The selected delivery order file could not be found.")
-    if receipt_downloads:
-        st.markdown(f"#### Download {record_label_lower} receipts")
-        selected_receipt = st.selectbox(
-            f"Pick a {record_label_lower} receipt",
-            list(receipt_downloads.keys()),
-            key=f"{key_prefix}_receipt_download_select",
-        )
-        receipt_path_value = receipt_downloads.get(selected_receipt)
-        receipt_file = resolve_upload_path(receipt_path_value)
-        if receipt_file and receipt_file.exists():
-            receipt_payload = _safe_read_bytes(receipt_file)
-            if receipt_payload:
-                st.download_button(
-                    f"Download receipt for {selected_receipt}",
-                    data=receipt_payload,
-                    file_name=receipt_file.name,
-                    key=f"{key_prefix}_receipt_download_button",
-                )
-            else:
-                st.warning("Unable to read the selected receipt.", icon="⚠️")
-        else:
-            st.info("The selected receipt file could not be found.")
-    if not downloads and not receipt_downloads and (st.session_state.get(filter_text_key) or query_text):
+    if not downloads and (st.session_state.get(filter_text_key) or query_text):
         st.caption(
             f"No matching {record_label_lower} records found for the applied filters."
         )
@@ -22887,7 +22970,8 @@ def customer_summary_page(conn):
                d.remarks,
                d.created_at,
                d.file_path,
-               d.payment_receipt_path
+               d.payment_receipt_path,
+               COALESCE(d.record_type, 'delivery_order') AS record_type
         FROM delivery_orders d
         LEFT JOIN customers c ON c.customer_id = d.customer_id
         WHERE d.customer_id IN ({placeholders})
@@ -22945,6 +23029,9 @@ def customer_summary_page(conn):
     if do_df is not None and not do_df.empty:
         do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
         do_df["Receipt"] = do_df["payment_receipt_path"].apply(_file_data_uri_from_path)
+        do_df["Type"] = do_df["record_type"].apply(
+            lambda val: "Work done" if clean_text(val) == "work_done" else "Delivery order"
+        )
 
     st.markdown("**Delivery orders**")
     if (do_df is None or do_df.empty) and not orphan_dos:
@@ -22963,8 +23050,9 @@ def customer_summary_page(conn):
                         "created_at": "Created",
                         "Document": "Document",
                         "Receipt": "Receipt",
+                        "Type": "Type",
                     }
-                ).drop(columns=["file_path", "payment_receipt_path"], errors="ignore"),
+                ).drop(columns=["file_path", "payment_receipt_path", "record_type"], errors="ignore"),
                 use_container_width=True,
                 column_config={
                     "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
@@ -23039,6 +23127,111 @@ def customer_summary_page(conn):
             ),
             use_container_width=True,
             column_config={
+                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
+            },
+        )
+
+    st.markdown("**Other operations uploads**")
+    other_ops_df = df_query(
+        conn,
+        f"""
+        SELECT o.document_id,
+               o.customer_id,
+               o.description,
+               o.items_payload,
+               o.file_path,
+               o.original_name,
+               o.uploaded_at
+        FROM operations_other_documents o
+        WHERE o.customer_id IN ({placeholders})
+          AND o.deleted_at IS NULL
+        ORDER BY datetime(o.uploaded_at) DESC, o.document_id DESC
+        """,
+        ids,
+    )
+    if other_ops_df.empty:
+        st.info("No other operations uploads found for this customer.")
+    else:
+        other_ops_df = fmt_dates(other_ops_df, ["uploaded_at"])
+        other_ops_df["Document"] = other_ops_df["file_path"].apply(_file_data_uri_from_path)
+        other_ops_display = other_ops_df.rename(
+            columns={
+                "description": "Description",
+                "original_name": "File name",
+                "uploaded_at": "Uploaded",
+                "Document": "Document",
+            }
+        )
+        st.dataframe(
+            other_ops_display.drop(columns=["file_path", "document_id", "customer_id"], errors="ignore"),
+            use_container_width=True,
+            column_config={
+                "Document": st.column_config.LinkColumn("Document", display_text="⬇️"),
+            },
+        )
+
+    customer_name = clean_text(info.get("name"))
+    raw_phone = clean_text(info.get("phone"))
+    phone_tokens = []
+    if raw_phone:
+        phone_tokens = [
+            token
+            for token in (clean_text(val) for val in re.split(r"[,\n]+", raw_phone))
+            if token
+        ]
+    quote_filters: list[str] = []
+    quote_params: list[object] = []
+    if customer_name:
+        quote_filters.append("LOWER(COALESCE(customer_name, '')) = LOWER(?)")
+        quote_filters.append("LOWER(COALESCE(customer_company, '')) = LOWER(?)")
+        quote_params.extend([customer_name, customer_name])
+    for phone in phone_tokens:
+        quote_filters.append("customer_contact LIKE ?")
+        quote_params.append(f"%{phone}%")
+    quotation_docs = pd.DataFrame()
+    if quote_filters:
+        quote_clause = " OR ".join(quote_filters)
+        quotation_docs = df_query(
+            conn,
+            dedent(
+                f"""
+                SELECT quotation_id,
+                       reference,
+                       quote_date,
+                       status,
+                       total_amount,
+                       document_path,
+                       payment_receipt_path
+                FROM quotations
+                WHERE deleted_at IS NULL
+                  AND ({quote_clause})
+                ORDER BY datetime(quote_date) DESC, quotation_id DESC
+                """
+            ),
+            tuple(quote_params),
+        )
+    st.markdown("**Quotation records**")
+    if quotation_docs.empty:
+        st.info("No quotation records found for this customer.")
+    else:
+        quotation_docs = fmt_dates(quotation_docs, ["quote_date"])
+        quotation_docs["Document"] = quotation_docs["document_path"].apply(_file_data_uri_from_path)
+        quotation_docs["Receipt"] = quotation_docs["payment_receipt_path"].apply(_file_data_uri_from_path)
+        quotation_display = quotation_docs.rename(
+            columns={
+                "reference": "Reference",
+                "quote_date": "Quote date",
+                "status": "Status",
+                "total_amount": "Total",
+                "Document": "Document",
+                "Receipt": "Receipt",
+            }
+        )
+        st.dataframe(
+            quotation_display.drop(columns=["quotation_id", "document_path", "payment_receipt_path"], errors="ignore"),
+            use_container_width=True,
+            column_config={
+                "Document": st.column_config.LinkColumn("Document", display_text="⬇️"),
                 "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
             },
         )
@@ -23329,84 +23522,71 @@ def customer_summary_page(conn):
                     }
                 )
 
-    customer_name = clean_text(info.get("name"))
-    raw_phone = clean_text(info.get("phone"))
-    phone_tokens = []
-    if raw_phone:
-        phone_tokens = [
-            token
-            for token in (clean_text(val) for val in re.split(r"[,\n]+", raw_phone))
-            if token
-        ]
-    quote_filters: list[str] = []
-    quote_params: list[object] = []
-    if customer_name:
-        quote_filters.append("LOWER(COALESCE(customer_name, '')) = LOWER(?)")
-        quote_filters.append("LOWER(COALESCE(customer_company, '')) = LOWER(?)")
-        quote_params.extend([customer_name, customer_name])
-    for phone in phone_tokens:
-        quote_filters.append("customer_contact LIKE ?")
-        quote_params.append(f"%{phone}%")
-    if quote_filters:
-        quote_clause = " OR ".join(quote_filters)
-        quotation_docs = df_query(
-            conn,
-            dedent(
-                f"""
-                SELECT quotation_id,
-                       reference,
-                       document_path,
-                       payment_receipt_path
-                FROM quotations
-                WHERE deleted_at IS NULL
-                  AND ({quote_clause})
-                ORDER BY datetime(quote_date) DESC, quotation_id DESC
-                """
-            ),
-            tuple(quote_params),
-        )
-        if not quotation_docs.empty:
-            for _, row in quotation_docs.iterrows():
-                quote_id = int(row.get("quotation_id"))
-                reference = clean_text(row.get("reference")) or "Quotation record"
-                doc_path = resolve_upload_path(row.get("document_path"))
-                if doc_path and doc_path.exists():
-                    doc_name = doc_path.name
-                    doc_archive = "/".join(
-                        [
-                            _sanitize_path_component("quotations"),
-                            f"{_sanitize_path_component(reference)}_{_sanitize_path_component(doc_name)}",
-                        ]
-                    )
-                    documents.append(
-                        {
-                            "source": "Quotation",
-                            "reference": reference,
-                            "display": doc_name,
-                            "path": doc_path,
-                            "archive_name": doc_archive,
-                            "key": f"quotation_doc_{quote_id}",
-                        }
-                    )
-                receipt_path = resolve_upload_path(row.get("payment_receipt_path"))
-                if receipt_path and receipt_path.exists():
-                    receipt_name = receipt_path.name
-                    receipt_archive = "/".join(
-                        [
-                            _sanitize_path_component("quotation_receipts"),
-                            f"{_sanitize_path_component(reference)}_{_sanitize_path_component(receipt_name)}",
-                        ]
-                    )
-                    documents.append(
-                        {
-                            "source": "Quotation receipt",
-                            "reference": reference,
-                            "display": receipt_name,
-                            "path": receipt_path,
-                            "archive_name": receipt_archive,
-                            "key": f"quotation_receipt_{quote_id}",
-                        }
-                    )
+    if not other_ops_df.empty:
+        for _, row in other_ops_df.iterrows():
+            path = resolve_upload_path(row.get("file_path"))
+            if not path or not path.exists():
+                continue
+            record_id = int(row.get("document_id"))
+            display_name = clean_text(row.get("original_name")) or path.name
+            archive_name = "/".join(
+                [
+                    _sanitize_path_component("operations_other"),
+                    f"{_sanitize_path_component(str(record_id))}_{_sanitize_path_component(display_name)}",
+                ]
+            )
+            documents.append(
+                {
+                    "source": "Other operations",
+                    "reference": clean_text(row.get("description")) or "Other record",
+                    "display": display_name,
+                    "path": path,
+                    "archive_name": archive_name,
+                    "key": f"operations_other_{record_id}",
+                }
+            )
+    if not quotation_docs.empty:
+        for _, row in quotation_docs.iterrows():
+            quote_id = int(row.get("quotation_id"))
+            reference = clean_text(row.get("reference")) or "Quotation record"
+            doc_path = resolve_upload_path(row.get("document_path"))
+            if doc_path and doc_path.exists():
+                doc_name = doc_path.name
+                doc_archive = "/".join(
+                    [
+                        _sanitize_path_component("quotations"),
+                        f"{_sanitize_path_component(reference)}_{_sanitize_path_component(doc_name)}",
+                    ]
+                )
+                documents.append(
+                    {
+                        "source": "Quotation",
+                        "reference": reference,
+                        "display": doc_name,
+                        "path": doc_path,
+                        "archive_name": doc_archive,
+                        "key": f"quotation_doc_{quote_id}",
+                    }
+                )
+            receipt_path = resolve_upload_path(row.get("payment_receipt_path"))
+            if receipt_path and receipt_path.exists():
+                receipt_name = receipt_path.name
+                receipt_archive = "/".join(
+                    [
+                        _sanitize_path_component("quotation_receipts"),
+                        f"{_sanitize_path_component(reference)}_{_sanitize_path_component(receipt_name)}",
+                    ]
+                )
+                documents.append(
+                    {
+                        "source": "Quotation receipt",
+                        "reference": reference,
+                        "display": receipt_name,
+                        "path": receipt_path,
+                        "archive_name": receipt_archive,
+                        "key": f"quotation_receipt_{quote_id}",
+                    }
+                )
 
     deduped_documents: dict[tuple[str, str, str, str], dict[str, object]] = {}
     for entry in documents:
