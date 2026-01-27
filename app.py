@@ -3891,12 +3891,12 @@ def _deep_link_for_entity(
         "quotation": {"page": "Quotation"},
         "customer": {"page": "Customers"},
         "warranty": {"page": "Warranties"},
-        "delivery_order": {"page": "Operations", "tab": "delivery_orders"},
-        "work_done": {"page": "Operations", "tab": "work_done"},
-        "service": {"page": "Operations", "tab": "service"},
-        "maintenance": {"page": "Operations", "tab": "maintenance"},
-        "operations_other": {"page": "Operations", "tab": "other_uploads"},
-        "customer_document": {"page": "Operations", "tab": "documents"},
+        "delivery_order": {"page": "Customers"},
+        "work_done": {"page": "Customers"},
+        "service": {"page": "Customers"},
+        "maintenance": {"page": "Customers"},
+        "operations_other": {"page": "Customers"},
+        "customer_document": {"page": "Customers"},
     }
     link = mapping.get(entity_key)
     if not link:
@@ -14130,6 +14130,9 @@ def render_customer_document_uploader(
     conn,
     *,
     key_prefix: str,
+    selected_customer_id: Optional[int] = None,
+    selected_customer_label: Optional[str] = None,
+    show_customer_select: bool = True,
 ) -> None:
     st.markdown("### Customer document uploads")
     customer_options, customer_labels, _, _ = fetch_customer_choices(conn, only_complete=False)
@@ -14138,6 +14141,28 @@ def render_customer_document_uploader(
         st.info("No customers available for document uploads yet.")
         return
 
+    selected_customer = None
+    if show_customer_select:
+        selected_customer = st.selectbox(
+            "Customer",
+            customer_choices,
+            format_func=lambda cid: customer_labels.get(cid, "Customer record"),
+            key=f"{key_prefix}_customer",
+        )
+    else:
+        selected_customer = (
+            selected_customer_id if selected_customer_id in customer_choices else None
+        )
+        if selected_customer:
+            label = selected_customer_label or customer_labels.get(
+                selected_customer, "Customer record"
+            )
+            if label:
+                st.caption(f"Uploading for: {label}")
+        else:
+            st.info("Select a customer above to upload documents.")
+            return
+
     upload_container = getattr(st, "popover", None)
     if callable(upload_container):
         container = upload_container("Upload documents", use_container_width=True)
@@ -14145,12 +14170,6 @@ def render_customer_document_uploader(
         container = st.expander("Upload documents", expanded=True)
 
     with container:
-        selected_customer = st.selectbox(
-            "Customer",
-            customer_choices,
-            format_func=lambda cid: customer_labels.get(cid, "Customer record"),
-            key=f"{key_prefix}_customer",
-        )
         customer_seed = df_query(
             conn,
             """
@@ -14205,141 +14224,174 @@ def render_customer_document_uploader(
                         _safe_rerun()
 
         with upload_cols[1]:
-            st.markdown("**Work done**")
-            work_done_file = st.file_uploader(
-                "Work done upload",
-                type=None,
-                accept_multiple_files=False,
-                key=f"{key_prefix}_work_done_file",
-                help="Upload completed work slips or PDFs.",
+            st.markdown("**Delivery order / Work done**")
+            do_work_type = st.selectbox(
+                "Type",
+                ["Delivery order", "Work done"],
+                key=f"{key_prefix}_do_work_type",
             )
-            _apply_ocr_autofill(
-                upload=work_done_file,
-                ocr_key_prefix=f"{key_prefix}_work_done_file",
-                doc_type="Work done",
-                details_key_prefix=f"{key_prefix}_work_done_details",
-            )
-            work_done_details = _render_doc_detail_inputs(
-                "Work done",
-                key_prefix=f"{key_prefix}_work_done_details",
-                defaults=customer_record,
-            )
-            submit_work_done = st.button(
-                "Save work done",
-                key=f"{key_prefix}_work_done_save",
-            )
-            if _guard_double_submit(f"{key_prefix}_work_done_save", submit_work_done):
-                if work_done_file is None:
-                    st.error("Select a work done document to upload.")
+            with st.form(key=f"{key_prefix}_do_work_form", clear_on_submit=False):
+                do_work_file = st.file_uploader(
+                    "Delivery order / work done upload",
+                    type=None,
+                    accept_multiple_files=False,
+                    key=f"{key_prefix}_do_work_file",
+                    help="Upload delivery order or work done documents.",
+                )
+                _apply_ocr_autofill(
+                    upload=do_work_file,
+                    ocr_key_prefix=f"{key_prefix}_do_work_file",
+                    doc_type=do_work_type,
+                    details_key_prefix=f"{key_prefix}_do_work_details",
+                )
+                do_work_details = _render_doc_detail_inputs(
+                    do_work_type,
+                    key_prefix=f"{key_prefix}_do_work_details",
+                    defaults=customer_record,
+                )
+                submit_do_work = st.form_submit_button(
+                    f"Save {do_work_type.lower()}",
+                )
+            if _guard_double_submit(f"{key_prefix}_do_work_save", submit_do_work):
+                if do_work_file is None:
+                    st.error("Select a document to upload.")
                 else:
                     saved = _save_customer_document_upload(
                         conn,
                         customer_id=int(selected_customer),
                         customer_record=customer_record,
-                        doc_type="Work done",
-                        upload_file=work_done_file,
-                        details=work_done_details,
+                        doc_type=do_work_type,
+                        upload_file=do_work_file,
+                        details=do_work_details,
                     )
                     if saved:
-                        st.success("Work done uploaded.")
+                        st.success(f"{do_work_type} uploaded.")
                         _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_work_done_file",
-                            details_key_prefix=f"{key_prefix}_work_done_details",
-                            doc_type="Work done",
+                            file_key=f"{key_prefix}_do_work_file",
+                            details_key_prefix=f"{key_prefix}_do_work_details",
+                            doc_type=do_work_type,
                         )
 
         upload_cols = st.columns(2)
         with upload_cols[0]:
-            st.markdown("**Delivery order (DO)**")
-            with st.form(key=f"{key_prefix}_do_form", clear_on_submit=False):
-                do_file = st.file_uploader(
-                    "Delivery order upload",
+            st.markdown("**Service**")
+            with st.form(key=f"{key_prefix}_service_form", clear_on_submit=False):
+                service_file = st.file_uploader(
+                    "Service upload",
                     type=None,
                     accept_multiple_files=False,
-                    key=f"{key_prefix}_do_file",
-                    help="Upload the delivery order PDF or image.",
+                    key=f"{key_prefix}_service_file",
+                    help="Upload service documents.",
                 )
                 _apply_ocr_autofill(
-                    upload=do_file,
-                    ocr_key_prefix=f"{key_prefix}_do_file",
-                    doc_type="Delivery order",
-                    details_key_prefix=f"{key_prefix}_do_details",
+                    upload=service_file,
+                    ocr_key_prefix=f"{key_prefix}_service_file",
+                    doc_type="Service",
+                    details_key_prefix=f"{key_prefix}_service_details",
                 )
-                do_details = _render_doc_detail_inputs(
-                    "Delivery order",
-                    key_prefix=f"{key_prefix}_do_details",
+                service_details = _render_doc_detail_inputs(
+                    "Service",
+                    key_prefix=f"{key_prefix}_service_details",
                     defaults=customer_record,
                 )
-                submit_do = st.form_submit_button(
-                    "Save delivery order",
-                )
-            if _guard_double_submit(f"{key_prefix}_do_save", submit_do):
-                if do_file is None:
-                    st.error("Select a delivery order document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Delivery order",
-                        upload_file=do_file,
-                        details=do_details,
-                    )
-                    if saved:
-                        st.success("Delivery order uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_do_file",
-                            details_key_prefix=f"{key_prefix}_do_details",
-                            doc_type="Delivery order",
-                        )
-
-        with upload_cols[1]:
-            st.markdown("**Service / Maintenance**")
-            service_choice = st.selectbox(
-                "Type",
-                ["Service", "Maintenance"],
-                key=f"{key_prefix}_service_choice",
-            )
-            service_file = st.file_uploader(
-                "Service/Maintenance upload",
-                type=None,
-                accept_multiple_files=False,
-                key=f"{key_prefix}_service_file",
-                help="Upload service or maintenance documents.",
-            )
-            _apply_ocr_autofill(
-                upload=service_file,
-                ocr_key_prefix=f"{key_prefix}_service_file",
-                doc_type=service_choice,
-                details_key_prefix=f"{key_prefix}_service_details",
-            )
-            service_details = _render_doc_detail_inputs(
-                service_choice,
-                key_prefix=f"{key_prefix}_service_details",
-                defaults=customer_record,
-            )
-            submit_service = st.button(
-                "Save service/maintenance",
-                key=f"{key_prefix}_service_save",
-            )
+                submit_service = st.form_submit_button("Save service")
             if _guard_double_submit(f"{key_prefix}_service_save", submit_service):
                 if service_file is None:
-                    st.error("Select a service/maintenance document to upload.")
+                    st.error("Select a service document to upload.")
                 else:
                     saved = _save_customer_document_upload(
                         conn,
                         customer_id=int(selected_customer),
                         customer_record=customer_record,
-                        doc_type=service_choice,
+                        doc_type="Service",
                         upload_file=service_file,
                         details=service_details,
                     )
                     if saved:
-                        st.success(f"{service_choice} uploaded.")
+                        st.success("Service uploaded.")
                         _clear_operations_upload_state(
                             file_key=f"{key_prefix}_service_file",
                             details_key_prefix=f"{key_prefix}_service_details",
-                            doc_type=service_choice,
+                            doc_type="Service",
+                        )
+
+        with upload_cols[1]:
+            st.markdown("**Maintenance**")
+            with st.form(key=f"{key_prefix}_maintenance_form", clear_on_submit=False):
+                maintenance_file = st.file_uploader(
+                    "Maintenance upload",
+                    type=None,
+                    accept_multiple_files=False,
+                    key=f"{key_prefix}_maintenance_file",
+                    help="Upload maintenance documents.",
+                )
+                _apply_ocr_autofill(
+                    upload=maintenance_file,
+                    ocr_key_prefix=f"{key_prefix}_maintenance_file",
+                    doc_type="Maintenance",
+                    details_key_prefix=f"{key_prefix}_maintenance_details",
+                )
+                maintenance_details = _render_doc_detail_inputs(
+                    "Maintenance",
+                    key_prefix=f"{key_prefix}_maintenance_details",
+                    defaults=customer_record,
+                )
+                submit_maintenance = st.form_submit_button("Save maintenance")
+            if _guard_double_submit(f"{key_prefix}_maintenance_save", submit_maintenance):
+                if maintenance_file is None:
+                    st.error("Select a maintenance document to upload.")
+                else:
+                    saved = _save_customer_document_upload(
+                        conn,
+                        customer_id=int(selected_customer),
+                        customer_record=customer_record,
+                        doc_type="Maintenance",
+                        upload_file=maintenance_file,
+                        details=maintenance_details,
+                    )
+                    if saved:
+                        st.success("Maintenance uploaded.")
+                        _clear_operations_upload_state(
+                            file_key=f"{key_prefix}_maintenance_file",
+                            details_key_prefix=f"{key_prefix}_maintenance_details",
+                            doc_type="Maintenance",
+                        )
+
+        upload_cols = st.columns(2)
+        with upload_cols[0]:
+            st.markdown("**Others**")
+            with st.form(key=f"{key_prefix}_other_form", clear_on_submit=False):
+                other_file = st.file_uploader(
+                    "Other upload",
+                    type=None,
+                    accept_multiple_files=False,
+                    key=f"{key_prefix}_other_file",
+                    help="Upload any other customer documents.",
+                )
+                other_details = _render_doc_detail_inputs(
+                    "Other",
+                    key_prefix=f"{key_prefix}_other_details",
+                    defaults=customer_record,
+                )
+                submit_other = st.form_submit_button("Save other upload")
+            if _guard_double_submit(f"{key_prefix}_other_save", submit_other):
+                if other_file is None:
+                    st.error("Select a document to upload.")
+                else:
+                    saved = _save_customer_document_upload(
+                        conn,
+                        customer_id=int(selected_customer),
+                        customer_record=customer_record,
+                        doc_type="Other",
+                        upload_file=other_file,
+                        details=other_details,
+                    )
+                    if saved:
+                        st.success("Other upload saved.")
+                        _clear_operations_upload_state(
+                            file_key=f"{key_prefix}_other_file",
+                            details_key_prefix=f"{key_prefix}_other_details",
+                            doc_type="Other",
                         )
 
     docs_df = df_query(
@@ -15598,28 +15650,23 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
 
 def operations_page(conn):
     st.subheader("🛠️ Operations")
-    st.caption(
-        "Review delivery orders, work done, service, maintenance, and other operational records in one place."
-    )
-    deep_link = _consume_deep_link("Operations")
-    deep_tab = clean_text(deep_link.get("tab")) if isinstance(deep_link, dict) else ""
-    deep_record = clean_text(deep_link.get("record_id")) if isinstance(deep_link, dict) else ""
-    if deep_tab == "service" and deep_record:
-        st.session_state["service_edit_select"] = int_or_none(deep_record)
-    if deep_tab == "maintenance" and deep_record:
-        st.session_state["maintenance_edit_select"] = int_or_none(deep_record)
-    if deep_tab == "other_uploads" and deep_record:
-        st.session_state["operations_page_other_edit_select"] = int_or_none(deep_record)
-    if deep_tab == "documents" and deep_record:
-        st.session_state["operations_page_doc_search"] = deep_record
-        st.info(f"Filtered documents to record #{deep_record}.")
-    st.markdown("### Customers")
-    st.caption(
-        "Select a customer from the table below to filter the operations documents."
-    )
+    st.info("Operations has moved into the Customers page.")
+    st.session_state["nav_page"] = "Customers"
+    st.session_state["page"] = "Customers"
+    st.session_state["nav_selection_top"] = "Customers"
+    st.session_state["nav_selection_mobile"] = "Customers"
+    st.rerun()
+
+
+def _render_operations_customer_selector(
+    conn,
+    *,
+    key_prefix: str,
+    select_help: str,
+) -> tuple[Optional[int], Optional[str]]:
     search_query = st.text_input(
         "Search customers",
-        key="operations_customer_search",
+        key=f"{key_prefix}_customer_search",
         help="Search by customer name, company, phone, or sales rep.",
     )
     scope_clause, scope_params = customer_scope_filter()
@@ -15656,192 +15703,106 @@ def operations_page(conn):
     selected_customer_label = None
     if customers_df.empty:
         st.info("No customers match that search.")
-    else:
-        customer_ids = customers_df["customer_id"].astype(int).tolist()
-        display_customers = customers_df.copy()
-        for col in [
-            "name",
-            "company_name",
-            "phone",
-            "address",
-            "delivery_address",
-            "remarks",
-        ]:
-            if col in display_customers.columns:
-                display_customers[col] = display_customers[col].map(
-                    lambda value: clean_text(value) or ""
-                )
-        customer_name = display_customers["name"].fillna("")
-        company_name = display_customers["company_name"].fillna("")
-        phone_value = display_customers["phone"].fillna("")
-        remarks_value = display_customers.get("remarks")
-        if remarks_value is None:
-            remarks_value = pd.Series([""] * len(display_customers), index=display_customers.index)
-        lead_status = remarks_value.map(
-            lambda value: _strip_lead_tag(value)
-            or ("Lead / chasing" if _is_lead_customer(value) else clean_text(value) or "")
-        )
-        customer_display = customer_name.where(customer_name != "", company_name)
-        customer_display = customer_display.where(customer_display != "", phone_value)
-        customer_display = customer_display.where(customer_display != "", lead_status)
-        company_display = company_name.where(company_name != "", customer_name)
-        company_display = company_display.where(company_display != "", lead_status)
-        table_df = pd.DataFrame(
-            {
-                "Select": False,
-                "Customer": customer_display.fillna(""),
-                "Company": company_display.fillna(""),
-                "Lead status": lead_status.fillna(""),
-                "Phone": phone_value,
-                "Address": display_customers["address"].fillna(""),
-                "Delivery address": display_customers["delivery_address"].fillna(""),
-            }
-        )
-        state_key = "operations_customer_table_state"
-        previous_table = st.session_state.get(state_key)
-        previous_select = pd.Series(False, index=table_df.index)
-        if isinstance(previous_table, pd.DataFrame) and "Select" in previous_table:
-            previous_select = (
-                previous_table["Select"]
-                .reindex(table_df.index)
-                .fillna(False)
-                .astype(bool)
+        return selected_customer_id, selected_customer_label
+    customer_ids = customers_df["customer_id"].astype(int).tolist()
+    display_customers = customers_df.copy()
+    for col in [
+        "name",
+        "company_name",
+        "phone",
+        "address",
+        "delivery_address",
+        "remarks",
+    ]:
+        if col in display_customers.columns:
+            display_customers[col] = display_customers[col].map(
+                lambda value: clean_text(value) or ""
             )
-        table_source = table_df.copy()
-        table_source["Select"] = previous_select
-        edited_table = safe_data_editor(
-            table_source,
-            hide_index=True,
-            use_container_width=True,
-            disabled=[col for col in table_df.columns if col != "Select"],
-            column_config={
-                "Select": st.column_config.CheckboxColumn(
-                    "Select",
-                    help="Choose a customer to upload operations documents.",
-                ),
-            },
-            key="operations_customer_table",
+    customer_name = display_customers["name"].fillna("")
+    company_name = display_customers["company_name"].fillna("")
+    phone_value = display_customers["phone"].fillna("")
+    remarks_value = display_customers.get("remarks")
+    if remarks_value is None:
+        remarks_value = pd.Series([""] * len(display_customers), index=display_customers.index)
+    lead_status = remarks_value.map(
+        lambda value: _strip_lead_tag(value)
+        or ("Lead / chasing" if _is_lead_customer(value) else clean_text(value) or "")
+    )
+    customer_display = customer_name.where(customer_name != "", company_name)
+    customer_display = customer_display.where(customer_display != "", phone_value)
+    customer_display = customer_display.where(customer_display != "", lead_status)
+    company_display = company_name.where(company_name != "", customer_name)
+    company_display = company_display.where(company_display != "", lead_status)
+    table_df = pd.DataFrame(
+        {
+            "Select": False,
+            "Customer": customer_display.fillna(""),
+            "Company": company_display.fillna(""),
+            "Lead status": lead_status.fillna(""),
+            "Phone": phone_value,
+            "Address": display_customers["address"].fillna(""),
+            "Delivery address": display_customers["delivery_address"].fillna(""),
+        }
+    )
+    state_key = f"{key_prefix}_customer_table_state"
+    previous_table = st.session_state.get(state_key)
+    previous_select = pd.Series(False, index=table_df.index)
+    if isinstance(previous_table, pd.DataFrame) and "Select" in previous_table:
+        previous_select = (
+            previous_table["Select"]
+            .reindex(table_df.index)
+            .fillna(False)
+            .astype(bool)
         )
-        edited_table = (
-            edited_table
-            if isinstance(edited_table, pd.DataFrame)
-            else pd.DataFrame(edited_table)
-        )
-        prev_select = pd.Series(previous_select, index=edited_table.index).fillna(False)
-        selected_rows = edited_table[edited_table["Select"]]
-        if len(selected_rows.index) > 1:
-            newly_selected = edited_table[
-                edited_table["Select"] & ~prev_select.astype(bool)
-            ]
-            if not newly_selected.empty:
-                chosen_idx = newly_selected.index[-1]
-            else:
-                chosen_idx = selected_rows.index[-1]
-            edited_table["Select"] = False
-            edited_table.loc[chosen_idx, "Select"] = True
-            st.session_state[state_key] = edited_table[["Select"]].copy()
-            st.rerun()
+    table_source = table_df.copy()
+    table_source["Select"] = previous_select
+    edited_table = safe_data_editor(
+        table_source,
+        hide_index=True,
+        use_container_width=True,
+        disabled=[col for col in table_df.columns if col != "Select"],
+        column_config={
+            "Select": st.column_config.CheckboxColumn(
+                "Select",
+                help=select_help,
+            ),
+        },
+        key=f"{key_prefix}_customer_table",
+    )
+    edited_table = (
+        edited_table
+        if isinstance(edited_table, pd.DataFrame)
+        else pd.DataFrame(edited_table)
+    )
+    prev_select = pd.Series(previous_select, index=edited_table.index).fillna(False)
+    selected_rows = edited_table[edited_table["Select"]]
+    if len(selected_rows.index) > 1:
+        newly_selected = edited_table[edited_table["Select"] & ~prev_select.astype(bool)]
+        if not newly_selected.empty:
+            chosen_idx = newly_selected.index[-1]
+        else:
+            chosen_idx = selected_rows.index[-1]
+        edited_table["Select"] = False
+        edited_table.loc[chosen_idx, "Select"] = True
         st.session_state[state_key] = edited_table[["Select"]].copy()
-        if not selected_rows.empty:
-            selected_row_position = int(selected_rows.index[0])
-            if 0 <= selected_row_position < len(customer_ids):
-                selected_customer_id = int(customer_ids[selected_row_position])
-            selected_row = customers_df[
-                customers_df["customer_id"].astype(str) == str(selected_customer_id)
-            ]
-            if not selected_row.empty:
-                name = clean_text(selected_row.iloc[0].get("name"))
-                company = clean_text(selected_row.iloc[0].get("company_name"))
-                if name and company:
-                    selected_customer_label = f"{name} ({company})"
-                else:
-                    selected_customer_label = name or company
-        st.caption(
-            "Showing all matching customers. Use search to narrow the list if needed."
-        )
-
-    render_operations_document_uploader(
-        conn,
-        key_prefix="operations_page",
-        selected_customer_id=selected_customer_id,
-        selected_customer_label=selected_customer_label,
-        show_customer_select=False,
-    )
-
-    st.markdown("---")
-    tab_labels = [
-        "Delivery orders",
-        "Work done",
-        "Service",
-        "Maintenance",
-        "Other uploads",
-    ]
-    tab_lookup = {
-        "delivery_orders": "Delivery orders",
-        "work_done": "Work done",
-        "service": "Service",
-        "maintenance": "Maintenance",
-        "other_uploads": "Other uploads",
-    }
-    if deep_tab in tab_lookup:
-        st.session_state["operations_tab"] = tab_lookup[deep_tab]
-    selected_tab = st.radio(
-        "Operations sections",
-        tab_labels,
-        horizontal=True,
-        key="operations_tab",
-        label_visibility="collapsed",
-    )
-    if selected_tab == "Delivery orders":
-        st.markdown("### Delivery orders")
-        delivery_orders_page(
-            conn,
-            show_heading=False,
-            record_type_label="Delivery order",
-            record_type_key="delivery_order",
-            highlight_record=deep_record if deep_tab == "delivery_orders" else None,
-            enable_receipt_ocr=False,
-        )
-    elif selected_tab == "Work done":
-        st.markdown("### Work done")
-        delivery_orders_page(
-            conn,
-            show_heading=False,
-            record_type_label="Work done",
-            record_type_key="work_done",
-            highlight_record=deep_record if deep_tab == "work_done" else None,
-            enable_receipt_ocr=False,
-        )
-    elif selected_tab == "Service":
-        st.markdown("### Service records")
-        _render_service_section(conn, show_heading=False)
-    elif selected_tab == "Maintenance":
-        st.markdown("### Maintenance records")
-        _render_maintenance_section(conn, show_heading=False)
-    elif selected_tab == "Other uploads":
-        _render_operations_other_manager(conn, key_prefix="operations_page")
-
-    if current_user_is_admin():
-        with st.expander("Admin activity log", expanded=False):
-            activity = fetch_activity_feed(conn, limit=50)
-            if not activity:
-                st.caption("No recent activity yet.")
+        st.rerun()
+    st.session_state[state_key] = edited_table[["Select"]].copy()
+    if not selected_rows.empty:
+        selected_row_position = int(selected_rows.index[0])
+        if 0 <= selected_row_position < len(customer_ids):
+            selected_customer_id = int(customer_ids[selected_row_position])
+        selected_row = customers_df[
+            customers_df["customer_id"].astype(str) == str(selected_customer_id)
+        ]
+        if not selected_row.empty:
+            name = clean_text(selected_row.iloc[0].get("name"))
+            company = clean_text(selected_row.iloc[0].get("company_name"))
+            if name and company:
+                selected_customer_label = f"{name} ({company})"
             else:
-                activity_df = pd.DataFrame(activity)
-                activity_df = fmt_dates(activity_df, ["timestamp"])
-                activity_df = activity_df.rename(
-                    columns={
-                        "timestamp": "When",
-                        "actor": "Staff",
-                        "event_type": "Event",
-                        "message": "Details",
-                    }
-                )
-                st.dataframe(
-                    activity_df[["When", "Staff", "Event", "Details"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                selected_customer_label = name or company
+    st.caption("Showing all matching customers. Use search to narrow the list if needed.")
+    return selected_customer_id, selected_customer_label
 
 
 def customers_page(conn):
@@ -17166,45 +17127,22 @@ def customers_page(conn):
                             conn.commit()
                             st.warning("Some changes were saved, but please review the errors above.")
     st.markdown("---")
-    render_customer_document_uploader(conn, key_prefix="customers_docs")
-    scope_clause, scope_params = customer_scope_filter("c")
-    st.markdown("**Recently Added Customers**")
-    recent_where = f"WHERE {scope_clause}" if scope_clause else ""
-    recent_params = scope_params if scope_clause else ()
-    recent_df = df_query(
+    st.markdown("### Customers")
+    st.caption(
+        "Select a customer from the table below to upload and view operational documents."
+    )
+    selected_customer_id, selected_customer_label = _render_operations_customer_selector(
         conn,
-        f"""
-        SELECT
-            c.customer_id AS id,
-            c.name,
-            c.company_name,
-            c.phone,
-            c.address,
-            c.delivery_address,
-            c.remarks,
-            c.purchase_date,
-            c.product_info,
-            c.delivery_order_code,
-            c.sales_person,
-            c.amount_spent,
-            c.created_at,
-            COALESCE(u.username, '(unknown)') AS uploaded_by
-        FROM customers c
-        LEFT JOIN users u ON u.user_id = c.created_by
-        {recent_where}
-        ORDER BY datetime(c.created_at) DESC LIMIT 200
-    """,
-        recent_params,
+        key_prefix="customers_docs",
+        select_help="Choose a customer to upload and view documents.",
     )
-    recent_df = fmt_dates(recent_df, ["created_at", "purchase_date"])
-    recent_df = recent_df.rename(
-        columns={
-            "sales_person": "Sales person",
-            "amount_spent": "Amount spent",
-            "uploaded_by": "Uploaded by",
-        }
+    render_customer_document_uploader(
+        conn,
+        key_prefix="customers_docs",
+        selected_customer_id=selected_customer_id,
+        selected_customer_label=selected_customer_label,
+        show_customer_select=False,
     )
-    st.dataframe(recent_df.drop(columns=["id"], errors="ignore"))
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
     is_admin = current_user_is_admin()
@@ -27872,7 +27810,6 @@ def main():
             "Dashboard",
             "Customers",
             "Quotation",
-            "Operations",
             "Warranties",
             "Advanced Search",
             "Reports",
@@ -27883,7 +27820,6 @@ def main():
             "Dashboard",
             "Customers",
             "Quotation",
-            "Operations",
             "Warranties",
             "Reports",
         ]
@@ -27988,8 +27924,6 @@ def main():
         quotation_page(conn, render_id=render_id)
     elif page == "Customers":
         customers_hub_page(conn)
-    elif page == "Operations":
-        operations_page(conn)
     elif page == "Warranties":
         warranties_page(conn)
     elif page == "Advanced Search":
