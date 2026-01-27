@@ -392,6 +392,15 @@ SERVICE_REPORT_FIELDS = OrderedDict(
             },
         ),
         (
+            "reminder_date",
+            {
+                "label": "Reminder date",
+                "type": "date",
+                "format": "DD-MM-YYYY",
+                "help": "Optional reminder date for this customer row.",
+            },
+        ),
+        (
             "payment_status",
             {
                 "label": "Payment Status",
@@ -427,6 +436,15 @@ SERVICE_REPORT_FIELDS = OrderedDict(
                 "type": "date",
                 "format": "DD-MM-YYYY",
                 "help": "When the work was completed.",
+            },
+        ),
+        (
+            "delivery_date",
+            {
+                "label": "Delivery Date",
+                "type": "date",
+                "format": "DD-MM-YYYY",
+                "help": "Date the delivery was completed.",
             },
         ),
         (
@@ -681,7 +699,9 @@ REPORT_COLUMN_ALIASES = {
         "quotation price",
         "quote",
     ],
+    "reminder_date": ["reminder_date", "reminder date", "reminder"],
     "work_done_date": ["work_done_date", "work done date", "completion_date"],
+    "delivery_date": ["delivery_date", "delivery date", "delivery"],
     "donation_cost": ["donation", "donation_cost", "complimentary cost"],
     "follow_up_date": ["follow_up_date", "follow-up date", "follow up date", "date"],
     "client_name": ["client_name", "customer_name", "customer", "client"],
@@ -690,7 +710,6 @@ REPORT_COLUMN_ALIASES = {
     "product_detail": ["product_detail", "product detail", "product details", "product"],
     "notes": ["remarks", "notes", "comment", "comments"],
     "person_in_charge": ["person_in_charge", "person in charge", "incharge", "responsible"],
-    "reminder_date": ["reminder_date", "reminder date", "reminder"],
 }
 
 
@@ -993,13 +1012,15 @@ def _append_report_remarks_history(
         old_remark = clean_text(previous.get(remarks_key)) or ""
         new_remark = clean_text(updated.get(remarks_key)) or ""
         history_lines: list[str] = []
-        if previous_history:
-            history_lines.append(previous_history)
-        if old_remark and new_remark and new_remark != old_remark:
-            if not previous_history:
+        if new_remark and new_remark != old_remark:
+            if previous_history:
+                history_lines.append(previous_history)
+            if old_remark and not previous_history:
                 history_lines.append(f"Previous: {old_remark}")
             history_lines.append(f"{now_stamp} - {new_remark}")
-        updated[history_key] = "\n".join(history_lines) if history_lines else previous_history
+            updated[history_key] = "\n".join(history_lines)
+        else:
+            updated[history_key] = previous_history
         updated_rows.append(updated)
     return updated_rows
 
@@ -3632,14 +3653,14 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                 }
             )
 
-    follow_up_reports = df_query(
+    report_reminders = df_query(
         conn,
         dedent(
             """
-            SELECT report_id, grid_payload
+            SELECT report_id, grid_payload, report_template
             FROM work_reports
             WHERE user_id=?
-              AND LOWER(COALESCE(report_template, '')) = 'follow_up'
+              AND LOWER(COALESCE(report_template, '')) IN ('follow_up', 'service', 'sales')
               AND grid_payload IS NOT NULL
               AND grid_payload != ''
             ORDER BY datetime(updated_at) DESC
@@ -3648,11 +3669,38 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
         ),
         (user_id,),
     )
-    follow_up_reminders: list[tuple[date, dict[str, object]]] = []
-    if not follow_up_reports.empty:
-        for _, row in follow_up_reports.iterrows():
+
+    def _report_reminder_label(entry: dict[str, object], template_key: str) -> str:
+        if template_key == "follow_up":
+            return (
+                clean_text(entry.get("client_name"))
+                or clean_text(entry.get("product_detail"))
+                or clean_text(entry.get("contact"))
+                or "Follow-up"
+            )
+        return (
+            clean_text(entry.get("customer_name"))
+            or clean_text(entry.get("company_name"))
+            or clean_text(entry.get("phone"))
+            or clean_text(entry.get("product_details"))
+            or "Report reminder"
+        )
+
+    def _report_reminder_message(entry: dict[str, object], template_key: str) -> str:
+        if template_key == "follow_up":
+            return clean_text(entry.get("notes")) or "Follow-up reminder"
+        return (
+            clean_text(entry.get("details_remarks"))
+            or clean_text(entry.get("reported_complaints"))
+            or "Report reminder"
+        )
+
+    report_reminder_entries: list[tuple[date, dict[str, object]]] = []
+    if not report_reminders.empty:
+        for _, row in report_reminders.iterrows():
+            template_key = _normalize_report_template(row.get("report_template"))
             grid_rows = parse_report_grid_payload(
-                row.get("grid_payload"), template_key="follow_up"
+                row.get("grid_payload"), template_key=template_key
             )
             for entry in grid_rows:
                 reminder_iso = to_iso_date(entry.get("reminder_date"))
@@ -3662,18 +3710,13 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                 if pd.isna(reminder_dt):
                     continue
                 reminder_date = reminder_dt.date()
-                customer_label = (
-                    clean_text(entry.get("client_name"))
-                    or clean_text(entry.get("product_detail"))
-                    or clean_text(entry.get("contact"))
-                    or "Follow-up"
-                )
-                message = clean_text(entry.get("notes")) or "Follow-up reminder"
-                follow_up_reminders.append(
+                title = _report_reminder_label(entry, template_key)
+                message = _report_reminder_message(entry, template_key)
+                report_reminder_entries.append(
                     (
                         reminder_date,
                         {
-                            "title": customer_label,
+                            "title": title,
                             "message": f"{message} (due {format_period_range(reminder_iso, reminder_iso)})",
                             "severity": "warning"
                             if reminder_date <= date.today()
@@ -3681,9 +3724,9 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                         },
                     )
                 )
-    if follow_up_reminders:
-        follow_up_reminders.sort(key=lambda item: item[0])
-        for _, reminder in follow_up_reminders[:12]:
+    if report_reminder_entries:
+        report_reminder_entries.sort(key=lambda item: item[0])
+        for _, reminder in report_reminder_entries[:12]:
             alerts.append(reminder)
 
     note_alerts = df_query(
@@ -14656,6 +14699,7 @@ def render_operations_document_uploader(
                cd.original_name,
                cd.uploaded_at,
                cd.uploaded_by,
+               c.created_by AS customer_created_by,
                COALESCE(c.name, '(customer)') AS customer_name,
                c.company_name AS company,
                COALESCE(u.username, '(user)') AS uploaded_by_name,
@@ -14665,6 +14709,7 @@ def render_operations_document_uploader(
                d.status AS do_status,
                d.created_at AS do_created_at,
                d.record_type,
+               d.created_by AS do_created_by,
                sd.document_id AS service_document_id,
                s.service_id,
                s.do_number AS service_do_number,
@@ -14672,6 +14717,7 @@ def render_operations_document_uploader(
                s.remarks AS service_remarks,
                s.status AS service_status,
                s.service_date,
+               s.created_by AS service_created_by,
                md.document_id AS maintenance_document_id,
                m.maintenance_id,
                m.do_number AS maintenance_do_number,
@@ -14679,8 +14725,10 @@ def render_operations_document_uploader(
                m.remarks AS maintenance_remarks,
                m.status AS maintenance_status,
                m.maintenance_date,
+               m.created_by AS maintenance_created_by,
                o.document_id AS other_document_id,
-               o.description AS other_description
+               o.description AS other_description,
+               o.uploaded_by AS other_uploaded_by
         FROM customer_documents cd
         LEFT JOIN customers c ON c.customer_id = cd.customer_id
         LEFT JOIN users u ON u.user_id = cd.uploaded_by
@@ -14695,6 +14743,20 @@ def render_operations_document_uploader(
         ORDER BY datetime(cd.uploaded_at) DESC, cd.document_id DESC
         """,
     )
+    is_admin = current_user_is_admin()
+    viewer_id = current_user_id()
+    if not is_admin:
+        if viewer_id is None:
+            docs_df = docs_df.iloc[0:0]
+        else:
+            docs_df = docs_df[
+                (docs_df["uploaded_by"].fillna(-1).astype(int) == viewer_id)
+                | (docs_df["customer_created_by"].fillna(-1).astype(int) == viewer_id)
+                | (docs_df["do_created_by"].fillna(-1).astype(int) == viewer_id)
+                | (docs_df["service_created_by"].fillna(-1).astype(int) == viewer_id)
+                | (docs_df["maintenance_created_by"].fillna(-1).astype(int) == viewer_id)
+                | (docs_df["other_uploaded_by"].fillna(-1).astype(int) == viewer_id)
+            ]
     if customer_filter:
         docs_df = docs_df[docs_df["customer_id"] == int(customer_filter)]
     if doc_type_filter != "All":
@@ -22792,6 +22854,8 @@ def service_maintenance_page(conn):
 def customer_summary_page(conn):
     st.subheader("📒 Customer Summary")
     blank_label = "(blank)"
+    is_admin = current_user_is_admin()
+    viewer_id = current_user_id()
     show_complete_only = st.checkbox(
         "Only show customers with phone + address",
         value=False,
@@ -22896,6 +22960,7 @@ def customer_summary_page(conn):
                s.remarks,
                s.bill_document_path,
                s.payment_receipt_path,
+               s.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                COALESCE(c.company_name, cdo.company_name) AS company,
                COUNT(sd.document_id) AS doc_count
@@ -22911,6 +22976,13 @@ def customer_summary_page(conn):
         """,
         ids,
     )
+    if not is_admin:
+        if viewer_id is None:
+            service_df = service_df.iloc[0:0]
+        elif "created_by" in service_df.columns:
+            service_df = service_df[
+                service_df["created_by"].fillna(-1).astype(int) == viewer_id
+            ]
     service_df = fmt_dates(service_df, ["service_date", "service_start_date", "service_end_date"])
     if not service_df.empty:
         service_df["service_period"] = service_df.apply(
@@ -22932,6 +23004,7 @@ def customer_summary_page(conn):
                m.description,
                m.remarks,
                m.payment_receipt_path,
+               m.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                COALESCE(c.company_name, cdo.company_name) AS company,
                COUNT(md.document_id) AS doc_count
@@ -22947,6 +23020,13 @@ def customer_summary_page(conn):
         """,
         ids,
     )
+    if not is_admin:
+        if viewer_id is None:
+            maintenance_df = maintenance_df.iloc[0:0]
+        elif "created_by" in maintenance_df.columns:
+            maintenance_df = maintenance_df[
+                maintenance_df["created_by"].fillna(-1).astype(int) == viewer_id
+            ]
     maintenance_df = fmt_dates(
         maintenance_df,
         ["maintenance_date", "maintenance_start_date", "maintenance_end_date"],
@@ -22971,6 +23051,7 @@ def customer_summary_page(conn):
                d.created_at,
                d.file_path,
                d.payment_receipt_path,
+               d.created_by,
                COALESCE(d.record_type, 'delivery_order') AS record_type
         FROM delivery_orders d
         LEFT JOIN customers c ON c.customer_id = d.customer_id
@@ -22980,6 +23061,11 @@ def customer_summary_page(conn):
         """,
         ids,
     )
+    if not is_admin:
+        if viewer_id is None:
+            do_df = do_df.iloc[0:0]
+        elif "created_by" in do_df.columns:
+            do_df = do_df[do_df["created_by"].fillna(-1).astype(int) == viewer_id]
     if not do_df.empty:
         do_df = fmt_dates(do_df, ["created_at"])
         do_df["do_number"] = do_df["do_number"].apply(clean_text)
@@ -23011,7 +23097,8 @@ def customer_summary_page(conn):
                    d.remarks,
                    d.created_at,
                    d.file_path,
-                   d.payment_receipt_path
+                   d.payment_receipt_path,
+                   d.created_by
             FROM delivery_orders d
             LEFT JOIN customers c ON c.customer_id = d.customer_id
             WHERE d.do_number IN ({','.join('?' * len(missing_dos))})
@@ -23020,6 +23107,13 @@ def customer_summary_page(conn):
             missing_dos,
         )
         if not extra_df.empty:
+            if not is_admin:
+                if viewer_id is None:
+                    extra_df = extra_df.iloc[0:0]
+                elif "created_by" in extra_df.columns:
+                    extra_df = extra_df[
+                        extra_df["created_by"].fillna(-1).astype(int) == viewer_id
+                    ]
             extra_df = fmt_dates(extra_df, ["created_at"])
             extra_df["do_number"] = extra_df["do_number"].apply(clean_text)
             do_df = pd.concat([do_df, extra_df], ignore_index=True) if not do_df.empty else extra_df
@@ -23052,7 +23146,15 @@ def customer_summary_page(conn):
                         "Receipt": "Receipt",
                         "Type": "Type",
                     }
-                ).drop(columns=["file_path", "payment_receipt_path", "record_type"], errors="ignore"),
+                ).drop(
+                    columns=[
+                        "file_path",
+                        "payment_receipt_path",
+                        "record_type",
+                        "created_by",
+                    ],
+                    errors="ignore",
+                ),
                 use_container_width=True,
                 column_config={
                     "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
@@ -23090,7 +23192,12 @@ def customer_summary_page(conn):
         )
         st.dataframe(
             service_display.drop(
-                columns=["service_id", "bill_document_path", "payment_receipt_path"],
+                columns=[
+                    "service_id",
+                    "bill_document_path",
+                    "payment_receipt_path",
+                    "created_by",
+                ],
                 errors="ignore",
             ),
             use_container_width=True,
@@ -23122,7 +23229,7 @@ def customer_summary_page(conn):
         )
         st.dataframe(
             maintenance_display.drop(
-                columns=["maintenance_id", "payment_receipt_path"],
+                columns=["maintenance_id", "payment_receipt_path", "created_by"],
                 errors="ignore",
             ),
             use_container_width=True,
@@ -23141,7 +23248,8 @@ def customer_summary_page(conn):
                o.items_payload,
                o.file_path,
                o.original_name,
-               o.uploaded_at
+               o.uploaded_at,
+               o.uploaded_by
         FROM operations_other_documents o
         WHERE o.customer_id IN ({placeholders})
           AND o.deleted_at IS NULL
@@ -23149,6 +23257,13 @@ def customer_summary_page(conn):
         """,
         ids,
     )
+    if not is_admin:
+        if viewer_id is None:
+            other_ops_df = other_ops_df.iloc[0:0]
+        elif "uploaded_by" in other_ops_df.columns:
+            other_ops_df = other_ops_df[
+                other_ops_df["uploaded_by"].fillna(-1).astype(int) == viewer_id
+            ]
     if other_ops_df.empty:
         st.info("No other operations uploads found for this customer.")
     else:
@@ -23163,7 +23278,10 @@ def customer_summary_page(conn):
             }
         )
         st.dataframe(
-            other_ops_display.drop(columns=["file_path", "document_id", "customer_id"], errors="ignore"),
+            other_ops_display.drop(
+                columns=["file_path", "document_id", "customer_id", "uploaded_by"],
+                errors="ignore",
+            ),
             use_container_width=True,
             column_config={
                 "Document": st.column_config.LinkColumn("Document", display_text="⬇️"),
@@ -23204,11 +23322,12 @@ def customer_summary_page(conn):
                        payment_receipt_path
                 FROM quotations
                 WHERE deleted_at IS NULL
+                  {"" if is_admin else "AND created_by = ?"}
                   AND ({quote_clause})
                 ORDER BY datetime(quote_date) DESC, quotation_id DESC
                 """
             ),
-            tuple(quote_params),
+            tuple([viewer_id] + quote_params if not is_admin else quote_params),
         )
     st.markdown("**Quotation records**")
     if quotation_docs.empty:
@@ -23274,7 +23393,7 @@ def customer_summary_page(conn):
     customer_docs = df_query(
         conn,
         f"""
-        SELECT document_id, customer_id, doc_type, file_path, original_name, uploaded_at
+        SELECT document_id, customer_id, doc_type, file_path, original_name, uploaded_at, uploaded_by
         FROM customer_documents
         WHERE customer_id IN ({placeholders})
           AND deleted_at IS NULL
@@ -23282,6 +23401,13 @@ def customer_summary_page(conn):
         """,
         ids,
     )
+    if not is_admin:
+        if viewer_id is None:
+            customer_docs = customer_docs.iloc[0:0]
+        elif "uploaded_by" in customer_docs.columns:
+            customer_docs = customer_docs[
+                customer_docs["uploaded_by"].fillna(-1).astype(int) == viewer_id
+            ]
     if not customer_docs.empty:
         customer_docs = customer_docs.drop_duplicates(
             subset=["customer_id", "doc_type", "file_path", "original_name"],
@@ -26930,8 +27056,10 @@ def reports_page(conn):
             disabled_columns.append("remarks_history")
         if editing_record and not is_admin:
             if template_key in {"service", "sales"}:
-                editable_columns = {"details_remarks", "progress_status"}
-                helper_label = "Staff can update only the remarks and progress columns for existing reports."
+                editable_columns = {"details_remarks", "progress_status", "reminder_date"}
+                helper_label = (
+                    "Staff can update only the remarks, progress, and reminder date columns for existing reports."
+                )
             elif template_key == "follow_up":
                 editable_columns = {"notes", "reminder_date", "progress_status"}
                 helper_label = (
