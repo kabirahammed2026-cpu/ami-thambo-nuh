@@ -90,6 +90,7 @@ STRICT_REPORT_WINDOWS = os.getenv("PS_REPORT_STRICT_WINDOWS", "").strip().lower(
     "yes",
     "on",
 }
+RECEIPTS_ENABLED = False
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 DELIVERY_ORDER_DIR = UPLOADS_DIR / "delivery_orders"
@@ -112,6 +113,16 @@ REQUIRED_CUSTOMER_FIELDS = {
     "phone": "Phone",
     "address": "Address",
 }
+
+PAGE_SKELETON_HTML = """
+<div class="ps-page-skeleton">
+  <div class="ps-skeleton-line ps-skeleton-title"></div>
+  <div class="ps-skeleton-line"></div>
+  <div class="ps-skeleton-line"></div>
+  <div class="ps-skeleton-line ps-skeleton-short"></div>
+  <div class="ps-skeleton-line"></div>
+</div>
+"""
 
 SERVICE_STATUS_OPTIONS = ["In progress", "Completed", "Haven't started"]
 DEFAULT_SERVICE_STATUS = SERVICE_STATUS_OPTIONS[0]
@@ -382,6 +393,15 @@ SERVICE_REPORT_FIELDS = OrderedDict(
             },
         ),
         ("qty", {"label": "Qty", "type": "number", "step": 1.0}),
+        (
+            "running_hours",
+            {
+                "label": "Running Hours",
+                "type": "number",
+                "step": 1.0,
+                "help": "Generator running hours recorded during the visit.",
+            },
+        ),
         (
             "progress_status",
             {
@@ -689,6 +709,13 @@ REPORT_COLUMN_ALIASES = {
     "remarks_history": ["remarks_history", "remarks history", "history"],
     "phone": ["phone", "contact", "mobile", "contact_no", "contact number", "whatsapp"],
     "qty": ["qty", "quantity", "pcs", "pieces", "units"],
+    "running_hours": [
+        "running_hours",
+        "running hours",
+        "running hour",
+        "hours",
+        "hour",
+    ],
     "progress_status": ["progress", "status"],
     "payment_status": ["payment", "payment_status", "payment status"],
     "quotation_tk": [
@@ -1194,6 +1221,7 @@ CREATE TABLE IF NOT EXISTS users (
     phone TEXT,
     email TEXT,
     title TEXT,
+    staff_classification TEXT DEFAULT 'service',
     role TEXT DEFAULT 'staff',
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -1292,6 +1320,7 @@ CREATE TABLE IF NOT EXISTS delivery_orders (
     description TEXT,
     sales_person TEXT,
     remarks TEXT,
+    delivery_date TEXT,
     file_path TEXT,
     record_type TEXT DEFAULT 'delivery_order',
     status TEXT DEFAULT 'pending',
@@ -1656,6 +1685,10 @@ def ensure_schema_upgrades(conn):
     add_column("users", "phone", "TEXT")
     add_column("users", "email", "TEXT")
     add_column("users", "title", "TEXT")
+    add_column("users", "staff_classification", "TEXT DEFAULT 'service'")
+    conn.execute(
+        "UPDATE users SET staff_classification='service' WHERE staff_classification IS NULL OR TRIM(staff_classification) = ''"
+    )
     add_column("services", "status", "TEXT DEFAULT 'In progress'")
     add_column("quotations", "follow_up_history", "TEXT")
     add_column("services", "service_start_date", "TEXT")
@@ -1673,6 +1706,7 @@ def ensure_schema_upgrades(conn):
     add_column("services", "payment_receipt_path", "TEXT")
     add_column("maintenance_records", "payment_status", "TEXT DEFAULT 'pending'")
     add_column("maintenance_records", "payment_receipt_path", "TEXT")
+    add_column("delivery_orders", "delivery_date", "TEXT")
     add_column("services", "deleted_at", "TEXT")
     add_column("services", "deleted_by", "INTEGER")
     add_column("maintenance_records", "deleted_at", "TEXT")
@@ -5694,7 +5728,7 @@ def _build_attachment_bundle_download(
     bundle_label: str,
 ) -> Optional[tuple[str, str]]:
     attachments: list[tuple[str, str, bytes]] = []
-    for doc_type, path_value in (("attachment", attachment_path), ("receipt", receipt_path)):
+    for doc_type, path_value in (("attachment", attachment_path),):
         if not path_value:
             continue
         resolved = resolve_upload_path(path_value)
@@ -6828,7 +6862,7 @@ def _build_quotations_export(conn) -> pd.DataFrame:
     )
     df = df_query(conn, query, scope_params)
     df = fmt_dates(df, ["quote_date", "follow_up_date", "created_at", "updated_at"])
-    return df.rename(
+    df = df.rename(
         columns={
             "reference": "Reference",
             "quote_date": "Quote date",
@@ -6855,6 +6889,9 @@ def _build_quotations_export(conn) -> pd.DataFrame:
             "updated_at": "Updated at",
         }
     )
+    if not RECEIPTS_ENABLED and "Receipt path" in df.columns:
+        df = df.drop(columns=["Receipt path"])
+    return df
 
 
 def _build_master_sheet(sheets: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
@@ -7681,6 +7718,39 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             background-color: var(--ps-button-hover) !important;
             border-color: var(--ps-button-border) !important;
             color: var(--ps-button-text) !important;
+        }}
+        .ps-page-skeleton {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            margin: 1rem 0 2rem;
+        }}
+        .ps-skeleton-line {{
+            height: 12px;
+            border-radius: 999px;
+            background: linear-gradient(
+                90deg,
+                rgba(148, 163, 184, 0.15) 0%,
+                rgba(148, 163, 184, 0.35) 50%,
+                rgba(148, 163, 184, 0.15) 100%
+            );
+            background-size: 200% 100%;
+            animation: ps-skeleton-shimmer 1.2s ease-in-out infinite;
+        }}
+        .ps-skeleton-title {{
+            height: 20px;
+            width: 55%;
+        }}
+        .ps-skeleton-short {{
+            width: 40%;
+        }}
+        @keyframes ps-skeleton-shimmer {{
+            0% {{
+                background-position: 200% 0;
+            }}
+            100% {{
+                background-position: -200% 0;
+            }}
         }}
         </style>
         """,
@@ -9290,7 +9360,7 @@ def _ensure_debug_user(conn) -> Optional[dict[str, object]]:
     debug_username = os.getenv("DEBUG_DIAG_USER", "diagnostic")
     row = df_query(
         conn,
-        "SELECT user_id, username, role, phone, title, email FROM users WHERE username=?",
+        "SELECT user_id, username, role, phone, title, email, staff_classification FROM users WHERE username=?",
         (debug_username,),
     )
     if row.empty:
@@ -9303,7 +9373,7 @@ def _ensure_debug_user(conn) -> Optional[dict[str, object]]:
         conn.commit()
         row = df_query(
             conn,
-            "SELECT user_id, username, role, phone, title, email FROM users WHERE username=?",
+            "SELECT user_id, username, role, phone, title, email, staff_classification FROM users WHERE username=?",
             (debug_username,),
         )
     payload = {
@@ -9313,6 +9383,7 @@ def _ensure_debug_user(conn) -> Optional[dict[str, object]]:
         "phone": clean_text(row.iloc[0].get("phone")),
         "title": clean_text(row.iloc[0].get("title")),
         "email": clean_text(row.iloc[0].get("email")),
+        "staff_classification": clean_text(row.iloc[0].get("staff_classification")) or "service",
     }
     st.session_state.user = payload
     st.session_state["debug_diag"] = True
@@ -9495,7 +9566,7 @@ def login_box(conn, *, render_id=None):
     if ok:
         row = df_query(
             conn,
-            "SELECT user_id, username, pass_hash, role, phone, title, email FROM users WHERE username = ?",
+            "SELECT user_id, username, pass_hash, role, phone, title, email, staff_classification FROM users WHERE username = ?",
             (u,),
         )
         if not row.empty and hashlib.sha256(p.encode("utf-8")).hexdigest() == row.iloc[0]["pass_hash"]:
@@ -9506,6 +9577,8 @@ def login_box(conn, *, render_id=None):
                 "phone": clean_text(row.iloc[0].get("phone")),
                 "title": clean_text(row.iloc[0].get("title")),
                 "email": clean_text(row.iloc[0].get("email")),
+                "staff_classification": clean_text(row.iloc[0].get("staff_classification"))
+                or "service",
             }
             st.session_state.user = user_payload
             _ensure_session_token(conn, user_payload)
@@ -11306,7 +11379,6 @@ def dashboard(conn):
                        c.company_name AS company,
                        d.description,
                        d.file_path,
-                       d.payment_receipt_path,
                        d.deleted_at,
                        d.deleted_by,
                        u.username AS deleted_by_name
@@ -11453,13 +11525,14 @@ def dashboard(conn):
         download_rows = []
         for _, row in snapshot_df.iterrows():
             attachments = []
-            for label, path_value in (
-                ("Document", row.get("file_path")),
-                ("Receipt", row.get("payment_receipt_path")),
-            ):
+            for label, path_value in (("Document", row.get("file_path")),):
                 payload, filename = _resolve_recent_pdf_bytes(path_value)
                 if payload and filename:
                     attachments.append((label, payload, filename))
+            if RECEIPTS_ENABLED:
+                payload, filename = _resolve_recent_pdf_bytes(row.get("payment_receipt_path"))
+                if payload and filename:
+                    attachments.append(("Receipt", payload, filename))
             if attachments:
                 download_rows.append((row, attachments))
         if not download_rows:
@@ -11760,10 +11833,10 @@ def dashboard(conn):
             SELECT d.do_number,
                    d.customer_id,
                    d.created_at,
+                   d.delivery_date,
                    d.status,
                    d.total_amount,
                    d.file_path,
-                   d.payment_receipt_path,
                    COALESCE(c.name, '(unknown)') AS customer,
                    c.company_name AS company,
                    d.description
@@ -11785,7 +11858,11 @@ def dashboard(conn):
         if recent_delivery_orders.empty:
             st.info("No recent delivery orders found.")
         else:
-            recent_delivery_orders = fmt_dates(recent_delivery_orders, ["created_at"])
+            recent_delivery_orders["sale_date"] = recent_delivery_orders.apply(
+                lambda row: clean_text(row.get("delivery_date")) or clean_text(row.get("created_at")),
+                axis=1,
+            )
+            recent_delivery_orders = fmt_dates(recent_delivery_orders, ["sale_date"])
             recent_delivery_orders["total_amount"] = recent_delivery_orders[
                 "total_amount"
             ].apply(
@@ -11796,7 +11873,7 @@ def dashboard(conn):
                 recent_delivery_orders.rename(
                 columns={
                     "do_number": "DO Serial",
-                    "created_at": "Created",
+                    "sale_date": "Sale date",
                     "status": "Status",
                     "total_amount": "Total",
                     "customer": "Customer",
@@ -11804,7 +11881,7 @@ def dashboard(conn):
                     "description": "Description",
                 }
             ).drop(
-                    columns=["customer_id", "file_path", "payment_receipt_path"],
+                    columns=["customer_id", "file_path", "created_at", "delivery_date"],
                     errors="ignore",
                 ),
                 use_container_width=True,
@@ -13287,12 +13364,14 @@ def _render_doc_detail_inputs(
             value=user_label,
             key=f"{key_prefix}_quotation_person_in_charge",
         )
-        details["receipt_upload"] = st.file_uploader(
-            "Payment receipt (required for paid)",
-            type=["pdf", "png", "jpg", "jpeg", "webp"],
-            key=f"{key_prefix}_quotation_receipt",
-            help="Attach the receipt when marking this quotation as paid.",
-        )
+        details["receipt_upload"] = None
+        if RECEIPTS_ENABLED:
+            details["receipt_upload"] = st.file_uploader(
+                "Payment receipt (required for paid)",
+                type=["pdf", "png", "jpg", "jpeg", "webp"],
+                key=f"{key_prefix}_quotation_receipt",
+                help="Attach the receipt when marking this quotation as paid.",
+            )
     elif doc_type in ("Delivery order", "Work done"):
         items_key = f"{key_prefix}_delivery_items"
         st.session_state.setdefault(items_key, _default_simple_items())
@@ -13355,15 +13434,17 @@ def _render_doc_detail_inputs(
             key=f"{key_prefix}_do_remarks",
         )
         details["advance_receipt_upload"] = None
-        details["receipt_upload"] = st.file_uploader(
-            "Payment receipt (required for paid)",
-            type=["pdf", "png", "jpg", "jpeg", "webp"],
-            key=f"{key_prefix}_do_receipt",
-            help="Attach the final receipt for paid delivery orders/work done.",
-        )
+        details["receipt_upload"] = None
+        if RECEIPTS_ENABLED:
+            details["receipt_upload"] = st.file_uploader(
+                "Payment receipt (required for paid)",
+                type=["pdf", "png", "jpg", "jpeg", "webp"],
+                key=f"{key_prefix}_do_receipt",
+                help="Attach the final receipt for paid delivery orders/work done.",
+            )
         status_value = normalize_delivery_status(details.get("status"))
         details["advance_taken"] = False
-        if status_value == "advanced":
+        if status_value == "advanced" and RECEIPTS_ENABLED:
             details["advance_taken"] = st.checkbox(
                 "Advance payment was received",
                 key=f"{key_prefix}_do_advance_taken",
@@ -13442,12 +13523,14 @@ def _render_doc_detail_inputs(
             value=user_label,
             key=f"{key_prefix}_service_person_in_charge",
         )
-        details["receipt_upload"] = st.file_uploader(
-            "Payment receipt (required for paid)",
-            type=["pdf", "png", "jpg", "jpeg", "webp"],
-            key=f"{key_prefix}_service_receipt",
-            help="Upload the receipt when marking this service as paid.",
-        )
+        details["receipt_upload"] = None
+        if RECEIPTS_ENABLED:
+            details["receipt_upload"] = st.file_uploader(
+                "Payment receipt (required for paid)",
+                type=["pdf", "png", "jpg", "jpeg", "webp"],
+                key=f"{key_prefix}_service_receipt",
+                help="Upload the receipt when marking this service as paid.",
+            )
     elif doc_type == "Maintenance":
         items_key = f"{key_prefix}_maintenance_items"
         st.session_state.setdefault(items_key, _default_simple_items())
@@ -13514,12 +13597,14 @@ def _render_doc_detail_inputs(
             value=user_label,
             key=f"{key_prefix}_maintenance_person_in_charge",
         )
-        details["receipt_upload"] = st.file_uploader(
-            "Payment receipt (required for paid)",
-            type=["pdf", "png", "jpg", "jpeg", "webp"],
-            key=f"{key_prefix}_maintenance_receipt",
-            help="Upload the receipt when marking this maintenance record as paid.",
-        )
+        details["receipt_upload"] = None
+        if RECEIPTS_ENABLED:
+            details["receipt_upload"] = st.file_uploader(
+                "Payment receipt (required for paid)",
+                type=["pdf", "png", "jpg", "jpeg", "webp"],
+                key=f"{key_prefix}_maintenance_receipt",
+                help="Upload the receipt when marking this maintenance record as paid.",
+            )
     elif doc_type == "Other":
         items_key = f"{key_prefix}_other_items"
         st.session_state.setdefault(items_key, _default_simple_items())
@@ -13648,25 +13733,26 @@ def _save_customer_document_upload(
             st.error("Provide a delivery/work done number before saving.")
             return False
         status_value = normalize_delivery_status(details.get("status"))
-        if status_value == "advanced" and details.get("advance_receipt_upload") is None:
-            st.warning("Advance receipt is highly recommended for advanced records.")
-        if status_value == "paid":
-            if details.get("receipt_upload") is None:
-                existing_receipt = df_query(
-                    conn,
-                    "SELECT payment_receipt_path FROM delivery_orders WHERE do_number = ? AND deleted_at IS NULL",
-                    (do_number,),
-                )
-                existing_receipt_path = (
-                    clean_text(existing_receipt.iloc[0].get("payment_receipt_path"))
-                    if not existing_receipt.empty
-                    else None
-                )
-                if not existing_receipt_path:
-                    st.error("Upload a full payment receipt before marking this record as paid.")
-                    return False
-            if details.get("advance_taken") and details.get("advance_receipt_upload") is None:
-                st.warning("Advance receipt is highly recommended when an advance was taken.")
+        if RECEIPTS_ENABLED:
+            if status_value == "advanced" and details.get("advance_receipt_upload") is None:
+                st.warning("Advance receipt is highly recommended for advanced records.")
+            if status_value == "paid":
+                if details.get("receipt_upload") is None:
+                    existing_receipt = df_query(
+                        conn,
+                        "SELECT payment_receipt_path FROM delivery_orders WHERE do_number = ? AND deleted_at IS NULL",
+                        (do_number,),
+                    )
+                    existing_receipt_path = (
+                        clean_text(existing_receipt.iloc[0].get("payment_receipt_path"))
+                        if not existing_receipt.empty
+                        else None
+                    )
+                    if not existing_receipt_path:
+                        st.error("Upload a full payment receipt before marking this record as paid.")
+                        return False
+                if details.get("advance_taken") and details.get("advance_receipt_upload") is None:
+                    st.warning("Advance receipt is highly recommended when an advance was taken.")
     if doc_type == "Quotation":
         status_value = clean_text(details.get("payment_status")) or "pending"
         if not clean_text(details.get("reference")):
@@ -13680,7 +13766,7 @@ def _save_customer_document_upload(
         if not items_clean:
             st.error("Add at least one quotation item before saving.")
             return False
-        if status_value == "paid" and details.get("receipt_upload") is None:
+        if RECEIPTS_ENABLED and status_value == "paid" and details.get("receipt_upload") is None:
             st.error("Upload a receipt before marking this quotation as paid.")
             return False
         details["items"] = items_clean
@@ -13694,11 +13780,12 @@ def _save_customer_document_upload(
         if not items_clean:
             st.error("Add at least one service product item before saving.")
             return False
-        if details.get("payment_status") == "paid" and details.get("receipt_upload") is None:
-            st.error("Upload a payment receipt before marking this service as paid.")
-            return False
-        if details.get("payment_status") == "advanced" and details.get("receipt_upload") is None:
-            st.warning("Payment receipt is highly recommended for advanced service records.")
+        if RECEIPTS_ENABLED:
+            if details.get("payment_status") == "paid" and details.get("receipt_upload") is None:
+                st.error("Upload a payment receipt before marking this service as paid.")
+                return False
+            if details.get("payment_status") == "advanced" and details.get("receipt_upload") is None:
+                st.warning("Payment receipt is highly recommended for advanced service records.")
         details["items"] = items_clean
     if doc_type == "Maintenance":
         if not clean_text(details.get("description")):
@@ -13709,11 +13796,12 @@ def _save_customer_document_upload(
         if not items_clean:
             st.error("Add at least one maintenance product item before saving.")
             return False
-        if details.get("payment_status") == "paid" and details.get("receipt_upload") is None:
-            st.error("Upload a payment receipt before marking this maintenance record as paid.")
-            return False
-        if details.get("payment_status") == "advanced" and details.get("receipt_upload") is None:
-            st.warning("Payment receipt is highly recommended for advanced maintenance records.")
+        if RECEIPTS_ENABLED:
+            if details.get("payment_status") == "paid" and details.get("receipt_upload") is None:
+                st.error("Upload a payment receipt before marking this maintenance record as paid.")
+                return False
+            if details.get("payment_status") == "advanced" and details.get("receipt_upload") is None:
+                st.warning("Payment receipt is highly recommended for advanced maintenance records.")
         details["items"] = items_clean
     if doc_type == "Other":
         if not clean_text(details.get("description")):
@@ -13793,7 +13881,7 @@ def _save_customer_document_upload(
     if doc_type == "Quotation":
         receipt_path = None
         receipt_upload = details.get("receipt_upload")
-        if receipt_upload is not None:
+        if RECEIPTS_ENABLED and receipt_upload is not None:
             receipt_error = _validate_upload(
                 receipt_upload,
                 allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
@@ -13851,11 +13939,13 @@ def _save_customer_document_upload(
         do_number = clean_text(details.get("do_number"))
         status_value = normalize_delivery_status(details.get("status"))
         receipt_path = None
-        receipt_upload = details.get("receipt_upload")
-        advance_receipt_upload = details.get("advance_receipt_upload")
+        receipt_upload = details.get("receipt_upload") if RECEIPTS_ENABLED else None
+        advance_receipt_upload = (
+            details.get("advance_receipt_upload") if RECEIPTS_ENABLED else None
+        )
         if status_value == "advanced" and advance_receipt_upload is not None:
             receipt_upload = advance_receipt_upload
-        if receipt_upload is not None:
+        if RECEIPTS_ENABLED and receipt_upload is not None:
             receipt_error = _validate_upload(
                 receipt_upload,
                 allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
@@ -13869,7 +13959,7 @@ def _save_customer_document_upload(
                 identifier=f"{_sanitize_path_component(do_number)}_receipt",
                 target_dir=DELIVERY_RECEIPT_DIR,
             )
-        if advance_receipt_upload is not None:
+        if RECEIPTS_ENABLED and advance_receipt_upload is not None:
             advance_error = _validate_upload(
                 advance_receipt_upload,
                 allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
@@ -13953,8 +14043,8 @@ def _save_customer_document_upload(
             new_product_labels = format_simple_item_labels(items_clean)
         product_info = ", ".join(new_product_labels)
         receipt_path = None
-        receipt_upload = details.get("receipt_upload")
-        if receipt_upload is not None:
+        receipt_upload = details.get("receipt_upload") if RECEIPTS_ENABLED else None
+        if RECEIPTS_ENABLED and receipt_upload is not None:
             receipt_error = _validate_upload(
                 receipt_upload,
                 allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
@@ -14019,8 +14109,8 @@ def _save_customer_document_upload(
             new_product_labels = format_simple_item_labels(items_clean)
         product_info = ", ".join(new_product_labels)
         receipt_path = None
-        receipt_upload = details.get("receipt_upload")
-        if receipt_upload is not None:
+        receipt_upload = details.get("receipt_upload") if RECEIPTS_ENABLED else None
+        if RECEIPTS_ENABLED and receipt_upload is not None:
             receipt_error = _validate_upload(
                 receipt_upload,
                 allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp"},
@@ -15800,7 +15890,6 @@ def operations_page(conn):
             record_type_label="Delivery order",
             record_type_key="delivery_order",
             highlight_record=deep_record if deep_tab == "delivery_orders" else None,
-            enable_receipt_ocr=False,
         )
     elif selected_tab == "Work done":
         st.markdown("### Work done")
@@ -15810,7 +15899,6 @@ def operations_page(conn):
             record_type_label="Work done",
             record_type_key="work_done",
             highlight_record=deep_record if deep_tab == "work_done" else None,
-            enable_receipt_ocr=False,
         )
     elif selected_tab == "Service":
         st.markdown("### Service records")
@@ -16059,15 +16147,16 @@ def customers_page(conn):
                         "Delivery order status",
                         options=DELIVERY_STATUS_OPTIONS,
                         key="new_customer_do_status",
-                        help="Mark as paid to require an accompanying receipt.",
+                        help="Mark as paid to track the delivery order status.",
                         format_func=lambda option: DELIVERY_STATUS_LABELS.get(option, option.title()),
                     )
-                    st.file_uploader(
-                        "Delivery order receipt (required if paid)",
-                        type=["pdf", "png", "jpg", "jpeg", "webp"],
-                        key="new_customer_do_receipt",
-                        help="Upload proof of payment when marking the DO as paid.",
-                    )
+                    if RECEIPTS_ENABLED:
+                        st.file_uploader(
+                            "Delivery order receipt (required if paid)",
+                            type=["pdf", "png", "jpg", "jpeg", "webp"],
+                            key="new_customer_do_receipt",
+                            help="Upload proof of payment when marking the DO as paid.",
+                        )
 
                 if create_work_done:
                     st.subheader("Work done details")
@@ -16083,7 +16172,7 @@ def customers_page(conn):
                         "Work done status",
                         options=DELIVERY_STATUS_OPTIONS,
                         key="new_customer_work_done_status",
-                        help="Mark as paid to require an accompanying receipt.",
+                        help="Mark as paid to track the work done status.",
                         format_func=lambda option: DELIVERY_STATUS_LABELS.get(option, option.title()),
                     )
                     work_done_pdf = work_done_cols[2].file_uploader(
@@ -16091,12 +16180,14 @@ def customers_page(conn):
                         type=["pdf", "png", "jpg", "jpeg", "webp"],
                         key="new_customer_work_done_pdf",
                     )
-                    work_done_receipt = st.file_uploader(
-                        "Payment receipt (required for paid work done)",
-                        type=["pdf", "png", "jpg", "jpeg", "webp"],
-                        key="new_customer_work_done_receipt",
-                        help="Upload proof of payment if this work done is already paid.",
-                    )
+                    work_done_receipt = None
+                    if RECEIPTS_ENABLED:
+                        work_done_receipt = st.file_uploader(
+                            "Payment receipt (required for paid work done)",
+                            type=["pdf", "png", "jpg", "jpeg", "webp"],
+                            key="new_customer_work_done_receipt",
+                            help="Upload proof of payment if this work done is already paid.",
+                        )
                     work_done_notes = st.text_area(
                         "Work done description / remarks",
                         key="new_customer_work_done_notes",
@@ -16131,12 +16222,14 @@ def customers_page(conn):
                         key="new_customer_service_payment_status",
                         help="Track whether the service has been paid.",
                     )
-                    service_receipt = st.file_uploader(
-                        "Service receipt (required if paid)",
-                        type=["pdf", "png", "jpg", "jpeg", "webp"],
-                        key="new_customer_service_receipt",
-                        help="Upload payment receipt when marking the service as paid.",
-                    )
+                    service_receipt = None
+                    if RECEIPTS_ENABLED:
+                        service_receipt = st.file_uploader(
+                            "Service receipt (required if paid)",
+                            type=["pdf", "png", "jpg", "jpeg", "webp"],
+                            key="new_customer_service_receipt",
+                            help="Upload payment receipt when marking the service as paid.",
+                        )
                 else:
                     service_date_input = st.session_state.get("new_customer_service_date")
                     service_description = st.session_state.get("new_customer_service_description")
@@ -16164,12 +16257,14 @@ def customers_page(conn):
                         key="new_customer_maintenance_payment_status",
                         help="Track whether maintenance has been paid.",
                     )
-                    maintenance_receipt = st.file_uploader(
-                        "Maintenance receipt (required if paid)",
-                        type=["pdf", "png", "jpg", "jpeg", "webp"],
-                        key="new_customer_maintenance_receipt",
-                        help="Upload payment receipt when marking maintenance as paid.",
-                    )
+                    maintenance_receipt = None
+                    if RECEIPTS_ENABLED:
+                        maintenance_receipt = st.file_uploader(
+                            "Maintenance receipt (required if paid)",
+                            type=["pdf", "png", "jpg", "jpeg", "webp"],
+                            key="new_customer_maintenance_receipt",
+                            help="Upload payment receipt when marking maintenance as paid.",
+                        )
                 else:
                     maintenance_date_input = st.session_state.get("new_customer_maintenance_date")
                     maintenance_description = st.session_state.get("new_customer_maintenance_description")
@@ -16323,7 +16418,7 @@ def customers_page(conn):
                         (do_serial,),
                     ).fetchone()
                     existing_receipt = clean_text(existing[4]) if existing else None
-                    if do_status_value == "paid":
+                    if RECEIPTS_ENABLED and do_status_value == "paid":
                         do_receipt = st.session_state.get("new_customer_do_receipt")
                         if do_receipt:
                             do_receipt_path = store_payment_receipt(
@@ -16342,7 +16437,7 @@ def customers_page(conn):
                     sales_clean = clean_text(sales_person_input)
                     if existing:
                         existing_customer, existing_path, existing_items, existing_total, existing_receipt = existing
-                        if do_status_value == "paid" and not do_receipt_path:
+                        if RECEIPTS_ENABLED and do_status_value == "paid" and not do_receipt_path:
                             do_receipt_path = clean_text(existing_receipt)
                         if existing_customer and int(existing_customer) != int(cid):
                             st.warning(
@@ -16462,7 +16557,7 @@ def customers_page(conn):
                             work_done_saved = False
                             work_done_status_value = normalize_delivery_status(work_done_status)
                             work_done_receipt_path = None
-                            if work_done_status_value == "paid":
+                            if RECEIPTS_ENABLED and work_done_status_value == "paid":
                                 work_done_receipt_path = store_payment_receipt(
                                     work_done_receipt,
                                     identifier=f"{_sanitize_path_component(work_done_serial) or 'work_done'}_receipt",
@@ -16478,8 +16573,10 @@ def customers_page(conn):
                                 existing_work_done_receipt = clean_text(
                                     existing_work_done.iloc[0].get("payment_receipt_path")
                                 )
-                            if work_done_status_value == "paid" and not (
-                                work_done_receipt_path or existing_work_done_receipt
+                            if (
+                                RECEIPTS_ENABLED
+                                and work_done_status_value == "paid"
+                                and not (work_done_receipt_path or existing_work_done_receipt)
                             ):
                                 st.error(
                                     "Upload a payment receipt before marking the work done as paid."
@@ -16524,7 +16621,7 @@ def customers_page(conn):
                                 existing_work_done_receipt = clean_text(
                                     existing_work_done.iloc[0].get("payment_receipt_path")
                                 )
-                                if work_done_status_value == "paid" and not work_done_receipt_path:
+                                if RECEIPTS_ENABLED and work_done_status_value == "paid" and not work_done_receipt_path:
                                     work_done_receipt_path = existing_work_done_receipt
                                 if existing_type != "work_done":
                                     st.error(
@@ -16606,7 +16703,7 @@ def customers_page(conn):
                     if service_status_value not in {"pending", "paid"}:
                         service_status_value = "pending"
                     service_receipt_path = None
-                    if service_status_value == "paid":
+                    if RECEIPTS_ENABLED and service_status_value == "paid":
                         service_receipt_path = store_payment_receipt(
                             service_receipt,
                             identifier=f"{_sanitize_path_component(service_reference) or 'service'}_receipt",
@@ -16668,7 +16765,7 @@ def customers_page(conn):
                     if maintenance_status_value not in {"pending", "paid"}:
                         maintenance_status_value = "pending"
                     maintenance_receipt_path = None
-                    if maintenance_status_value == "paid":
+                    if RECEIPTS_ENABLED and maintenance_status_value == "paid":
                         maintenance_receipt_path = store_payment_receipt(
                             maintenance_receipt,
                             identifier=f"{_sanitize_path_component(maintenance_reference) or 'maintenance'}_receipt",
@@ -18051,8 +18148,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                s.condition_remarks,
                s.bill_amount,
                s.bill_document_path,
-                s.payment_receipt_path,
-                s.updated_at,
+               s.updated_at,
                s.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                COALESCE(c.company_name, cdo.company_name) AS company,
@@ -18120,7 +18216,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 _build_attachment_bundle_download(
                     clean_text(row.get("bill_document_path"))
                     or clean_text(row.get("attachment_path")),
-                    clean_text(row.get("payment_receipt_path")),
+                    None,
                     bundle_label=_resolve_bundle_label(
                         clean_text(row.get("do_number")),
                         fallback_prefix="service",
@@ -18266,34 +18362,37 @@ def _render_service_section(conn, *, show_heading: bool = True):
             value=clean_text(selected_record.get("condition_remarks")) or "",
             key=f"service_edit_condition_notes_{selected_service_id}",
         )
-        receipt_col1, receipt_col2 = st.columns([1, 1])
-        existing_receipt_path = clean_text(selected_record.get("payment_receipt_path"))
-        resolved_receipt = resolve_upload_path(existing_receipt_path)
-        with receipt_col1:
-            receipt_upload = st.file_uploader(
-                "Upload payment receipt (PDF or image)",
-                type=["pdf", "png", "jpg", "jpeg", "webp"],
-                key=f"service_edit_receipt_upload_{selected_service_id}",
-            )
-        with receipt_col2:
-            clear_receipt = st.checkbox(
-                "Remove receipt",
-                value=False,
-                key=f"service_edit_receipt_clear_{selected_service_id}",
-            )
-        if resolved_receipt and resolved_receipt.exists():
-            payload = _safe_read_bytes(resolved_receipt)
-            if payload:
-                st.download_button(
-                    "Download receipt",
-                    data=payload,
-                    file_name=resolved_receipt.name,
-                    key=f"service_receipt_download_{selected_service_id}",
+        receipt_upload = None
+        clear_receipt = False
+        if RECEIPTS_ENABLED:
+            receipt_col1, receipt_col2 = st.columns([1, 1])
+            existing_receipt_path = clean_text(selected_record.get("payment_receipt_path"))
+            resolved_receipt = resolve_upload_path(existing_receipt_path)
+            with receipt_col1:
+                receipt_upload = st.file_uploader(
+                    "Upload payment receipt (PDF or image)",
+                    type=["pdf", "png", "jpg", "jpeg", "webp"],
+                    key=f"service_edit_receipt_upload_{selected_service_id}",
                 )
-            else:
-                st.warning("Unable to read the receipt file.", icon="⚠️")
-        elif existing_receipt_path:
-            st.caption("Receipt file not found. Upload a new copy to replace it.")
+            with receipt_col2:
+                clear_receipt = st.checkbox(
+                    "Remove receipt",
+                    value=False,
+                    key=f"service_edit_receipt_clear_{selected_service_id}",
+                )
+            if resolved_receipt and resolved_receipt.exists():
+                payload = _safe_read_bytes(resolved_receipt)
+                if payload:
+                    st.download_button(
+                        "Download receipt",
+                        data=payload,
+                        file_name=resolved_receipt.name,
+                        key=f"service_receipt_download_{selected_service_id}",
+                    )
+                else:
+                    st.warning("Unable to read the receipt file.", icon="⚠️")
+            elif existing_receipt_path:
+                st.caption("Receipt file not found. Upload a new copy to replace it.")
         save_updates = st.button("Save updates", key="save_service_updates")
         if _guard_double_submit("save_service_updates", save_updates):
             (
@@ -18323,25 +18422,30 @@ def _render_service_section(conn, *, show_heading: bool = True):
                         bill_amount_update = round(float(bill_amount_edit), 2)
                 except Exception:
                     bill_amount_update = None
-                receipt_path_value = clean_text(selected_record.get("payment_receipt_path"))
+                receipt_path_value = (
+                    clean_text(selected_record.get("payment_receipt_path"))
+                    if RECEIPTS_ENABLED
+                    else None
+                )
                 replaced_receipt = False
                 cleared_receipt = False
-                if receipt_upload is not None:
-                    receipt_path_value = store_payment_receipt(
-                        receipt_upload,
-                        identifier=f"service_{selected_service_id}_receipt",
-                        target_dir=SERVICE_BILL_DIR,
-                    )
-                    replaced_receipt = bool(receipt_path_value)
-                elif clear_receipt and receipt_path_value:
-                    old_receipt = resolve_upload_path(receipt_path_value)
-                    if old_receipt and old_receipt.exists():
-                        try:
-                            old_receipt.unlink()
-                        except Exception:
-                            pass
-                    receipt_path_value = None
-                    cleared_receipt = True
+                if RECEIPTS_ENABLED:
+                    if receipt_upload is not None:
+                        receipt_path_value = store_payment_receipt(
+                            receipt_upload,
+                            identifier=f"service_{selected_service_id}_receipt",
+                            target_dir=SERVICE_BILL_DIR,
+                        )
+                        replaced_receipt = bool(receipt_path_value)
+                    elif clear_receipt and receipt_path_value:
+                        old_receipt = resolve_upload_path(receipt_path_value)
+                        if old_receipt and old_receipt.exists():
+                            try:
+                                old_receipt.unlink()
+                            except Exception:
+                                pass
+                        receipt_path_value = None
+                        cleared_receipt = True
                 conn.execute(
                     """
                     UPDATE services
@@ -18388,10 +18492,11 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 message_bits = ["Service record updated."]
                 if bill_amount_update is not None:
                     message_bits.append(f"Service amount {format_money(bill_amount_update)}")
-                if replaced_receipt:
-                    message_bits.append("Receipt uploaded")
-                elif cleared_receipt:
-                    message_bits.append("Receipt removed")
+                if RECEIPTS_ENABLED:
+                    if replaced_receipt:
+                        message_bits.append("Receipt uploaded")
+                    elif cleared_receipt:
+                        message_bits.append("Receipt removed")
                 st.success(". ".join(message_bits))
                 _safe_rerun()
 
@@ -20639,11 +20744,12 @@ def _render_quotation_management(conn):
         clean_text(selected_row.get("document_path")),
         key_prefix=f"quotation_doc_{selected_detail_id}",
     )
-    _render_attachment_preview(
-        "Payment receipt",
-        existing_receipt,
-        key_prefix=f"quotation_receipt_{selected_detail_id}",
-    )
+    if RECEIPTS_ENABLED:
+        _render_attachment_preview(
+            "Payment receipt",
+            existing_receipt,
+            key_prefix=f"quotation_receipt_{selected_detail_id}",
+        )
 
     col_left, col_right = st.columns(2)
     with col_left:
@@ -20675,7 +20781,7 @@ def _render_quotation_management(conn):
             placeholder="No follow-up history yet.",
         )
         receipt_upload = None
-        if selected_status == "paid":
+        if RECEIPTS_ENABLED and selected_status == "paid":
             receipt_upload = st.file_uploader(
                 "Attach receipt for this paid quotation",
                 type=["pdf", "png", "jpg", "jpeg", "webp"],
@@ -20686,7 +20792,7 @@ def _render_quotation_management(conn):
 
     if st.button("Update quotation details", type="primary", key="quotation_detail_save"):
         receipt_path = existing_receipt
-        if selected_status == "paid":
+        if RECEIPTS_ENABLED and selected_status == "paid":
             if receipt_upload:
                 safe_ref = _sanitize_path_component(
                     clean_text(selected_row.get("reference"))
@@ -21491,7 +21597,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                m.status,
                m.remarks,
                m.total_amount,
-               m.payment_receipt_path,
                m.updated_at,
                m.created_by,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
@@ -21558,7 +21663,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             lambda row: (
                 _build_attachment_bundle_download(
                     clean_text(row.get("attachment_path")),
-                    clean_text(row.get("payment_receipt_path")),
+                    None,
                     bundle_label=_resolve_bundle_label(
                         clean_text(row.get("do_number")),
                         fallback_prefix="maintenance",
@@ -21687,34 +21792,8 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             format="%.2f",
             key=f"maintenance_edit_amount_{selected_maintenance_id}",
         )
-        existing_receipt_path = clean_text(selected_record.get("payment_receipt_path"))
-        resolved_receipt = resolve_upload_path(existing_receipt_path)
-        receipt_cols = st.columns([1, 1])
-        with receipt_cols[0]:
-            maintenance_receipt_upload = st.file_uploader(
-                "Upload payment receipt (PDF or image)",
-                type=["pdf", "png", "jpg", "jpeg", "webp"],
-                key=f"maintenance_edit_receipt_{selected_maintenance_id}",
-            )
-        with receipt_cols[1]:
-            clear_maintenance_receipt = st.checkbox(
-                "Remove receipt",
-                value=False,
-                key=f"maintenance_clear_receipt_{selected_maintenance_id}",
-            )
-        if resolved_receipt and resolved_receipt.exists():
-            payload = _safe_read_bytes(resolved_receipt)
-            if payload:
-                st.download_button(
-                    "Download receipt",
-                    data=payload,
-                    file_name=resolved_receipt.name,
-                    key=f"maintenance_receipt_download_{selected_maintenance_id}",
-                )
-            else:
-                st.warning("Unable to read the receipt file.", icon="⚠️")
-        elif existing_receipt_path:
-            st.caption("Receipt file not found. Upload a new copy to replace it.")
+        maintenance_receipt_upload = None
+        clear_maintenance_receipt = False
         save_maintenance = st.button(
             "Save maintenance updates",
             key="save_maintenance_updates",
@@ -21743,25 +21822,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     maintenance_amount_update = round(float(maintenance_amount_edit or 0.0), 2)
                 except Exception:
                     maintenance_amount_update = 0.0
-                receipt_path_value = existing_receipt_path
-                replaced_receipt = False
-                cleared_receipt = False
-                if maintenance_receipt_upload is not None:
-                    receipt_path_value = store_payment_receipt(
-                        maintenance_receipt_upload,
-                        identifier=f"maintenance_{selected_maintenance_id}_receipt",
-                        target_dir=MAINTENANCE_DOCS_DIR,
-                    )
-                    replaced_receipt = bool(receipt_path_value)
-                elif clear_maintenance_receipt and receipt_path_value:
-                    old_receipt = resolve_upload_path(receipt_path_value)
-                    if old_receipt and old_receipt.exists():
-                        try:
-                            old_receipt.unlink()
-                        except Exception:
-                            pass
-                    receipt_path_value = None
-                    cleared_receipt = True
+                receipt_path_value = None
                 conn.execute(
                     """
                     UPDATE maintenance_records
@@ -21805,10 +21866,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 message_bits = ["Maintenance record updated."]
                 if maintenance_amount_update:
                     message_bits.append(f"Maintenance amount {format_money(maintenance_amount_update)}")
-                if replaced_receipt:
-                    message_bits.append("Receipt uploaded")
-                elif cleared_receipt:
-                    message_bits.append("Receipt removed")
                 st.success(" ".join(message_bits))
                 _safe_rerun()
 
@@ -21945,10 +22002,11 @@ def _reset_delivery_order_form_state(record_type_key: str) -> None:
     st.session_state[f"{key_prefix}_description"] = ""
     st.session_state[f"{key_prefix}_remarks"] = ""
     st.session_state[f"{key_prefix}_status"] = "due"
+    st.session_state[f"{key_prefix}_delivery_date"] = ""
+    st.session_state[f"{key_prefix}_file_path"] = ""
     for key in (f"{key_prefix}_form_loader", f"{key_prefix}_items_editor"):
         st.session_state.pop(key, None)
     for record_key in ("delivery_order", "work_done"):
-        st.session_state.pop(f"{record_key}_receipt_upload", None)
         st.session_state.pop(f"{record_key}_document_upload", None)
 
 
@@ -21981,7 +22039,6 @@ def delivery_orders_page(
     record_type_label: str = "Delivery order",
     record_type_key: str = "delivery_order",
     highlight_record: Optional[str] = None,
-    enable_receipt_ocr: bool = True,
 ):
     if show_heading:
         st.subheader("🚚 Delivery orders")
@@ -21999,6 +22056,8 @@ def delivery_orders_page(
     description_key = f"{key_prefix}_description"
     remarks_key = f"{key_prefix}_remarks"
     status_key = f"{key_prefix}_status"
+    delivery_date_key = f"{key_prefix}_delivery_date"
+    file_path_key = f"{key_prefix}_file_path"
     form_loader_key = f"{key_prefix}_form_loader"
     form_key = f"{key_prefix}_form"
     items_editor_key = f"{key_prefix}_items_editor"
@@ -22020,6 +22079,8 @@ def delivery_orders_page(
     st.session_state.setdefault(description_key, "")
     st.session_state.setdefault(remarks_key, "")
     st.session_state.setdefault(status_key, "due")
+    st.session_state.setdefault(delivery_date_key, "")
+    st.session_state.setdefault(file_path_key, "")
     autofill_customer_key = f"{record_type_key}_autofill_customer"
     st.session_state.setdefault(autofill_customer_key, None)
     st.session_state.setdefault(manual_customer_toggle_key, False)
@@ -22051,13 +22112,13 @@ def delivery_orders_page(
                    d.description,
                    d.sales_person,
                    d.remarks,
+                   d.delivery_date,
                    d.file_path,
                    d.items_payload,
                    d.total_amount,
                    d.created_by,
                    d.created_at,
                    d.status,
-                   d.payment_receipt_path,
                    d.updated_at,
                    d.record_type,
                    u.username
@@ -22088,7 +22149,6 @@ def delivery_orders_page(
             load_labels[do_num] = f"{do_num} • {customer_name}"
 
     closed_statuses = {"paid"}
-    current_receipt_path: Optional[str] = None
 
     st.markdown(f"### Create or update a {record_label_lower}")
     selected_existing = st.selectbox(
@@ -22108,7 +22168,8 @@ def delivery_orders_page(
             st.session_state[description_key] = clean_text(row.get("description")) or ""
             st.session_state[remarks_key] = clean_text(row.get("remarks")) or ""
             st.session_state[status_key] = normalize_delivery_status(row.get("status"))
-            current_receipt_path = clean_text(row.get("payment_receipt_path"))
+            st.session_state[delivery_date_key] = clean_text(row.get("delivery_date")) or ""
+            st.session_state[file_path_key] = clean_text(row.get("file_path")) or ""
             loaded_items = parse_delivery_items_payload(row.get("items_payload"))
             st.session_state[items_rows_key] = loaded_items or _default_delivery_items()
         st.session_state[autofill_customer_key] = None
@@ -22135,10 +22196,6 @@ def delivery_orders_page(
             st.session_state[autofill_customer_key] = selected_customer_state
         elif selected_customer_state is None:
             st.session_state[autofill_customer_key] = None
-
-    receipt_download = None
-    receipt_download_name = None
-    receipt_download_key = None
 
     with st.form(form_key, clear_on_submit=True):
         do_number = st.text_input(
@@ -22171,6 +22228,18 @@ def delivery_orders_page(
             "Remarks",
             key=remarks_key,
         )
+        delivery_date = render_flexible_date_input(
+            "Delivery date",
+            value=st.session_state.get(delivery_date_key),
+            key=delivery_date_key,
+            help="Record the delivery date (single-line entry).",
+        )
+        document_upload = st.file_uploader(
+            f"{record_label} document (PDF or image)",
+            type=["pdf", "png", "jpg", "jpeg", "webp"],
+            key=f"{record_type_key}_document_upload",
+            help="Upload the signed delivery order or work done document.",
+        )
         status_value = st.selectbox(
             "Status",
             DELIVERY_STATUS_OPTIONS,
@@ -22183,42 +22252,6 @@ def delivery_orders_page(
             in closed_statuses,
             key=status_key,
         )
-        receipt_upload = None
-        if status_value in {"advanced", "paid"}:
-            receipt_label = (
-                f"{record_label} advance receipt (PDF or image)"
-                if status_value == "advanced"
-                else f"{record_label} full payment receipt (PDF or image)"
-            )
-            receipt_help = (
-                "Highly recommended: attach proof of advance payment."
-                if status_value == "advanced"
-                else "Highly recommended: attach proof of payment for paid records."
-            )
-            receipt_upload = st.file_uploader(
-                receipt_label,
-                type=["pdf", "png", "jpg", "jpeg", "webp"],
-                key=f"{record_type_key}_receipt_upload",
-                help=receipt_help,
-            )
-            if enable_receipt_ocr:
-                _render_upload_ocr_preview(
-                    receipt_upload,
-                    key_prefix=f"{record_type_key}_receipt",
-                    label=f"{record_label} receipt OCR",
-                )
-            if current_receipt_path:
-                receipt_file = resolve_upload_path(current_receipt_path)
-                if receipt_file and receipt_file.exists():
-                    receipt_download = _safe_read_bytes(receipt_file)
-                    if receipt_download:
-                        receipt_download_name = receipt_file.name
-                        receipt_download_key = (
-                            f"{record_label.lower().replace(' ', '_')}_receipt_view"
-                        )
-                    else:
-                        receipt_download = None
-                st.caption("Uploading a new file will replace the current receipt.")
         st.markdown("**Products / items**")
         items_df_seed = pd.DataFrame(
             st.session_state.get(items_rows_key, _default_delivery_items())
@@ -22257,13 +22290,20 @@ def delivery_orders_page(
         )
         submit = st.form_submit_button(f"Save {record_label_lower}", type="primary")
 
-    if receipt_download and receipt_download_name:
-        st.download_button(
-            "View current receipt",
-            data=receipt_download,
-            file_name=receipt_download_name,
-            key=receipt_download_key,
-        )
+    current_file_path = clean_text(st.session_state.get(file_path_key))
+    if current_file_path:
+        existing_file = resolve_upload_path(current_file_path)
+        if existing_file and existing_file.exists():
+            payload = _safe_read_bytes(existing_file)
+            if payload:
+                st.download_button(
+                    f"View current {record_label_lower} document",
+                    data=payload,
+                    file_name=existing_file.name,
+                    key=f"{record_type_key}_doc_download",
+                )
+        elif selected_existing:
+            st.caption("Delivery order file not found. Upload a new copy to replace it.")
 
     if _guard_double_submit(f"{record_type_key}_save_form", submit):
         sales_person = clean_text(get_current_user().get("username"))
@@ -22291,97 +22331,47 @@ def delivery_orders_page(
                 return
             existing = df_query(
                 conn,
-                "SELECT file_path, items_payload, total_amount, created_by, status, payment_receipt_path, deleted_at FROM delivery_orders WHERE do_number = ? AND COALESCE(record_type, 'delivery_order') = ?",
+                "SELECT file_path, items_payload, total_amount, created_by, status, deleted_at, delivery_date FROM delivery_orders WHERE do_number = ? AND COALESCE(record_type, 'delivery_order') = ?",
                 (cleaned_number, record_type_key),
             )
             stored_path = None
             existing_status = "due"
-            existing_receipt = None
             existing_deleted_at = None
             if not existing.empty:
                 stored_path = clean_text(existing.iloc[0].get("file_path"))
                 existing_status = normalize_delivery_status(existing.iloc[0].get("status"))
-                existing_receipt = clean_text(existing.iloc[0].get("payment_receipt_path"))
                 existing_deleted_at = clean_text(existing.iloc[0].get("deleted_at"))
+            existing_file_path = stored_path
+            if document_upload is not None:
+                validation_error = _validate_upload(
+                    document_upload,
+                    allowed_extensions=DOCUMENT_UPLOAD_EXTENSIONS,
+                    max_bytes=MAX_UPLOAD_BYTES,
+                )
+                if validation_error:
+                    st.error(f"Document upload failed: {validation_error}")
+                    return
+                safe_number = _sanitize_path_component(cleaned_number) or record_type_key
+                doc_ext = _upload_extension(document_upload, default=".pdf")
+                saved_path = save_uploaded_file(
+                    document_upload,
+                    DELIVERY_ORDER_DIR,
+                    filename=f"{record_type_key}_{safe_number}{doc_ext}",
+                    allowed_extensions=DOCUMENT_UPLOAD_EXTENSIONS,
+                    default_extension=".pdf",
+                )
+                if not saved_path:
+                    st.error("Unable to save the uploaded document. Please try again.")
+                    return
+                try:
+                    stored_path = str(saved_path.relative_to(BASE_DIR))
+                except ValueError:
+                    stored_path = str(saved_path)
             locked_record = existing_status.lower() in closed_statuses
-            receipt_only_update = (
-                locked_record
-                and status_value == existing_status
-                and existing_status.lower() == "paid"
-                and receipt_upload is not None
-            )
-            if locked_record and not receipt_only_update:
+            if locked_record:
                 st.warning(
                     f"{record_label} {cleaned_number} is locked because it is marked as {existing_status}."
                 )
-                return
-            auto_mark_paid = False
-            if (
-                status_value == "advanced"
-                and existing_status == "advanced"
-                and existing_receipt
-                and receipt_upload is not None
-            ):
-                auto_mark_paid = True
-                status_value = "paid"
-            receipt_path = existing_receipt
-            if status_value in {"advanced", "paid"}:
-                if status_value == "paid" and receipt_upload is None and not existing_receipt:
-                    st.error("Upload a full payment receipt before marking this record as paid.")
-                    return
-                if receipt_upload:
-                    receipt_identifier = _sanitize_path_component(cleaned_number) or "do_receipt"
-                    receipt_path = store_payment_receipt(
-                        receipt_upload,
-                        identifier=f"{receipt_identifier}_receipt",
-                        target_dir=DELIVERY_RECEIPT_DIR,
-                    )
-                    if not receipt_path:
-                        st.error("Receipt upload failed. Please use a PDF or image file.")
-                        return
-                if not receipt_path:
-                    missing_label = "advance" if status_value == "advanced" else "full payment"
-                    st.warning(
-                        f"No {missing_label} receipt uploaded. It is highly recommended to attach one."
-                    )
-            if auto_mark_paid and existing_receipt and selected_customer:
-                advance_receipt_path = clean_text(existing_receipt)
-                resolved_advance = resolve_upload_path(advance_receipt_path)
-                if resolved_advance and resolved_advance.exists():
-                    conn.execute(
-                        """
-                        INSERT INTO customer_documents (
-                            customer_id, doc_type, file_path, original_name, uploaded_by, file_size, mime_type
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            int(selected_customer),
-                            f"{record_label} advance receipt",
-                            advance_receipt_path,
-                            resolved_advance.name,
-                            current_user_id(),
-                            resolved_advance.stat().st_size if resolved_advance.exists() else None,
-                            _guess_upload_mime(resolved_advance.name),
-                        ),
-                    )
-            if receipt_only_update:
-                conn.execute(
-                    """
-                    UPDATE delivery_orders
-                       SET payment_receipt_path=COALESCE(?, payment_receipt_path),
-                           updated_at=datetime('now')
-                     WHERE do_number=? AND COALESCE(record_type, 'delivery_order') = ? AND deleted_at IS NULL
-                    """,
-                    (
-                        receipt_path,
-                        cleaned_number,
-                        record_type_key,
-                    ),
-                )
-                conn.commit()
-                st.success("Receipt added to locked record.")
-                _mark_data_changed("delivery_orders")
-                _safe_rerun()
                 return
             items_clean, total_amount_value = normalize_delivery_items(
                 st.session_state.get(items_rows_key, [])
@@ -22394,7 +22384,7 @@ def delivery_orders_page(
             if existing.empty:
                 cur.execute(
                     """
-                    INSERT INTO delivery_orders (do_number, customer_id, description, sales_person, remarks, file_path, items_payload, total_amount, created_by, status, payment_receipt_path, updated_at, record_type)
+                    INSERT INTO delivery_orders (do_number, customer_id, description, sales_person, remarks, delivery_date, file_path, items_payload, total_amount, created_by, status, updated_at, record_type)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
                     """,
                     (
@@ -22403,12 +22393,12 @@ def delivery_orders_page(
                         clean_text(description),
                         clean_text(sales_person),
                         clean_text(remarks),
+                        to_iso_date(delivery_date),
                         stored_path,
                         items_payload,
                         total_amount_value,
                         creator_id,
                         normalize_delivery_status(status_value),
-                        receipt_path,
                         record_type_key,
                     ),
                 )
@@ -22417,7 +22407,7 @@ def delivery_orders_page(
                 cur.execute(
                     """
                     UPDATE delivery_orders
-                       SET customer_id=?, description=?, sales_person=?, remarks=?, file_path=?, items_payload=?, total_amount=?, status=?, payment_receipt_path=COALESCE(?, payment_receipt_path), updated_at=datetime('now'), created_by=COALESCE(created_by, ?), record_type=?, deleted_at=NULL, deleted_by=NULL
+                       SET customer_id=?, description=?, sales_person=?, remarks=?, delivery_date=?, file_path=?, items_payload=?, total_amount=?, status=?, updated_at=datetime('now'), created_by=COALESCE(created_by, ?), record_type=?, deleted_at=NULL, deleted_by=NULL
                      WHERE do_number=? AND COALESCE(record_type, 'delivery_order') = ?
                     """,
                     (
@@ -22425,11 +22415,11 @@ def delivery_orders_page(
                         clean_text(description),
                         clean_text(sales_person),
                         clean_text(remarks),
+                        to_iso_date(delivery_date),
                         stored_path,
                         items_payload,
                         total_amount_value,
                         normalize_delivery_status(status_value) or existing_status,
-                        receipt_path,
                         creator_id,
                         record_type_key,
                         cleaned_number,
@@ -22439,8 +22429,12 @@ def delivery_orders_page(
             if selected_customer:
                 link_delivery_order_to_customer(conn, cleaned_number, int(selected_customer))
             conn.commit()
-            if receipt_upload is not None:
-                _mark_data_changed("delivery_orders")
+            _mark_data_changed("delivery_orders")
+            if stored_path and existing_file_path and stored_path != existing_file_path:
+                previous_file = resolve_upload_path(existing_file_path)
+                if previous_file and previous_file.exists():
+                    with contextlib.suppress(OSError):
+                        previous_file.unlink()
             if existing.empty:
                 action_label = "created"
             elif existing_deleted_at:
@@ -22596,7 +22590,7 @@ def delivery_orders_page(
             if not do_number:
                 continue
             row_key = f"{record_type_key}_{do_number}"
-            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.9, 1.2))
+            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 1.2))
             is_highlight = highlight_target and do_number == highlight_target
             def _render_cell(col, value: str) -> None:
                 if is_highlight:
@@ -22612,82 +22606,12 @@ def delivery_orders_page(
             _render_cell(row_cols[2], clean_text(row.get("description")) or "")
             _render_cell(row_cols[3], clean_text(row.get("total_amount")) or "")
             _render_cell(row_cols[4], clean_text(row.get("status")) or "")
-            receipt_path_value = clean_text(row.get("payment_receipt_path")) or clean_text(
-                row.get("receipt_path")
-            )
             _render_attachment_bundle_link(
                 row_cols[5],
                 attachment_path=clean_text(row.get("file_path")),
-                receipt_path=receipt_path_value,
+                receipt_path=None,
                 bundle_label=f"{record_label}_{do_number}",
             )
-            upload_receipt = row_cols[6].file_uploader(
-                "Upload receipt",
-                type=["pdf", "png", "jpg", "jpeg", "webp"],
-                label_visibility="collapsed",
-                key=f"do_row_receipt_upload_{row_key}",
-            )
-            if enable_receipt_ocr:
-                _render_upload_ocr_preview(
-                    upload_receipt,
-                    key_prefix=f"do_row_receipt_upload_{row_key}",
-                    label=f"{record_label} row receipt OCR",
-                )
-            save_label = f"💾 Save {record_label}"
-            save_doc = row_cols[6].button(
-                save_label, type="secondary", key=f"do_row_save_{row_key}"
-            )
-            if _guard_double_submit(f"do_row_save_{row_key}", save_doc):
-                if upload_receipt is None:
-                    st.warning("Select a receipt to upload.")
-                else:
-                    updates = {}
-                    if upload_receipt is not None:
-                        receipt_identifier = _sanitize_path_component(do_number) or "do_receipt"
-                        receipt_path = store_payment_receipt(
-                            upload_receipt,
-                            identifier=f"{receipt_identifier}_receipt",
-                            target_dir=DELIVERY_RECEIPT_DIR,
-                        )
-                        if not receipt_path:
-                            st.error("Receipt upload failed. Please use a PDF or image file.")
-                            continue
-                        updates["payment_receipt_path"] = receipt_path
-                    if updates:
-                        set_clause = ", ".join(f"{col}=?" for col in updates)
-                        params = list(updates.values())
-                        params.extend([do_number, record_type_key])
-                        conn.execute(
-                            f"""
-                            UPDATE delivery_orders
-                               SET {set_clause},
-                                   updated_at=datetime('now')
-                             WHERE do_number=?
-                               AND COALESCE(record_type, 'delivery_order') = ?
-                               AND deleted_at IS NULL
-                            """,
-                            tuple(params),
-                        )
-                        conn.commit()
-                        _mark_data_changed("operations", "delivery_orders")
-                        if "file_path" in updates:
-                            log_activity(
-                                conn,
-                                event_type=f"{record_type_key}_document_uploaded",
-                                description=f"{record_label} {do_number} document uploaded",
-                                entity_type=record_type_key,
-                                entity_id=None,
-                            )
-                        if "payment_receipt_path" in updates:
-                            log_activity(
-                                conn,
-                                event_type=f"{record_type_key}_receipt_uploaded",
-                                description=f"{record_label} {do_number} receipt uploaded",
-                                entity_type=record_type_key,
-                                entity_id=None,
-                            )
-                        st.success("Upload saved.")
-                        _safe_rerun()
 
     downloads = {}
     if not do_df.empty:
@@ -22704,18 +22628,9 @@ def delivery_orders_page(
             key=f"{key_prefix}_download_select",
         )
         attachment_path_value = downloads.get(selected_download)
-        receipt_path_value = None
-        if not do_df.empty:
-            receipt_row = do_df[
-                do_df["do_number"].apply(lambda val: clean_text(val) == selected_download)
-            ]
-            if not receipt_row.empty:
-                receipt_path_value = clean_text(receipt_row.iloc[0].get("payment_receipt_path")) or clean_text(
-                    receipt_row.iloc[0].get("receipt_path")
-                )
         bundle = _build_attachment_bundle_download(
             attachment_path_value,
-            receipt_path_value,
+            None,
             bundle_label=f"{record_label}_{selected_download}",
         )
         if bundle:
@@ -22774,7 +22689,6 @@ def delivery_orders_page(
         if not delete_row.empty:
             delete_info = delete_row.iloc[0].to_dict()
         attachment_path = clean_text(delete_info.get("file_path"))
-        receipt_path = clean_text(delete_info.get("payment_receipt_path"))
         description_text = clean_text(delete_info.get("description"))
         total_amount = clean_text(delete_info.get("total_amount"))
         deleted_by_label = clean_text(delete_info.get("created_by_name")) or "(staff)"
@@ -22799,8 +22713,6 @@ def delivery_orders_page(
             detail_parts.append(f"total: {total_amount}")
         if attachment_path:
             detail_parts.append(f"doc: {attachment_path}")
-        if receipt_path:
-            detail_parts.append(f"receipt: {receipt_path}")
         description = " | ".join(detail_parts)
         log_activity(
             conn,
@@ -23050,7 +22962,6 @@ def customer_summary_page(conn):
                d.remarks,
                d.created_at,
                d.file_path,
-               d.payment_receipt_path,
                d.created_by,
                COALESCE(d.record_type, 'delivery_order') AS record_type
         FROM delivery_orders d
@@ -23070,7 +22981,6 @@ def customer_summary_page(conn):
         do_df = fmt_dates(do_df, ["created_at"])
         do_df["do_number"] = do_df["do_number"].apply(clean_text)
         do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
-        do_df["Receipt"] = do_df["payment_receipt_path"].apply(_file_data_uri_from_path)
 
     do_numbers = set()
     if not do_df.empty and "do_number" in do_df.columns:
@@ -23097,7 +23007,6 @@ def customer_summary_page(conn):
                    d.remarks,
                    d.created_at,
                    d.file_path,
-                   d.payment_receipt_path,
                    d.created_by
             FROM delivery_orders d
             LEFT JOIN customers c ON c.customer_id = d.customer_id
@@ -23122,7 +23031,6 @@ def customer_summary_page(conn):
 
     if do_df is not None and not do_df.empty:
         do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
-        do_df["Receipt"] = do_df["payment_receipt_path"].apply(_file_data_uri_from_path)
         do_df["Type"] = do_df["record_type"].apply(
             lambda val: "Work done" if clean_text(val) == "work_done" else "Delivery order"
         )
@@ -23143,22 +23051,17 @@ def customer_summary_page(conn):
                         "remarks": "Remarks",
                         "created_at": "Created",
                         "Document": "Document",
-                        "Receipt": "Receipt",
                         "Type": "Type",
                     }
                 ).drop(
                     columns=[
                         "file_path",
-                        "payment_receipt_path",
                         "record_type",
                         "created_by",
                     ],
                     errors="ignore",
                 ),
                 use_container_width=True,
-                column_config={
-                    "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
-                },
             )
         if orphan_dos:
             st.caption("Referenced DO codes without a recorded delivery order: " + ", ".join(orphan_dos))
@@ -23173,7 +23076,6 @@ def customer_summary_page(conn):
     if service_df.empty:
         st.info("No service records found for this customer.")
     else:
-        service_df["Receipt"] = service_df["payment_receipt_path"].apply(_file_data_uri_from_path)
         service_display = service_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -23184,7 +23086,6 @@ def customer_summary_page(conn):
                 "service_product_info": "Products sold",
                 "description": "Description",
                 "remarks": "Remarks",
-                "Receipt": "Receipt",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -23195,22 +23096,17 @@ def customer_summary_page(conn):
                 columns=[
                     "service_id",
                     "bill_document_path",
-                    "payment_receipt_path",
                     "created_by",
                 ],
                 errors="ignore",
             ),
             use_container_width=True,
-            column_config={
-                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
-            },
         )
 
     st.markdown("**Maintenance records**")
     if maintenance_df.empty:
         st.info("No maintenance records found for this customer.")
     else:
-        maintenance_df["Receipt"] = maintenance_df["payment_receipt_path"].apply(_file_data_uri_from_path)
         maintenance_display = maintenance_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -23221,7 +23117,6 @@ def customer_summary_page(conn):
                 "maintenance_product_info": "Products sold",
                 "description": "Description",
                 "remarks": "Remarks",
-                "Receipt": "Receipt",
                 "customer": "Customer",
                 "company": "Company",
                 "doc_count": "Documents",
@@ -23229,13 +23124,10 @@ def customer_summary_page(conn):
         )
         st.dataframe(
             maintenance_display.drop(
-                columns=["maintenance_id", "payment_receipt_path", "created_by"],
+                columns=["maintenance_id", "created_by"],
                 errors="ignore",
             ),
             use_container_width=True,
-            column_config={
-                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
-            },
         )
 
     st.markdown("**Other operations uploads**")
@@ -23318,8 +23210,7 @@ def customer_summary_page(conn):
                        quote_date,
                        status,
                        total_amount,
-                       document_path,
-                       payment_receipt_path
+                       document_path
                 FROM quotations
                 WHERE deleted_at IS NULL
                   {"" if is_admin else "AND created_by = ?"}
@@ -23335,7 +23226,6 @@ def customer_summary_page(conn):
     else:
         quotation_docs = fmt_dates(quotation_docs, ["quote_date"])
         quotation_docs["Document"] = quotation_docs["document_path"].apply(_file_data_uri_from_path)
-        quotation_docs["Receipt"] = quotation_docs["payment_receipt_path"].apply(_file_data_uri_from_path)
         quotation_display = quotation_docs.rename(
             columns={
                 "reference": "Reference",
@@ -23343,15 +23233,13 @@ def customer_summary_page(conn):
                 "status": "Status",
                 "total_amount": "Total",
                 "Document": "Document",
-                "Receipt": "Receipt",
             }
         )
         st.dataframe(
-            quotation_display.drop(columns=["quotation_id", "document_path", "payment_receipt_path"], errors="ignore"),
+            quotation_display.drop(columns=["quotation_id", "document_path"], errors="ignore"),
             use_container_width=True,
             column_config={
                 "Document": st.column_config.LinkColumn("Document", display_text="⬇️"),
-                "Receipt": st.column_config.LinkColumn("Receipt", display_text="⬇️"),
             },
         )
 
@@ -25276,7 +25164,7 @@ def users_admin_page(conn):
     users = df_query(
         conn,
         """
-        SELECT user_id as id, username, phone, email, title, role, created_at
+        SELECT user_id as id, username, phone, email, title, staff_classification, role, created_at
         FROM users
         WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
         ORDER BY datetime(created_at) DESC
@@ -25293,6 +25181,11 @@ def users_admin_page(conn):
             phone = st.text_input("Phone number (required)")
             email = st.text_input("Email (optional)")
             title = st.text_input("Title / role", help="Shown on quotations by default")
+            staff_classification = st.selectbox(
+                "Staff classification",
+                ["service", "sales"],
+                format_func=lambda value: value.title(),
+            )
             role = st.selectbox("Role", ["staff", "admin"])
             ok = st.form_submit_button("Create")
             if ok and u.strip() and p.strip():
@@ -25302,13 +25195,14 @@ def users_admin_page(conn):
                 h = hashlib.sha256(p.encode("utf-8")).hexdigest()
                 try:
                     conn.execute(
-                        "INSERT INTO users (username, pass_hash, phone, email, title, role) VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO users (username, pass_hash, phone, email, title, staff_classification, role) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (
                             u.strip(),
                             h,
                             clean_text(phone),
                             clean_text(email),
                             clean_text(title),
+                            clean_text(staff_classification) or "service",
                             role,
                         ),
                     )
@@ -25364,6 +25258,51 @@ def users_admin_page(conn):
                 conn.execute("DELETE FROM users WHERE user_id=?", (int(uid),))
                 conn.commit()
                 st.warning("User deleted")
+
+    with st.expander("Update staff classification"):
+        staff_users = df_query(
+            conn,
+            """
+            SELECT user_id, username, staff_classification
+            FROM users
+            WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
+            ORDER BY LOWER(COALESCE(username, ''))
+            """,
+        )
+        if staff_users.empty:
+            st.caption("No staff accounts available.")
+        else:
+            staff_map = {
+                int(row["user_id"]): clean_text(row.get("username")) or "Staff member"
+                for _, row in staff_users.iterrows()
+            }
+            selected_staff = st.selectbox(
+                "Staff account",
+                options=list(staff_map.keys()),
+                format_func=lambda val: staff_map.get(val, "Staff member"),
+                key="staff_classification_user",
+            )
+            current_classification = "service"
+            selection_row = staff_users[
+                staff_users["user_id"] == int(selected_staff)
+            ].iloc[0]
+            current_classification = (
+                clean_text(selection_row.get("staff_classification")) or "service"
+            )
+            classification_choice = st.selectbox(
+                "Classification",
+                ["service", "sales"],
+                index=0 if current_classification == "service" else 1,
+                format_func=lambda value: value.title(),
+                key="staff_classification_value",
+            )
+            if st.button("Save classification", key="staff_classification_save"):
+                conn.execute(
+                    "UPDATE users SET staff_classification=? WHERE user_id=?",
+                    (classification_choice, int(selected_staff)),
+                )
+                conn.commit()
+                st.success("Staff classification updated.")
 
     with st.expander("Delete staff and uploads"):
         staff_users = df_query(
@@ -25934,6 +25873,78 @@ def _normalize_report_text(value: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+def _auto_create_customers_from_reports(
+    conn,
+    *,
+    grid_rows: Iterable[dict],
+    created_by: Optional[int],
+    template_key: str,
+) -> int:
+    if template_key not in {"service", "sales", "follow_up"}:
+        return 0
+    normalized_rows = _normalize_grid_rows(grid_rows, template_key=template_key)
+    if not normalized_rows:
+        return 0
+    existing_rows = conn.execute(
+        """
+        SELECT customer_id, name, company_name, phone
+        FROM customers
+        WHERE phone IS NOT NULL AND TRIM(phone) != ''
+        """,
+    ).fetchall()
+    existing_by_phone: dict[str, list[tuple[int, str, str, str]]] = {}
+    for row in existing_rows:
+        phone_key = _normalize_phone_key(row[3])
+        if not phone_key:
+            continue
+        existing_by_phone.setdefault(phone_key, []).append(row)
+
+    created_count = 0
+    for entry in normalized_rows:
+        name = clean_text(entry.get("customer_name")) or ""
+        company = clean_text(entry.get("company_name")) or ""
+        phone = clean_text(entry.get("phone")) or ""
+        address = clean_text(entry.get("address")) or ""
+        if not (name and company and phone):
+            continue
+        phone_key = _normalize_phone_key(phone)
+        if not phone_key:
+            continue
+        if phone_key in existing_by_phone:
+            continue
+        display_name = name or company
+        remarks = "Auto-added from report entry."
+        conn.execute(
+            """
+            INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, created_by, dup_flag)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                display_name,
+                company,
+                phone,
+                address,
+                address,
+                remarks,
+                created_by,
+            ),
+        )
+        created_count += 1
+        existing_by_phone[phone_key] = [(None, display_name, company, phone)]
+    if created_count:
+        conn.commit()
+        _mark_data_changed("customers")
+        log_activity(
+            conn,
+            event_type="customer_created",
+            description=f"Auto-added {created_count} customer(s) from reports.",
+            entity_type="customer",
+            entity_id=None,
+            user_id=created_by,
+        )
+    return created_count
+
+
 def _lookup_customer_id_by_name(conn, customer_name: Optional[str]) -> Optional[int]:
     name_value = clean_text(customer_name)
     if not name_value:
@@ -26467,7 +26478,7 @@ def reports_page(conn):
 
     directory = df_query(
         conn,
-        "SELECT user_id, username, role FROM users ORDER BY LOWER(username)",
+        "SELECT user_id, username, role, staff_classification FROM users ORDER BY LOWER(username)",
     )
     user_labels: dict[int, str] = {}
     if not directory.empty:
@@ -26643,7 +26654,7 @@ def reports_page(conn):
             if owner_id < 0:
                 owner_id = None
         owner_label = label_map.get(owner_id, "Team member") if owner_id else None
-        can_delete = is_admin
+        can_delete = is_admin or (owner_id is not None and owner_id == viewer_id)
         if can_delete:
             with st.expander("Delete report", expanded=False):
                 st.warning(
@@ -27247,7 +27258,17 @@ def reports_page(conn):
                     except ValueError as err:
                         st.error(str(err))
                     else:
+                        created_customers = _auto_create_customers_from_reports(
+                            conn,
+                            grid_rows=grid_rows_to_store,
+                            created_by=report_owner_id,
+                            template_key=template_key,
+                        )
                         st.success("Report saved successfully.")
+                        if created_customers:
+                            st.info(
+                                f"Auto-added {created_customers} customer(s) from new report entries."
+                            )
                         if cleanup_path:
                             old_path = resolve_upload_path(cleanup_path)
                             if old_path and old_path.exists():
@@ -27506,6 +27527,145 @@ def reports_page(conn):
             key="reports_download",
         )
 
+    if is_admin:
+        st.markdown("---")
+        st.markdown("### Daily Sales & Service Reports")
+        filter_mode = st.radio(
+            "Filter mode",
+            ["Single date", "Date range"],
+            horizontal=True,
+            key="daily_report_filter_mode",
+        )
+        range_start = range_end = None
+        if filter_mode == "Single date":
+            single_date = render_flexible_date_input(
+                "Date",
+                value=today,
+                key="daily_report_single_date",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            )
+            range_start = range_end = single_date
+        else:
+            range_start, range_end = render_flexible_date_range(
+                "Date range",
+                start_value=today - timedelta(days=7),
+                end_value=today,
+                key_prefix="daily_report_range",
+                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            )
+        if range_start and range_end:
+            if range_end < range_start:
+                range_start, range_end = range_end, range_start
+            range_start_iso = to_iso_date(range_start)
+            range_end_iso = to_iso_date(range_end)
+            st.markdown("#### Daily Service Report")
+            service_entries: list[dict[str, object]] = []
+            service_reports = df_query(
+                conn,
+                dedent(
+                    """
+                    SELECT wr.report_id,
+                           wr.user_id,
+                           wr.period_start,
+                           wr.grid_payload,
+                           wr.report_template,
+                           u.username,
+                           u.staff_classification
+                    FROM work_reports wr
+                    JOIN users u ON u.user_id = wr.user_id
+                    WHERE wr.period_type = 'daily'
+                      AND date(wr.period_start) >= date(?)
+                      AND date(wr.period_start) <= date(?)
+                      AND LOWER(COALESCE(wr.report_template, '')) = 'service'
+                      AND LOWER(COALESCE(u.staff_classification, 'service')) = 'service'
+                    ORDER BY date(wr.period_start) DESC, wr.report_id DESC
+                    """
+                ),
+                (range_start_iso, range_end_iso),
+            )
+            if not service_reports.empty:
+                for _, row in service_reports.iterrows():
+                    template_key = _normalize_report_template(row.get("report_template"))
+                    grid_rows = parse_report_grid_payload(
+                        row.get("grid_payload"), template_key=template_key
+                    )
+                    display_df = format_report_grid_rows_for_display(
+                        grid_rows, empty_ok=True, template_key=template_key
+                    )
+                    if display_df.empty:
+                        continue
+                    for entry in display_df.to_dict("records"):
+                        service_entries.append(
+                            {
+                                "Date": format_period_range(
+                                    row.get("period_start"), row.get("period_start")
+                                ),
+                                "Team member": clean_text(row.get("username")) or "Team member",
+                                **entry,
+                            }
+                        )
+            if service_entries:
+                service_table = pd.DataFrame(service_entries)
+                st.dataframe(service_table, use_container_width=True)
+            else:
+                st.info("No service report entries found for the selected dates.")
+
+            st.markdown("#### Daily Sales Report")
+            sales_records = df_query(
+                conn,
+                dedent(
+                    """
+                    SELECT d.do_number,
+                           d.record_type,
+                           d.created_at,
+                           d.total_amount,
+                           d.status,
+                           COALESCE(c.name, c.company_name, '(customer)') AS customer,
+                           u.username,
+                           u.staff_classification
+                    FROM delivery_orders d
+                    LEFT JOIN customers c ON c.customer_id = d.customer_id
+                    LEFT JOIN users u ON u.user_id = d.created_by
+                    WHERE d.deleted_at IS NULL
+                      AND date(d.created_at) >= date(?)
+                      AND date(d.created_at) <= date(?)
+                      AND COALESCE(d.record_type, 'delivery_order') IN ('delivery_order', 'work_done')
+                      AND LOWER(COALESCE(u.staff_classification, 'sales')) = 'sales'
+                    ORDER BY datetime(d.created_at) DESC, d.do_number DESC
+                    """
+                ),
+                (range_start_iso, range_end_iso),
+            )
+            if sales_records.empty:
+                st.info("No sales entries found for the selected dates.")
+            else:
+                sales_records = fmt_dates(sales_records, ["created_at"])
+                sales_records["Type"] = sales_records["record_type"].apply(
+                    lambda value: "Work done" if clean_text(value) == "work_done" else "Delivery order"
+                )
+                sales_records["Amount"] = sales_records["total_amount"].apply(
+                    lambda val: format_money(val) or format_number(_coerce_float(val, 0.0))
+                )
+                sales_records["Team member"] = sales_records["username"].apply(
+                    lambda val: clean_text(val) or "Team member"
+                )
+                sales_display = sales_records.rename(
+                    columns={
+                        "do_number": "DO/WO No.",
+                        "created_at": "Date",
+                        "status": "Status",
+                        "customer": "Customer",
+                    }
+                )
+                st.dataframe(
+                    sales_display[
+                        ["Date", "Type", "DO/WO No.", "Customer", "Amount", "Status", "Team member"]
+                    ],
+                    use_container_width=True,
+                )
+        else:
+            st.info("Select a valid date or date range to view daily reports.")
+
     cadence_summary = (
         history_df.assign(label=history_df["period_type"].apply(format_period_label))
         .groupby("label")["report_id"]
@@ -27634,6 +27794,38 @@ def _scan_missing_uploads(conn: sqlite3.Connection) -> list[dict[str, str]]:
                     {"table": table, "column": column, "path": str(path_value)}
                 )
     return missing
+
+
+def _clear_page_state_on_navigation(previous_page: Optional[str]) -> None:
+    if not previous_page:
+        return
+    page_prefixes = {
+        "Dashboard": ["dashboard_"],
+        "Customers": ["customer_", "new_customer_", "import_", "scrap_", "duplicate_"],
+        "Quotation": ["quotation_", "quote_", "quotation_editor_"],
+        "Operations": ["delivery_order_", "work_done_", "service_", "maintenance_", "operations_"],
+        "Warranties": ["warranty_"],
+        "Advanced Search": ["advanced_search_"],
+        "Reports": ["report_"],
+        "Users (Admin)": ["staff_", "user_"],
+        "System Diagnostics": ["diag_"],
+    }
+    prefixes = page_prefixes.get(previous_page, [])
+    if not prefixes:
+        return
+    protected = {
+        "user",
+        "session_token",
+        "page",
+        "nav_page",
+        "nav_selection_top",
+        "nav_selection_mobile",
+    }
+    for key in list(st.session_state.keys()):
+        if key in protected or key.startswith("_"):
+            continue
+        if any(key.startswith(prefix) for prefix in prefixes):
+            st.session_state.pop(key, None)
 
 
 def _run_storage_roundtrip(base_dir: Path) -> dict[str, str]:
@@ -27917,6 +28109,10 @@ def main():
         selection = st.session_state.get(key, pages[0])
         if selection not in pages:
             selection = pages[0]
+        previous_page = st.session_state.get("nav_page")
+        if selection != previous_page:
+            st.session_state["_nav_transition"] = True
+            st.session_state["_nav_previous_page"] = previous_page
         st.session_state["nav_page"] = selection
         st.session_state["page"] = selection
         st.session_state["nav_selection_top"] = selection
@@ -27979,27 +28175,32 @@ def main():
                         st.rerun()
 
     page = st.session_state.get("nav_page", pages[0])
-    st.session_state.page = page
-    show_expiry_notifications(conn)
+    page_container = st.empty()
+    if st.session_state.pop("_nav_transition", False):
+        _clear_page_state_on_navigation(st.session_state.pop("_nav_previous_page", None))
+        page_container.markdown(PAGE_SKELETON_HTML, unsafe_allow_html=True)
+    with page_container.container():
+        st.session_state.page = page
+        show_expiry_notifications(conn)
 
-    if page == "Dashboard":
-        dashboard(conn)
-    elif page == "Quotation":
-        quotation_page(conn, render_id=render_id)
-    elif page == "Customers":
-        customers_hub_page(conn)
-    elif page == "Operations":
-        operations_page(conn)
-    elif page == "Warranties":
-        warranties_page(conn)
-    elif page == "Advanced Search":
-        advanced_search_page(conn)
-    elif page == "Reports":
-        reports_page(conn)
-    elif page == "Users (Admin)":
-        users_admin_page(conn)
-    elif page == "System Diagnostics":
-        render_system_diagnostics(conn)
+        if page == "Dashboard":
+            dashboard(conn)
+        elif page == "Quotation":
+            quotation_page(conn, render_id=render_id)
+        elif page == "Customers":
+            customers_hub_page(conn)
+        elif page == "Operations":
+            operations_page(conn)
+        elif page == "Warranties":
+            warranties_page(conn)
+        elif page == "Advanced Search":
+            advanced_search_page(conn)
+        elif page == "Reports":
+            reports_page(conn)
+        elif page == "Users (Admin)":
+            users_admin_page(conn)
+        elif page == "System Diagnostics":
+            render_system_diagnostics(conn)
 
 if __name__ == "__main__":
     if _streamlit_runtime_active():
