@@ -2108,6 +2108,7 @@ def _resolve_manual_customer_id(
         (cleaned_name, current_user_id()),
     )
     conn.commit()
+    _mark_data_changed("customers")
     return int(cursor.lastrowid)
 
 
@@ -16336,6 +16337,13 @@ def customers_page(conn):
                 created_by = current_user_id()
                 existing_customer_id = merge_customers_by_phone(conn, phone_val)
                 if existing_customer_id is None:
+                    existing_customer_id = _lookup_customer_id_for_merge(
+                        conn,
+                        name=name_val,
+                        company=company_val,
+                        phone=phone_val,
+                    )
+                if existing_customer_id is None:
                     cur.execute(
                         "INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                         (
@@ -16371,6 +16379,20 @@ def customers_page(conn):
                         amount_spent=amount_value,
                         sales_person=sales_person_value,
                     )
+                    if phone_val:
+                        existing_phone_row = conn.execute(
+                            "SELECT phone FROM customers WHERE customer_id=?",
+                            (cid,),
+                        ).fetchone()
+                        existing_phone = clean_text(existing_phone_row[0]) if existing_phone_row else ""
+                        if not existing_phone or (
+                            _normalize_phone_key(existing_phone)
+                            == _normalize_phone_key(phone_val)
+                        ):
+                            conn.execute(
+                                "UPDATE customers SET phone=? WHERE customer_id=?",
+                                (phone_val, cid),
+                            )
                     conn.commit()
                 if cleaned_products:
                     for prod in cleaned_products:
@@ -16848,7 +16870,7 @@ def customers_page(conn):
                     entity_type="customer",
                     entity_id=int(cid),
                 )
-                _refresh_customer_caches()
+                _mark_data_changed("customers")
                 _reset_new_customer_form_state()
                 st.session_state["new_customer_feedback"] = (
                     "success",
@@ -17814,7 +17836,9 @@ def _render_service_section(conn, *, show_heading: bool = True):
     if show_heading:
         st.subheader("🛠️ Service Records")
     _, customer_label_map = build_customer_groups(conn, only_complete=False)
-    customer_options, customer_labels, _, label_by_id = fetch_customer_choices(conn)
+    customer_options, customer_labels, _, label_by_id = fetch_customer_choices(
+        conn, only_complete=False
+    )
     viewer_id = current_user_id()
     do_df = df_query(
         conn,
@@ -21289,7 +21313,9 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
     if show_heading:
         st.subheader("🔧 Maintenance Records")
     _, customer_label_map = build_customer_groups(conn, only_complete=False)
-    customer_options, customer_labels, _, label_by_id = fetch_customer_choices(conn)
+    customer_options, customer_labels, _, label_by_id = fetch_customer_choices(
+        conn, only_complete=False
+    )
     viewer_id = current_user_id()
     do_df = df_query(
         conn,
@@ -22086,7 +22112,7 @@ def delivery_orders_page(
     st.session_state.setdefault(manual_customer_toggle_key, False)
     st.session_state.setdefault(manual_customer_name_key, "")
 
-    customer_options, customer_labels, _, _ = fetch_customer_choices(conn)
+    customer_options, customer_labels, _, _ = fetch_customer_choices(conn, only_complete=False)
     scope_clause, scope_params = customer_scope_filter("c")
     where_sql = f"WHERE {scope_clause}" if scope_clause else ""
     do_rows = df_query(
@@ -22197,6 +22223,7 @@ def delivery_orders_page(
         elif selected_customer_state is None:
             st.session_state[autofill_customer_key] = None
 
+    date_label = "Delivery date" if record_type_key == "delivery_order" else "Work done date"
     with st.form(form_key, clear_on_submit=True):
         do_number = st.text_input(
             f"{record_label} number *",
@@ -22229,10 +22256,10 @@ def delivery_orders_page(
             key=remarks_key,
         )
         delivery_date = render_flexible_date_input(
-            "Delivery date",
+            date_label,
             value=st.session_state.get(delivery_date_key),
             key=delivery_date_key,
-            help="Record the delivery date (single-line entry).",
+            help="Optional: record the date the work was completed or delivered.",
         )
         document_upload = st.file_uploader(
             f"{record_label} document (PDF or image)",
@@ -22511,6 +22538,7 @@ def delivery_orders_page(
                d.description,
                d.sales_person,
                d.remarks,
+               d.delivery_date,
                d.created_at,
                d.file_path,
                d.total_amount,
@@ -22532,7 +22560,7 @@ def delivery_orders_page(
     allowed_customers = accessible_customer_ids(conn)
     do_df = filter_delivery_orders_for_view(do_df, allowed_customers)
     if not do_df.empty:
-        do_df = fmt_dates(do_df, ["created_at", "updated_at"])
+        do_df = fmt_dates(do_df, ["created_at", "updated_at", "delivery_date"])
         if query_text:
             needle = query_text.lower()
             do_df = do_df[
@@ -22576,21 +22604,21 @@ def delivery_orders_page(
 
             do_df["total_amount"] = do_df["total_amount"].apply(_format_total_value)
         st.markdown(f"#### {record_label} records")
-        header_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 0.9, 1.2))
+        header_cols = st.columns((1.2, 1.6, 2.3, 0.9, 1.0, 0.9, 1.2))
         header_cols[0].write(f"**{number_label}**")
         header_cols[1].write("**Customer**")
         header_cols[2].write("**Description**")
-        header_cols[3].write("**Total**")
-        header_cols[4].write("**Status**")
-        header_cols[5].write("**Attachment**")
-        header_cols[6].write("**Upload receipt**")
+        header_cols[3].write(f"**{date_label}**")
+        header_cols[4].write("**Total**")
+        header_cols[5].write("**Status**")
+        header_cols[6].write("**Attachment**")
 
         for _, row in do_df.iterrows():
             do_number = clean_text(row.get("do_number"))
             if not do_number:
                 continue
             row_key = f"{record_type_key}_{do_number}"
-            row_cols = st.columns((1.2, 1.6, 2.6, 1.0, 0.9, 1.2))
+            row_cols = st.columns((1.2, 1.6, 2.3, 0.9, 1.0, 0.9, 1.2))
             is_highlight = highlight_target and do_number == highlight_target
             def _render_cell(col, value: str) -> None:
                 if is_highlight:
@@ -22604,10 +22632,11 @@ def delivery_orders_page(
             _render_cell(row_cols[0], do_number)
             _render_cell(row_cols[1], clean_text(row.get("customer")) or "(unknown)")
             _render_cell(row_cols[2], clean_text(row.get("description")) or "")
-            _render_cell(row_cols[3], clean_text(row.get("total_amount")) or "")
-            _render_cell(row_cols[4], clean_text(row.get("status")) or "")
+            _render_cell(row_cols[3], clean_text(row.get("delivery_date")) or "—")
+            _render_cell(row_cols[4], clean_text(row.get("total_amount")) or "")
+            _render_cell(row_cols[5], clean_text(row.get("status")) or "")
             _render_attachment_bundle_link(
-                row_cols[5],
+                row_cols[6],
                 attachment_path=clean_text(row.get("file_path")),
                 receipt_path=None,
                 bundle_label=f"{record_label}_{do_number}",
@@ -25962,6 +25991,48 @@ def _lookup_customer_id_by_name(conn, customer_name: Optional[str]) -> Optional[
     ).fetchone()
     if row:
         return int(row[0])
+    return None
+
+
+def _lookup_customer_id_for_merge(
+    conn,
+    *,
+    name: Optional[str],
+    company: Optional[str],
+    phone: Optional[str],
+) -> Optional[int]:
+    name_value = clean_text(name)
+    company_value = clean_text(company)
+    if not name_value and not company_value:
+        return None
+    clauses = []
+    params: list[object] = []
+    if name_value:
+        clauses.append("LOWER(TRIM(name)) = LOWER(TRIM(?))")
+        params.append(name_value)
+    if company_value:
+        clauses.append("LOWER(TRIM(company_name)) = LOWER(TRIM(?))")
+        params.append(company_value)
+    if not clauses:
+        return None
+    rows = conn.execute(
+        f"""
+        SELECT customer_id, phone
+        FROM customers
+        WHERE {" OR ".join(clauses)}
+        ORDER BY customer_id DESC
+        """,
+        tuple(params),
+    ).fetchall()
+    if not rows:
+        return None
+    incoming_key = _normalize_phone_key(phone)
+    for customer_id, phone_value in rows:
+        existing_key = _normalize_phone_key(phone_value)
+        if not phone_value or not existing_key or not incoming_key:
+            return int(customer_id)
+        if existing_key == incoming_key:
+            return int(customer_id)
     return None
 
 
