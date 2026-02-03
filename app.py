@@ -1499,6 +1499,7 @@ CREATE TABLE IF NOT EXISTS operations_other_documents (
     document_id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER NOT NULL,
     description TEXT,
+    document_date TEXT,
     items_payload TEXT,
     file_path TEXT,
     original_name TEXT,
@@ -1864,6 +1865,7 @@ def ensure_schema_upgrades(conn):
     add_column("delivery_orders", "updated_at", "TEXT DEFAULT (datetime('now'))")
     add_column("delivery_orders", "deleted_at", "TEXT")
     add_column("delivery_orders", "deleted_by", "INTEGER")
+    add_column("operations_other_documents", "document_date", "TEXT")
     add_column("operations_other_documents", "updated_at", "TEXT DEFAULT (datetime('now'))")
     add_column("operations_other_documents", "updated_by", "INTEGER")
     add_column("operations_other_documents", "deleted_at", "TEXT")
@@ -1972,6 +1974,7 @@ def ensure_schema_upgrades(conn):
             document_id INTEGER PRIMARY KEY AUTOINCREMENT,
             customer_id INTEGER NOT NULL,
             description TEXT,
+            document_date TEXT,
             items_payload TEXT,
             file_path TEXT,
             original_name TEXT,
@@ -3147,6 +3150,10 @@ def _apply_ocr_autofill(
                         }
                     )
                 st.session_state[items_key] = mapped_items
+            date_key = f"{details_key_prefix}_delivery_date"
+            parsed_date = _parse_date_from_text(text_content)
+            if parsed_date and not st.session_state.get(date_key):
+                st.session_state[date_key] = parsed_date
         elif doc_type == "Service":
             items_key = f"{details_key_prefix}_service_items"
             existing_items = st.session_state.get(items_key, [])
@@ -3200,9 +3207,13 @@ def _apply_ocr_autofill(
                             "description": item.get("description") or "",
                             "quantity": _coerce_float(item.get("quantity"), 1.0),
                             "unit_price": _coerce_float(item.get("rate"), 0.0),
-                        }
-                    )
+                    }
+                )
                 st.session_state[items_key] = mapped_items
+            date_key = f"{details_key_prefix}_other_date"
+            parsed_date = _parse_date_from_text(text_content)
+            if parsed_date and not st.session_state.get(date_key):
+                st.session_state[date_key] = parsed_date
             description_key = f"{details_key_prefix}_other_description"
             if not clean_text(st.session_state.get(description_key)) and lines:
                 st.session_state[description_key] = " ".join(lines[:2])
@@ -13392,7 +13403,7 @@ def _render_doc_detail_inputs(
         )
         st.markdown("**Quotation items**")
         edited_items = safe_data_editor(
-            items_df[["description", "quantity", "rate", "total_price"]],
+            items_df[["description", "quantity", "rate"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
             hide_index=True,
@@ -13403,11 +13414,7 @@ def _render_doc_detail_inputs(
                 "rate": st.column_config.NumberColumn(
                     "Unit price", min_value=0.0, step=100.0, format="%.2f"
                 ),
-                "total_price": st.column_config.NumberColumn(
-                    "Price (Tk.)", min_value=0.0, step=100.0, format="%.2f"
-                ),
             },
-            disabled=["total_price"],
         )
         items_records = (
             edited_items.to_dict("records")
@@ -13514,6 +13521,12 @@ def _render_doc_detail_inputs(
         details["remarks"] = st.text_area(
             "Remarks",
             key=f"{key_prefix}_do_remarks",
+        )
+        date_label = "Delivery date" if doc_type == "Delivery order" else "Work done date"
+        details["delivery_date"] = render_flexible_date_input(
+            date_label,
+            key=f"{key_prefix}_delivery_date",
+            help="Optional: record the date the work was completed or delivered.",
         )
         details["advance_receipt_upload"] = None
         details["receipt_upload"] = None
@@ -13724,6 +13737,11 @@ def _render_doc_detail_inputs(
         )
         details["items"] = items_records
         st.session_state[items_key] = items_records
+        details["document_date"] = render_flexible_date_input(
+            "Document date",
+            key=f"{key_prefix}_other_date",
+            help="Optional: record the date for this document.",
+        )
         details["description"] = st.text_area(
             "Description",
             key=f"{key_prefix}_other_description",
@@ -13753,6 +13771,7 @@ def _clear_operations_upload_state(
                 f"{details_key_prefix}_do_person_in_charge",
                 f"{details_key_prefix}_do_description",
                 f"{details_key_prefix}_do_remarks",
+                f"{details_key_prefix}_delivery_date",
                 f"{details_key_prefix}_do_advance_taken",
                 f"{details_key_prefix}_do_advance_receipt",
                 f"{details_key_prefix}_do_receipt",
@@ -13791,6 +13810,7 @@ def _clear_operations_upload_state(
             [
                 f"{details_key_prefix}_other_items",
                 f"{details_key_prefix}_other_items_editor",
+                f"{details_key_prefix}_other_date",
                 f"{details_key_prefix}_other_description",
             ]
         )
@@ -14078,14 +14098,15 @@ def _save_customer_document_upload(
         conn.execute(
             """
             INSERT INTO delivery_orders (
-                do_number, customer_id, description, sales_person, remarks, file_path,
+                do_number, customer_id, description, sales_person, remarks, delivery_date, file_path,
                 items_payload, total_amount, record_type, status, payment_receipt_path, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(do_number) DO UPDATE SET
                 customer_id=excluded.customer_id,
                 description=excluded.description,
                 sales_person=excluded.sales_person,
                 remarks=excluded.remarks,
+                delivery_date=COALESCE(excluded.delivery_date, delivery_orders.delivery_date),
                 file_path=COALESCE(excluded.file_path, delivery_orders.file_path),
                 items_payload=COALESCE(excluded.items_payload, delivery_orders.items_payload),
                 total_amount=COALESCE(excluded.total_amount, delivery_orders.total_amount),
@@ -14100,6 +14121,7 @@ def _save_customer_document_upload(
                 clean_text(details.get("description")),
                 clean_text(details.get("person_in_charge")) or clean_text(user_label),
                 clean_text(details.get("remarks")),
+                to_iso_date(details.get("delivery_date")),
                 stored_path,
                 json.dumps(items_clean, ensure_ascii=False) if items_clean else None,
                 total_amount if items_clean else None,
@@ -14257,12 +14279,13 @@ def _save_customer_document_upload(
         cur = conn.execute(
             """
             INSERT INTO operations_other_documents (
-                customer_id, description, items_payload, file_path, original_name, uploaded_by, file_size, mime_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                customer_id, description, document_date, items_payload, file_path, original_name, uploaded_by, file_size, mime_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(customer_id),
                 clean_text(details.get("description")),
+                to_iso_date(details.get("document_date")),
                 items_payload,
                 stored_path,
                 safe_original,
@@ -14880,6 +14903,7 @@ def render_operations_document_uploader(
                d.remarks AS do_remarks,
                d.status AS do_status,
                d.created_at AS do_created_at,
+               d.delivery_date AS do_delivery_date,
                d.record_type,
                d.created_by AS do_created_by,
                sd.document_id AS service_document_id,
@@ -14900,6 +14924,7 @@ def render_operations_document_uploader(
                m.created_by AS maintenance_created_by,
                o.document_id AS other_document_id,
                o.description AS other_description,
+               o.document_date AS other_document_date,
                o.uploaded_by AS other_uploaded_by
         FROM customer_documents cd
         LEFT JOIN customers c ON c.customer_id = cd.customer_id
@@ -14993,7 +15018,7 @@ def render_operations_document_uploader(
         if source == "delivery":
             description = clean_text(row.get("do_remarks")) or clean_text(row.get("do_description"))
             status = normalize_delivery_status(clean_text(row.get("do_status")))
-            date_value = clean_text(row.get("do_created_at"))
+            date_value = clean_text(row.get("do_delivery_date")) or clean_text(row.get("do_created_at"))
         elif source == "service":
             description = clean_text(row.get("service_remarks")) or clean_text(row.get("service_description"))
             status = clean_text(row.get("service_status"))
@@ -15004,7 +15029,7 @@ def render_operations_document_uploader(
             date_value = clean_text(row.get("maintenance_date"))
         elif source == "other":
             description = clean_text(row.get("other_description"))
-            date_value = clean_text(row.get("uploaded_at"))
+            date_value = clean_text(row.get("other_document_date")) or clean_text(row.get("uploaded_at"))
         uploaded_at = pd.to_datetime(row.get("uploaded_at"), errors="coerce")
         uploaded_label = uploaded_at.strftime("%d-%m-%Y") if pd.notna(uploaded_at) else "—"
         table_records.append(
@@ -15108,6 +15133,7 @@ def render_operations_document_uploader(
                     """
                     UPDATE delivery_orders
                     SET remarks=?,
+                        delivery_date=?,
                         status=?,
                         updated_at=datetime('now')
                     WHERE do_number=?
@@ -15115,6 +15141,7 @@ def render_operations_document_uploader(
                     """,
                     (
                         new_desc,
+                        to_iso_date(new_date),
                         normalize_delivery_status(new_status),
                         clean_text(table_df.loc[doc_id, "do_number"]),
                     ),
@@ -15160,6 +15187,7 @@ def render_operations_document_uploader(
                     """
                     UPDATE operations_other_documents
                     SET description=?,
+                        document_date=?,
                         updated_at=datetime('now'),
                         updated_by=?
                     WHERE document_id=?
@@ -15167,6 +15195,7 @@ def render_operations_document_uploader(
                     """,
                     (
                         new_desc,
+                        to_iso_date(new_date),
                         actor_id,
                         int(table_df.loc[doc_id, "other_document_id"]),
                     ),
@@ -15477,6 +15506,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
         SELECT o.document_id,
                o.customer_id,
                o.description,
+               o.document_date,
                o.items_payload,
                o.file_path,
                o.original_name,
@@ -15536,7 +15566,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
 
     display_df = other_df.copy()
     display_df["items_summary"] = display_df["items_payload"].apply(_summarize_items)
-    display_df = fmt_dates(display_df, ["uploaded_at", "updated_at"])
+    display_df = fmt_dates(display_df, ["document_date", "uploaded_at", "updated_at"])
     display_df["Document"] = display_df["file_path"].apply(_file_data_uri_from_path)
     display_df["Download"] = display_df["file_path"].apply(_file_data_uri_from_path)
     display_df = display_df.rename(
@@ -15545,6 +15575,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             "customer_name": "Customer",
             "company": "Company",
             "items_summary": "Items",
+            "document_date": "Date",
             "uploaded_at": "Uploaded",
             "updated_at": "Updated",
             "uploaded_by_name": "Uploaded by",
@@ -15558,6 +15589,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
                 "Customer",
                 "Company",
                 "Items",
+                "Date",
                 "Uploaded",
                 "Updated",
                 "Document",
@@ -15636,6 +15668,12 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
     actor_id = current_user_id()
     can_edit = actor_id is not None
     with st.form(f"{key_prefix}_other_edit_form"):
+        date_input = render_flexible_date_input(
+            "Document date",
+            value=selected_record.get("document_date") or selected_record.get("uploaded_at"),
+            key=f"{key_prefix}_other_edit_date",
+            help="Optional: record the date for this document.",
+        )
         description_input = st.text_area(
             "Description",
             value=clean_text(selected_record.get("description")) or "",
@@ -15699,6 +15737,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             """
             UPDATE operations_other_documents
             SET description=?,
+                document_date=?,
                 items_payload=?,
                 file_path=?,
                 original_name=?,
@@ -15709,6 +15748,7 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
             """,
             (
                 clean_text(description_input),
+                to_iso_date(date_input),
                 items_payload,
                 stored_path,
                 original_name,
@@ -20170,7 +20210,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             axis=1,
         )
         edited_df = safe_data_editor(
-            items_df,
+            items_df[["description", "quantity", "rate"]],
             hide_index=True,
             num_rows="dynamic",
             use_container_width=True,
@@ -20185,11 +20225,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 "rate": st.column_config.NumberColumn(
                     "Unit Price, Tk.", min_value=0.0, step=100.0, format="%.2f"
                 ),
-                "total_price": st.column_config.NumberColumn(
-                    "Price (Tk.)", min_value=0.0, step=100.0, format="%.2f"
-                ),
             },
-            disabled=["total_price"],
         )
         if isinstance(edited_df, pd.DataFrame):
             edited_df["total_price"] = edited_df.apply(
@@ -20869,7 +20905,6 @@ def _render_quotation_management(conn):
                 "Description of Generator",
                 "Qty.",
                 "Unit Price, Tk.",
-                "Total Price, Tk.",
             ]
             if col in items_df.columns
         ]
@@ -22706,34 +22741,21 @@ def delivery_orders_page(
         highlight_target = clean_text(highlight_record)
         if highlight_target:
             st.info(f"Highlighted {record_label} {highlight_target}.")
-        if "total_amount" in do_df.columns:
-            def _format_total_value(value: object) -> str:
-                if value is None:
-                    return ""
-                try:
-                    if pd.isna(value):
-                        return ""
-                except Exception:
-                    pass
-                return format_money(value) or format_number(_coerce_float(value, 0.0))
-
-            do_df["total_amount"] = do_df["total_amount"].apply(_format_total_value)
         st.markdown(f"#### {record_label} records")
-        header_cols = st.columns((1.2, 1.6, 2.3, 0.9, 1.0, 0.9, 1.2))
+        header_cols = st.columns((1.2, 1.6, 2.6, 0.9, 0.9, 1.2))
         header_cols[0].write(f"**{number_label}**")
         header_cols[1].write("**Customer**")
         header_cols[2].write("**Description**")
         header_cols[3].write(f"**{date_label}**")
-        header_cols[4].write("**Total**")
-        header_cols[5].write("**Status**")
-        header_cols[6].write("**Attachment**")
+        header_cols[4].write("**Status**")
+        header_cols[5].write("**Attachment**")
 
         for _, row in do_df.iterrows():
             do_number = clean_text(row.get("do_number"))
             if not do_number:
                 continue
             row_key = f"{record_type_key}_{do_number}"
-            row_cols = st.columns((1.2, 1.6, 2.3, 0.9, 1.0, 0.9, 1.2))
+            row_cols = st.columns((1.2, 1.6, 2.6, 0.9, 0.9, 1.2))
             is_highlight = highlight_target and do_number == highlight_target
             def _render_cell(col, value: str) -> None:
                 if is_highlight:
@@ -22748,10 +22770,9 @@ def delivery_orders_page(
             _render_cell(row_cols[1], clean_text(row.get("customer")) or "(unknown)")
             _render_cell(row_cols[2], clean_text(row.get("description")) or "")
             _render_cell(row_cols[3], clean_text(row.get("delivery_date")) or "—")
-            _render_cell(row_cols[4], clean_text(row.get("total_amount")) or "")
-            _render_cell(row_cols[5], clean_text(row.get("status")) or "")
+            _render_cell(row_cols[4], clean_text(row.get("status")) or "")
             _render_attachment_bundle_link(
-                row_cols[6],
+                row_cols[5],
                 attachment_path=clean_text(row.get("file_path")),
                 receipt_path=None,
                 bundle_label=f"{record_label}_{do_number}",
