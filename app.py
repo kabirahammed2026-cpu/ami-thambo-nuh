@@ -13392,7 +13392,7 @@ def _render_doc_detail_inputs(
         )
         st.markdown("**Quotation items**")
         edited_items = safe_data_editor(
-            items_df[["description", "quantity", "rate", "total_price"]],
+            items_df[["description", "quantity", "rate"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
             hide_index=True,
@@ -13403,11 +13403,7 @@ def _render_doc_detail_inputs(
                 "rate": st.column_config.NumberColumn(
                     "Unit price", min_value=0.0, step=100.0, format="%.2f"
                 ),
-                "total_price": st.column_config.NumberColumn(
-                    "Price (Tk.)", min_value=0.0, step=100.0, format="%.2f"
-                ),
             },
-            disabled=["total_price"],
         )
         items_records = (
             edited_items.to_dict("records")
@@ -20170,7 +20166,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             axis=1,
         )
         edited_df = safe_data_editor(
-            items_df,
+            items_df[["description", "quantity", "rate"]],
             hide_index=True,
             num_rows="dynamic",
             use_container_width=True,
@@ -20185,11 +20181,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 "rate": st.column_config.NumberColumn(
                     "Unit Price, Tk.", min_value=0.0, step=100.0, format="%.2f"
                 ),
-                "total_price": st.column_config.NumberColumn(
-                    "Price (Tk.)", min_value=0.0, step=100.0, format="%.2f"
-                ),
             },
-            disabled=["total_price"],
         )
         if isinstance(edited_df, pd.DataFrame):
             edited_df["total_price"] = edited_df.apply(
@@ -20869,7 +20861,6 @@ def _render_quotation_management(conn):
                 "Description of Generator",
                 "Qty.",
                 "Unit Price, Tk.",
-                "Total Price, Tk.",
             ]
             if col in items_df.columns
         ]
