@@ -371,7 +371,7 @@ SERVICE_REPORT_FIELDS = OrderedDict(
         (
             "details_remarks",
             {
-                "label": "Remarks",
+                "label": "Customer feedback",
                 "type": "text",
                 "help": "Notes or actions taken for this row.",
             },
@@ -379,7 +379,7 @@ SERVICE_REPORT_FIELDS = OrderedDict(
         (
             "remarks_history",
             {
-                "label": "Remarks history",
+                "label": "Feedback history",
                 "type": "text",
                 "help": "Previous remarks captured for this row.",
             },
@@ -440,6 +440,36 @@ SERVICE_REPORT_FIELDS = OrderedDict(
             },
         ),
         (
+            "amount_tk",
+            {
+                "label": "Amount",
+                "type": "number",
+                "format": "%.2f",
+                "step": 100.0,
+                "help": "Recorded amount for this entry.",
+            },
+        ),
+        (
+            "paid_amount_tk",
+            {
+                "label": "Paid Amount",
+                "type": "number",
+                "format": "%.2f",
+                "step": 100.0,
+                "help": "Amount already collected from the customer.",
+            },
+        ),
+        (
+            "due_amount_tk",
+            {
+                "label": "Due Amount",
+                "type": "number",
+                "format": "%.2f",
+                "step": 100.0,
+                "help": "Outstanding amount still due.",
+            },
+        ),
+        (
             "bill_price_tk",
             {
                 "label": "Bill Price Tk",
@@ -447,6 +477,16 @@ SERVICE_REPORT_FIELDS = OrderedDict(
                 "format": "%.2f",
                 "step": 100.0,
                 "help": "Final billed amount in Taka.",
+            },
+        ),
+        (
+            "price_tk",
+            {
+                "label": "Price (Tk.)",
+                "type": "number",
+                "format": "%.2f",
+                "step": 100.0,
+                "help": "Recorded price for this report entry.",
             },
         ),
         (
@@ -492,9 +532,19 @@ FOLLOW_UP_REPORT_FIELDS = OrderedDict(
         ("product_detail", {"label": "Product Detail", "type": "text"}),
         ("qty", {"label": "Qty", "type": "number", "step": 1.0}),
         (
+            "price_tk",
+            {
+                "label": "Price (Tk.)",
+                "type": "number",
+                "format": "%.2f",
+                "step": 100.0,
+                "help": "Recorded price for this follow-up entry.",
+            },
+        ),
+        (
             "notes",
             {
-                "label": "Remarks",
+                "label": "Customer feedback",
                 "type": "text",
                 "help": "Follow-up notes or updates for this row.",
             },
@@ -502,7 +552,7 @@ FOLLOW_UP_REPORT_FIELDS = OrderedDict(
         (
             "remarks_history",
             {
-                "label": "Remarks history",
+                "label": "Feedback history",
                 "type": "text",
                 "help": "Previous remarks captured for this row.",
             },
@@ -656,6 +706,12 @@ def _normalize_grid_rows(
                 entry[key] = to_iso_date(value)
             else:
                 entry[key] = value
+        if (
+            "customer_name" in entry
+            and "company_name" in fields
+            and not clean_text(entry.get("company_name"))
+        ):
+            entry["company_name"] = clean_text(entry.get("customer_name"))
         if any(val not in (None, "") for val in entry.values()):
             normalized.append(entry)
     return normalized
@@ -726,6 +782,9 @@ REPORT_COLUMN_ALIASES = {
         "quotation price",
         "quote",
     ],
+    "amount_tk": ["amount", "amount_tk", "total", "total amount"],
+    "paid_amount_tk": ["paid_amount", "paid amount", "paid", "amount paid"],
+    "due_amount_tk": ["due_amount", "due amount", "due", "balance"],
     "reminder_date": ["reminder_date", "reminder date", "reminder"],
     "work_done_date": ["work_done_date", "work done date", "completion_date"],
     "delivery_date": ["delivery_date", "delivery date", "delivery"],
@@ -5002,6 +5061,15 @@ def _default_new_customer_products() -> list[dict[str, object]]:
     ]
 
 
+def _ensure_auto_reference(key: str, prefix: str) -> str:
+    reference = clean_text(st.session_state.get(key))
+    if not reference:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        reference = f"{prefix}-{timestamp}-{secrets.token_hex(2)}"
+        st.session_state[key] = reference
+    return reference
+
+
 def _reset_new_customer_form_state() -> None:
     default_products = _default_new_customer_products()
     st.session_state["new_customer_products_rows"] = default_products
@@ -5012,20 +5080,22 @@ def _reset_new_customer_form_state() -> None:
         "new_customer_address",
         "new_customer_delivery_address",
         "new_customer_purchase_date",
-        "new_customer_do_code",
+        "new_customer_auto_do_code",
         "new_customer_sales_person",
         "new_customer_remarks",
         "new_customer_amount_spent",
         "new_customer_pdf",
         "new_customer_create_delivery_order",
         "new_customer_create_work_done",
-        "new_customer_work_done_number",
+        "new_customer_auto_work_done_number",
         "new_customer_work_done_notes",
         "new_customer_work_done_pdf",
         "new_customer_create_service",
+        "new_customer_auto_service_reference",
         "new_customer_service_date",
         "new_customer_service_description",
         "new_customer_create_maintenance",
+        "new_customer_auto_maintenance_reference",
         "new_customer_maintenance_date",
         "new_customer_maintenance_description",
         "new_customer_products_table",
@@ -13322,7 +13392,7 @@ def _render_doc_detail_inputs(
         )
         st.markdown("**Quotation items**")
         edited_items = safe_data_editor(
-            items_df[["description", "quantity", "rate"]],
+            items_df[["description", "quantity", "rate", "total_price"]],
             key=f"{items_key}_editor",
             num_rows="dynamic",
             hide_index=True,
@@ -13333,13 +13403,24 @@ def _render_doc_detail_inputs(
                 "rate": st.column_config.NumberColumn(
                     "Unit price", min_value=0.0, step=100.0, format="%.2f"
                 ),
+                "total_price": st.column_config.NumberColumn(
+                    "Price (Tk.)", min_value=0.0, step=100.0, format="%.2f"
+                ),
             },
+            disabled=["total_price"],
         )
         items_records = (
             edited_items.to_dict("records")
             if isinstance(edited_items, pd.DataFrame)
             else edited_items
         )
+        if isinstance(items_records, list):
+            for entry in items_records:
+                entry["total_price"] = max(
+                    _coerce_float(entry.get("quantity"), 0.0)
+                    * _coerce_float(entry.get("rate"), 0.0),
+                    0.0,
+                )
         details["items"] = items_records
         st.session_state[items_key] = items_records
         default_purchase_date = parse_date_value(defaults.get("purchase_date"))
@@ -16079,26 +16160,10 @@ def customers_page(conn):
             product_entries = editor_df.to_dict("records")
             st.session_state["new_customer_products_rows"] = product_entries
             with st.expander("Attachments & advanced details", expanded=True):
-                do_code = st.text_input(
-                    "Delivery order (DO) code (optional)",
-                    key="new_customer_do_code",
-                    help="Link the customer to an existing delivery order if available.",
-                )
-                work_done_number = st.text_input(
-                    "Work done number (optional)",
-                    key="new_customer_work_done_number",
-                    help="Reference code used when creating a work done record.",
-                )
-                service_reference = st.text_input(
-                    "Service reference (optional)",
-                    key="new_customer_service_reference",
-                    help="Code or tag to use when creating the linked service record.",
-                )
-                maintenance_reference = st.text_input(
-                    "Maintenance reference (optional)",
-                    key="new_customer_maintenance_reference",
-                    help="Code or tag for the maintenance record created with this customer.",
-                )
+                do_serial = None
+                work_done_serial = None
+                service_reference = None
+                maintenance_reference = None
                 sales_person_input = st.text_input(
                     "Sales person",
                     value=st.session_state.get("new_customer_sales_person", salesperson_seed),
@@ -16113,14 +16178,9 @@ def customers_page(conn):
                 )
                 st.markdown("---")
                 create_cols = st.columns(4)
-                if (
-                    "new_customer_create_delivery_order" not in st.session_state
-                    and do_code
-                ):
-                    st.session_state["new_customer_create_delivery_order"] = True
                 create_delivery_order = create_cols[0].checkbox(
                     "Delivery order",
-                    value=bool(st.session_state.get("new_customer_create_delivery_order")) or bool(do_code),
+                    value=bool(st.session_state.get("new_customer_create_delivery_order")),
                     key="new_customer_create_delivery_order",
                 )
                 create_work_done = create_cols[1].checkbox(
@@ -16140,10 +16200,12 @@ def customers_page(conn):
                 )
 
                 if create_delivery_order:
+                    do_serial = _ensure_auto_reference("new_customer_auto_do_code", "DO")
                     st.subheader("Delivery order details")
                     st.caption(
                         "Uses the delivery order code and product list exactly as on the Delivery orders page."
                     )
+                    st.caption(f"Delivery order code: {do_serial}")
                     do_status = st.selectbox(
                         "Delivery order status",
                         options=DELIVERY_STATUS_OPTIONS,
@@ -16160,15 +16222,16 @@ def customers_page(conn):
                         )
 
                 if create_work_done:
+                    work_done_serial = _ensure_auto_reference(
+                        "new_customer_auto_work_done_number", "WD"
+                    )
                     st.subheader("Work done details")
                     st.caption(
                         "Matches the work done form so you can fill in the reference, remarks and PDF attachment."
                     )
                     work_done_cols = st.columns((1, 2, 2))
                     with work_done_cols[0]:
-                        st.caption(
-                            f"Work done number: {clean_text(work_done_number) or '— set above —'}"
-                        )
+                        st.caption(f"Work done number: {work_done_serial}")
                     work_done_status = work_done_cols[1].selectbox(
                         "Work done status",
                         options=DELIVERY_STATUS_OPTIONS,
@@ -16203,6 +16266,10 @@ def customers_page(conn):
                     st.subheader("After-sales records")
 
                 if create_service:
+                    service_reference = _ensure_auto_reference(
+                        "new_customer_auto_service_reference", "SV"
+                    )
+                    st.caption(f"Service reference: {service_reference}")
                     service_cols = st.columns((1, 1, 1))
                     service_date_default = purchase_date or datetime.now().date()
                     with service_cols[0]:
@@ -16238,6 +16305,10 @@ def customers_page(conn):
                     service_receipt = st.session_state.get("new_customer_service_receipt")
 
                 if create_maintenance:
+                    maintenance_reference = _ensure_auto_reference(
+                        "new_customer_auto_maintenance_reference", "MT"
+                    )
+                    st.caption(f"Maintenance reference: {maintenance_reference}")
                     maintenance_cols = st.columns((1, 1, 1))
                     maintenance_date_default = purchase_date or datetime.now().date()
                     with maintenance_cols[0]:
@@ -16292,10 +16363,20 @@ def customers_page(conn):
                     errors.append("Customer name is required before saving.")
                 if not clean_text(phone):
                     errors.append("Phone number is required and must be unique.")
-                do_serial = clean_text(do_code)
-                work_done_serial = clean_text(work_done_number)
+                if create_delivery_order and not do_serial:
+                    do_serial = _ensure_auto_reference("new_customer_auto_do_code", "DO")
                 if create_work_done and not work_done_serial:
-                    errors.append("Work done number is required when creating a record.")
+                    work_done_serial = _ensure_auto_reference(
+                        "new_customer_auto_work_done_number", "WD"
+                    )
+                if create_service and not service_reference:
+                    service_reference = _ensure_auto_reference(
+                        "new_customer_auto_service_reference", "SV"
+                    )
+                if create_maintenance and not maintenance_reference:
+                    maintenance_reference = _ensure_auto_reference(
+                        "new_customer_auto_maintenance_reference", "MT"
+                    )
                 if create_service and not clean_text(service_description):
                     errors.append("Add a short service description to create the service record.")
                 if create_maintenance and not clean_text(maintenance_description):
@@ -16426,7 +16507,9 @@ def customers_page(conn):
                             (cid, pid, prod.get("serial"), issue, expiry, remarks_val),
                         )
                     conn.commit()
-                if do_serial and create_delivery_order:
+                if create_delivery_order:
+                    if not do_serial:
+                        do_serial = _ensure_auto_reference("new_customer_auto_do_code", "DO")
                     stored_path = None
                     do_receipt_path = None
                     cur = conn.cursor()
@@ -16543,7 +16626,11 @@ def customers_page(conn):
                             ),
                         )
                         conn.commit()
-                if create_work_done and work_done_serial:
+                if create_work_done:
+                    if not work_done_serial:
+                        work_done_serial = _ensure_auto_reference(
+                            "new_customer_auto_work_done_number", "WD"
+                        )
                     if not product_items:
                         st.warning(
                             "Add at least one product row before creating a work done record."
@@ -16720,7 +16807,11 @@ def customers_page(conn):
                     service_date_str = to_iso_date(service_date_input) or purchase_str
                     if not service_date_str:
                         service_date_str = datetime.utcnow().strftime("%Y-%m-%d")
-                    service_reference = clean_text(service_reference) or do_serial
+                    service_reference = clean_text(service_reference)
+                    if not service_reference:
+                        service_reference = _ensure_auto_reference(
+                            "new_customer_auto_service_reference", "SV"
+                        )
                     service_status_value = clean_text(service_status) or "pending"
                     if service_status_value not in {"pending", "paid"}:
                         service_status_value = "pending"
@@ -16782,7 +16873,11 @@ def customers_page(conn):
                     maintenance_date_str = to_iso_date(maintenance_date_input) or purchase_str
                     if not maintenance_date_str:
                         maintenance_date_str = datetime.utcnow().strftime("%Y-%m-%d")
-                    maintenance_reference = clean_text(maintenance_reference) or do_serial
+                    maintenance_reference = clean_text(maintenance_reference)
+                    if not maintenance_reference:
+                        maintenance_reference = _ensure_auto_reference(
+                            "new_customer_auto_maintenance_reference", "MT"
+                        )
                     maintenance_status_value = clean_text(maintenance_status) or "pending"
                     if maintenance_status_value not in {"pending", "paid"}:
                         maintenance_status_value = "pending"
@@ -20066,8 +20161,16 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 default_value = 0.0 if column != "description" else ""
                 items_df[column] = default_value
         items_df = items_df[["description", "quantity", "rate", "total_price"]]
+        items_df["total_price"] = items_df.apply(
+            lambda row: max(
+                _coerce_float(row.get("quantity"), 0.0)
+                * _coerce_float(row.get("rate"), 0.0),
+                0.0,
+            ),
+            axis=1,
+        )
         edited_df = safe_data_editor(
-            items_df.drop(columns=["total_price"], errors="ignore"),
+            items_df,
             hide_index=True,
             num_rows="dynamic",
             use_container_width=True,
@@ -20082,9 +20185,21 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 "rate": st.column_config.NumberColumn(
                     "Unit Price, Tk.", min_value=0.0, step=100.0, format="%.2f"
                 ),
+                "total_price": st.column_config.NumberColumn(
+                    "Price (Tk.)", min_value=0.0, step=100.0, format="%.2f"
+                ),
             },
+            disabled=["total_price"],
         )
         if isinstance(edited_df, pd.DataFrame):
+            edited_df["total_price"] = edited_df.apply(
+                lambda row: max(
+                    _coerce_float(row.get("quantity"), 0.0)
+                    * _coerce_float(row.get("rate"), 0.0),
+                    0.0,
+                ),
+                axis=1,
+            )
             st.session_state["quotation_item_rows"] = (
                 edited_df.fillna("").to_dict("records")
             )
