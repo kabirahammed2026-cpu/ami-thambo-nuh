@@ -6284,10 +6284,23 @@ def render_admin_filters() -> None:
     df["delivery_order_date"] = pd.to_datetime(df["delivery_order_date"], errors="coerce")
     df["payment_date"] = pd.to_datetime(df["payment_date"], errors="coerce")
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    df["work_type"] = df.apply(
+        lambda row: (
+            "Service work"
+            if row.get("source_type") == "work_order"
+            or pd.notna(row.get("work_order_id"))
+            else "Sales work"
+        ),
+        axis=1,
+    )
     quote_min = df["quote_date"].dropna().min()
     quote_max = df["quote_date"].dropna().max()
     follow_min = df["follow_up_date"].dropna().min()
     follow_max = df["follow_up_date"].dropna().max()
+    work_min = df["work_order_date"].dropna().min()
+    work_max = df["work_order_date"].dropna().max()
+    delivery_min = df["delivery_order_date"].dropna().min()
+    delivery_max = df["delivery_order_date"].dropna().max()
 
     with st.expander("Filters", expanded=True):
         first_row = st.columns(3)
@@ -6330,6 +6343,12 @@ def render_admin_filters() -> None:
         source_filter = third_row[2].multiselect(
             "Delivery order source",
             sorted(df["source_type"].dropna().unique().tolist()),
+        )
+
+        work_type_filter = st.multiselect(
+            "Work type",
+            ["Sales work", "Service work"],
+            help="Filter records between sales work and service work.",
         )
 
         fourth_row = st.columns(3)
@@ -6423,6 +6442,74 @@ def render_admin_filters() -> None:
         if not follow_end_enabled:
             follow_end = None
 
+        work_date_row = st.columns(2)
+        work_start_enabled = work_date_row[0].checkbox(
+            "Enable work order start",
+            key="admin_work_order_start_enabled",
+        )
+        work_start_seed = work_min.date() if pd.notna(work_min) else date.today()
+        with work_date_row[0]:
+            work_start = render_human_date_input(
+                "Work order start",
+                value=work_start_seed,
+                key="admin_work_order_start_date",
+                disabled=not work_start_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
+        if not work_start_enabled:
+            work_start = None
+
+        work_end_enabled = work_date_row[1].checkbox(
+            "Enable work order end",
+            key="admin_work_order_end_enabled",
+        )
+        work_end_seed = work_max.date() if pd.notna(work_max) else date.today()
+        with work_date_row[1]:
+            work_end = render_human_date_input(
+                "Work order end",
+                value=work_end_seed,
+                key="admin_work_order_end_date",
+                disabled=not work_end_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
+        if not work_end_enabled:
+            work_end = None
+
+        delivery_date_row = st.columns(2)
+        delivery_start_enabled = delivery_date_row[0].checkbox(
+            "Enable delivery order start",
+            key="admin_delivery_order_start_enabled",
+        )
+        delivery_start_seed = (
+            delivery_min.date() if pd.notna(delivery_min) else date.today()
+        )
+        with delivery_date_row[0]:
+            delivery_start = render_human_date_input(
+                "Delivery order start",
+                value=delivery_start_seed,
+                key="admin_delivery_order_start_date",
+                disabled=not delivery_start_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
+        if not delivery_start_enabled:
+            delivery_start = None
+
+        delivery_end_enabled = delivery_date_row[1].checkbox(
+            "Enable delivery order end",
+            key="admin_delivery_order_end_enabled",
+        )
+        delivery_end_seed = delivery_max.date() if pd.notna(delivery_max) else date.today()
+        with delivery_date_row[1]:
+            delivery_end = render_human_date_input(
+                "Delivery order end",
+                value=delivery_end_seed,
+                key="admin_delivery_order_end_date",
+                disabled=not delivery_end_enabled,
+                help="Enter a date like YYYY-MM-DD.",
+            )
+        if not delivery_end_enabled:
+            delivery_end = None
+
         search_text = st.text_input(
             "Search text",
             help="Filter by company name, notes, delivery order number or third-party name.",
@@ -6444,6 +6531,8 @@ def render_admin_filters() -> None:
         filtered = filtered[filtered["company"].isin(company_filter)]
     if source_filter:
         filtered = filtered[filtered["source_type"].isin(source_filter)]
+    if work_type_filter:
+        filtered = filtered[filtered["work_type"].isin(work_type_filter)]
     if payment_state != "All":
         expected = 1 if payment_state == "Received" else 0
         filtered = filtered[filtered["payment_received"].fillna(0) == expected]
@@ -6471,6 +6560,26 @@ def render_admin_filters() -> None:
         filtered = filtered[
             filtered["follow_up_date"].notna()
             & (filtered["follow_up_date"] <= pd.Timestamp(follow_end))
+        ]
+    if work_start:
+        filtered = filtered[
+            filtered["work_order_date"].notna()
+            & (filtered["work_order_date"] >= pd.Timestamp(work_start))
+        ]
+    if work_end:
+        filtered = filtered[
+            filtered["work_order_date"].notna()
+            & (filtered["work_order_date"] <= pd.Timestamp(work_end))
+        ]
+    if delivery_start:
+        filtered = filtered[
+            filtered["delivery_order_date"].notna()
+            & (filtered["delivery_order_date"] >= pd.Timestamp(delivery_start))
+        ]
+    if delivery_end:
+        filtered = filtered[
+            filtered["delivery_order_date"].notna()
+            & (filtered["delivery_order_date"] <= pd.Timestamp(delivery_end))
         ]
     if search_text:
         filtered = filtered[
