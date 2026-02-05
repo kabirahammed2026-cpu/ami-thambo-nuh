@@ -12045,6 +12045,9 @@ def dashboard(conn):
                 "recent_work_pdf",
             )
 
+    if not is_admin:
+        return
+
     st.markdown("---")
     st.subheader("👥 Team work overview")
     st.caption(
