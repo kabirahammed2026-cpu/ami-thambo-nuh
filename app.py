@@ -10593,6 +10593,7 @@ def dashboard(conn):
                    d.description,
                    d.total_amount,
                    d.status,
+                   d.delivery_date,
                    d.created_at,
                    COALESCE(c.name, '(customer)') AS customer,
                    c.company_name AS company
@@ -10680,17 +10681,23 @@ def dashboard(conn):
                 or "—",
                 axis=1,
             )
-            staff_sales_df["Sales date"] = pd.to_datetime(
-                staff_sales_df["created_at"], errors="coerce"
-            ).dt.date
+            staff_sales_df["Sales date"] = staff_sales_df.apply(
+                lambda row: (
+                    clean_text(row.get("delivery_date"))
+                    if clean_text(row.get("record_type")) == "delivery_order"
+                    else (clean_text(row.get("delivery_date")) or clean_text(row.get("created_at")))
+                ),
+                axis=1,
+            )
+            staff_sales_df = fmt_dates(staff_sales_df, ["Sales date"])
             staff_sales_df["When"] = staff_sales_df["created_at"].apply(
                 lambda value: format_time_ago(value) or format_period_range(value, value)
             )
             staff_sales_df["Total (BDT)"] = staff_sales_df["total_amount"].apply(format_sales_amount)
             staff_sales_df["Status"] = staff_sales_df["status"].apply(_format_payment_label)
             staff_sales_df["sort_date"] = pd.to_datetime(
-                staff_sales_df["created_at"], errors="coerce"
-            )
+                staff_sales_df["delivery_date"], errors="coerce"
+            ).fillna(pd.to_datetime(staff_sales_df["created_at"], errors="coerce"))
             sales_frames.append(
                 staff_sales_df[
                     [
@@ -11945,10 +11952,7 @@ def dashboard(conn):
         if recent_delivery_orders.empty:
             st.info("No recent delivery orders found.")
         else:
-            recent_delivery_orders["sale_date"] = recent_delivery_orders.apply(
-                lambda row: clean_text(row.get("delivery_date")) or clean_text(row.get("created_at")),
-                axis=1,
-            )
+            recent_delivery_orders["sale_date"] = recent_delivery_orders["delivery_date"]
             recent_delivery_orders = fmt_dates(recent_delivery_orders, ["sale_date"])
             recent_delivery_orders["total_amount"] = recent_delivery_orders[
                 "total_amount"
@@ -11960,7 +11964,7 @@ def dashboard(conn):
                 recent_delivery_orders.rename(
                 columns={
                     "do_number": "DO Serial",
-                    "sale_date": "Sale date",
+                    "sale_date": "Delivery date",
                     "status": "Status",
                     "total_amount": "Total",
                     "customer": "Customer",
@@ -21618,6 +21622,29 @@ def advanced_search_page(conn):
     elif history_range:
         history_start = to_iso_date(history_range)
         history_end = history_start
+    history_event_options = [
+        "quotation",
+        "delivery_order",
+        "work_done",
+        "service",
+        "maintenance",
+        "report",
+        "customer",
+        "user",
+    ]
+    selected_history_events = st.multiselect(
+        "Record types in history",
+        history_event_options,
+        default=history_event_options,
+        key="advanced_search_history_event_types",
+        help="Filter activity timeline by record type.",
+    )
+    history_keyword = st.text_input(
+        "History keyword",
+        key="advanced_search_history_keyword",
+        help="Search inside activity details and event names.",
+    )
+
     history_filters = ["a.user_id = ?"]
     history_params: list[object] = [int(history_staff)]
     if history_start:
@@ -21626,6 +21653,10 @@ def advanced_search_page(conn):
     if history_end:
         history_filters.append("date(a.created_at) <= date(?)")
         history_params.append(history_end)
+    if selected_history_events:
+        placeholders = ",".join(["?"] * len(selected_history_events))
+        history_filters.append(f"LOWER(COALESCE(a.entity_type, '')) IN ({placeholders})")
+        history_params.extend([clean_text(v).lower() for v in selected_history_events])
     history_clause = " AND ".join(history_filters)
     history_df = df_query(
         conn,
@@ -21643,6 +21674,22 @@ def advanced_search_page(conn):
         ),
         tuple(history_params),
     )
+    if not history_df.empty and history_keyword:
+        keyword = history_keyword.strip().lower()
+        if keyword:
+            history_df = history_df[
+                history_df.apply(
+                    lambda row: keyword in " ".join(
+                        [
+                            clean_text(row.get("event_type")) or "",
+                            clean_text(row.get("entity_type")) or "",
+                            clean_text(row.get("description")) or "",
+                        ]
+                    ).lower(),
+                    axis=1,
+                )
+            ]
+
     if history_df.empty:
         st.caption("No activity history found for the selected staff member.")
     else:
@@ -25060,7 +25107,20 @@ def duplicates_page(conn):
     )
     duplicate_customers = pd.DataFrame()
     if not cust_raw.empty:
-        duplicate_customers = cust_raw[cust_raw["dup_flag"] == 1].copy()
+        cust_raw = cust_raw.copy()
+        cust_raw["__phone_key"] = cust_raw["phone"].apply(_normalize_phone_key)
+        phone_counts = (
+            cust_raw[cust_raw["__phone_key"].notna()]
+            .groupby("__phone_key")["id"]
+            .count()
+            .to_dict()
+        )
+        cust_raw["__live_dup_flag"] = cust_raw["__phone_key"].apply(
+            lambda key: 1 if key and phone_counts.get(key, 0) > 1 else 0
+        )
+        duplicate_customers = cust_raw[
+            (cust_raw["dup_flag"] == 1) | (cust_raw["__live_dup_flag"] == 1)
+        ].copy()
     if duplicate_customers.empty:
         st.success("No customer duplicates detected at the moment.")
     else:
@@ -27987,7 +28047,6 @@ def reports_page(conn):
                       AND date(wr.period_start) >= date(?)
                       AND date(wr.period_start) <= date(?)
                       AND LOWER(COALESCE(wr.report_template, '')) = 'service'
-                      AND LOWER(COALESCE(u.staff_classification, 'service')) = 'service'
                     ORDER BY date(wr.period_start) DESC, wr.report_id DESC
                     """
                 ),
@@ -28040,7 +28099,6 @@ def reports_page(conn):
                       AND date(d.created_at) >= date(?)
                       AND date(d.created_at) <= date(?)
                       AND COALESCE(d.record_type, 'delivery_order') IN ('delivery_order', 'work_done')
-                      AND LOWER(COALESCE(u.staff_classification, 'sales')) = 'sales'
                     ORDER BY datetime(d.created_at) DESC, d.do_number DESC
                     """
                 ),
