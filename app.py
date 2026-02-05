@@ -2525,6 +2525,11 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
         row = conn.execute(query, tuple(params)).fetchone()
         return float(row[0] or 0)
 
+    delivery_date_expr = "COALESCE(date(d.delivery_date), date(d.created_at))"
+    quote_date_expr = "COALESCE(date(q.quote_date), date(q.created_at))"
+    service_date_expr = "COALESCE(date(s.service_start_date), date(s.service_date), date(s.updated_at))"
+    maintenance_date_expr = "COALESCE(date(m.maintenance_start_date), date(m.maintenance_date), date(m.updated_at))"
+
     def _sum_all(
         delivery_clause: str,
         quote_clause: str,
@@ -2539,22 +2544,22 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
 
     return {
         "daily": _sum_all(
-            "date(d.created_at) = date('now')",
-            "date(q.created_at) = date('now')",
-            "date(s.updated_at) = date('now')",
-            "date(m.updated_at) = date('now')",
+            f"{delivery_date_expr} = date('now')",
+            f"{quote_date_expr} = date('now')",
+            f"{service_date_expr} = date('now')",
+            f"{maintenance_date_expr} = date('now')",
         ),
         "weekly": _sum_all(
-            "date(d.created_at) >= date('now', '-6 day')",
-            "date(q.created_at) >= date('now', '-6 day')",
-            "date(s.updated_at) >= date('now', '-6 day')",
-            "date(m.updated_at) >= date('now', '-6 day')",
+            f"{delivery_date_expr} >= date('now', '-6 day')",
+            f"{quote_date_expr} >= date('now', '-6 day')",
+            f"{service_date_expr} >= date('now', '-6 day')",
+            f"{maintenance_date_expr} >= date('now', '-6 day')",
         ),
         "monthly": _sum_all(
-            "strftime('%Y-%m', d.created_at) = strftime('%Y-%m', 'now')",
-            "strftime('%Y-%m', q.created_at) = strftime('%Y-%m', 'now')",
-            "strftime('%Y-%m', s.updated_at) = strftime('%Y-%m', 'now')",
-            "strftime('%Y-%m', m.updated_at) = strftime('%Y-%m', 'now')",
+            f"strftime('%Y-%m', {delivery_date_expr}) = strftime('%Y-%m', 'now')",
+            f"strftime('%Y-%m', {quote_date_expr}) = strftime('%Y-%m', 'now')",
+            f"strftime('%Y-%m', {service_date_expr}) = strftime('%Y-%m', 'now')",
+            f"strftime('%Y-%m', {maintenance_date_expr}) = strftime('%Y-%m', 'now')",
         ),
     }
 
@@ -12038,6 +12043,201 @@ def dashboard(conn):
                 "Work order",
                 recent_work_orders,
                 "recent_work_pdf",
+            )
+
+    st.markdown("---")
+    st.subheader("👥 Team work overview")
+    st.caption(
+        "Track service and sales workload by staff across a custom date window."
+    )
+
+    date_filter_cols = st.columns((1, 1, 2))
+    default_end_date = datetime.now().date()
+    default_start_date = default_end_date - timedelta(days=30)
+    with date_filter_cols[0]:
+        team_from_date = st.date_input(
+            "From date",
+            value=default_start_date,
+            key="dashboard_team_from_date",
+        )
+    with date_filter_cols[1]:
+        team_to_date = st.date_input(
+            "To date",
+            value=default_end_date,
+            key="dashboard_team_to_date",
+        )
+
+    if team_from_date > team_to_date:
+        st.warning("From date cannot be after To date.")
+        return
+
+    from_iso = team_from_date.isoformat()
+    to_iso = team_to_date.isoformat()
+
+    team_tab_service, team_tab_sales = st.tabs(
+        ["Service staff works", "Sales staff works"]
+    )
+
+    with team_tab_service:
+        service_staff_summary = df_query(
+            conn,
+            """
+            WITH service_activity AS (
+                SELECT s.created_by AS staff_id,
+                       COALESCE(date(s.service_start_date), date(s.service_date), date(s.updated_at)) AS work_date,
+                       COALESCE(s.status, '') AS work_status,
+                       COALESCE(s.bill_amount, 0) AS amount,
+                       s.customer_id,
+                       d.customer_id AS do_customer_id
+                FROM services s
+                LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+                WHERE s.deleted_at IS NULL
+                UNION ALL
+                SELECT m.created_by AS staff_id,
+                       COALESCE(date(m.maintenance_start_date), date(m.maintenance_date), date(m.updated_at)) AS work_date,
+                       COALESCE(m.status, '') AS work_status,
+                       COALESCE(m.total_amount, 0) AS amount,
+                       m.customer_id,
+                       d.customer_id AS do_customer_id
+                FROM maintenance_records m
+                LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+                WHERE m.deleted_at IS NULL
+            )
+            SELECT COALESCE(u.username, 'Unassigned') AS staff,
+                   COUNT(*) AS total_tasks,
+                   SUM(CASE WHEN LOWER(work_status) = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
+                   SUM(CASE WHEN LOWER(work_status) != 'completed' THEN 1 ELSE 0 END) AS pending_tasks,
+                   ROUND(SUM(amount), 2) AS billed_amount
+            FROM service_activity sa
+            LEFT JOIN users u ON u.user_id = sa.staff_id
+            WHERE sa.work_date IS NOT NULL
+              AND date(sa.work_date) BETWEEN date(?) AND date(?)
+            GROUP BY COALESCE(u.username, 'Unassigned')
+            ORDER BY total_tasks DESC, staff ASC
+            """,
+            (from_iso, to_iso),
+        )
+
+        if allowed_customers and not service_staff_summary.empty:
+            scoped_service_activity = df_query(
+                conn,
+                """
+                WITH service_activity AS (
+                    SELECT s.created_by AS staff_id,
+                           COALESCE(date(s.service_start_date), date(s.service_date), date(s.updated_at)) AS work_date,
+                           COALESCE(s.status, '') AS work_status,
+                           COALESCE(s.bill_amount, 0) AS amount,
+                           s.customer_id,
+                           d.customer_id AS do_customer_id
+                    FROM services s
+                    LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+                    WHERE s.deleted_at IS NULL
+                    UNION ALL
+                    SELECT m.created_by AS staff_id,
+                           COALESCE(date(m.maintenance_start_date), date(m.maintenance_date), date(m.updated_at)) AS work_date,
+                           COALESCE(m.status, '') AS work_status,
+                           COALESCE(m.total_amount, 0) AS amount,
+                           m.customer_id,
+                           d.customer_id AS do_customer_id
+                    FROM maintenance_records m
+                    LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+                    WHERE m.deleted_at IS NULL
+                )
+                SELECT COALESCE(u.username, 'Unassigned') AS staff,
+                       COUNT(*) AS total_tasks,
+                       SUM(CASE WHEN LOWER(work_status) = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
+                       SUM(CASE WHEN LOWER(work_status) != 'completed' THEN 1 ELSE 0 END) AS pending_tasks,
+                       ROUND(SUM(amount), 2) AS billed_amount
+                FROM service_activity sa
+                LEFT JOIN users u ON u.user_id = sa.staff_id
+                WHERE sa.work_date IS NOT NULL
+                  AND date(sa.work_date) BETWEEN date(?) AND date(?)
+                  AND (
+                    sa.customer_id IN ({placeholders})
+                    OR sa.do_customer_id IN ({placeholders})
+                  )
+                GROUP BY COALESCE(u.username, 'Unassigned')
+                ORDER BY total_tasks DESC, staff ASC
+                """.format(placeholders=",".join(["?"] * len(allowed_customers))),
+                (from_iso, to_iso, *allowed_customers, *allowed_customers),
+            )
+            service_staff_summary = scoped_service_activity
+
+        if service_staff_summary.empty:
+            st.info("No service staff activity found in the selected date range.")
+        else:
+            service_staff_summary["billed_amount"] = service_staff_summary[
+                "billed_amount"
+            ].apply(lambda value: format_money(value) or format_number(value))
+            st.dataframe(
+                service_staff_summary.rename(
+                    columns={
+                        "staff": "Staff",
+                        "total_tasks": "Total tasks",
+                        "completed_tasks": "Completed",
+                        "pending_tasks": "Pending",
+                        "billed_amount": "Billed",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with team_tab_sales:
+        sales_staff_summary = df_query(
+            conn,
+            """
+            SELECT COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned') AS staff,
+                   COUNT(*) AS total_orders,
+                   SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
+                   SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
+                   ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value
+            FROM delivery_orders d
+            WHERE d.deleted_at IS NULL
+              AND COALESCE(date(d.delivery_date), date(d.created_at)) BETWEEN date(?) AND date(?)
+            GROUP BY COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned')
+            ORDER BY total_orders DESC, staff ASC
+            """,
+            (from_iso, to_iso),
+        )
+
+        if allowed_customers and not sales_staff_summary.empty:
+            sales_staff_summary = df_query(
+                conn,
+                """
+                SELECT COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned') AS staff,
+                       COUNT(*) AS total_orders,
+                       SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
+                       SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
+                       ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value
+                FROM delivery_orders d
+                WHERE d.deleted_at IS NULL
+                  AND COALESCE(date(d.delivery_date), date(d.created_at)) BETWEEN date(?) AND date(?)
+                  AND d.customer_id IN ({placeholders})
+                GROUP BY COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned')
+                ORDER BY total_orders DESC, staff ASC
+                """.format(placeholders=",".join(["?"] * len(allowed_customers))),
+                (from_iso, to_iso, *allowed_customers),
+            )
+
+        if sales_staff_summary.empty:
+            st.info("No sales staff activity found in the selected date range.")
+        else:
+            sales_staff_summary["total_value"] = sales_staff_summary["total_value"].apply(
+                lambda value: format_money(value) or format_number(value)
+            )
+            st.dataframe(
+                sales_staff_summary.rename(
+                    columns={
+                        "staff": "Staff",
+                        "total_orders": "Total orders",
+                        "delivery_orders": "Delivery orders",
+                        "work_orders": "Work orders",
+                        "total_value": "Order value",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
             )
 
 def show_expiry_notifications(conn):
