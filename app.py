@@ -12110,7 +12110,7 @@ def dashboard(conn):
                 LEFT JOIN delivery_orders d ON d.do_number = m.do_number
                 WHERE m.deleted_at IS NULL
             )
-            SELECT COALESCE(u.username, 'Unassigned') AS staff,
+            SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
                    COUNT(*) AS total_tasks,
                    SUM(CASE WHEN LOWER(work_status) = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
                    SUM(CASE WHEN LOWER(work_status) != 'completed' THEN 1 ELSE 0 END) AS pending_tasks,
@@ -12119,7 +12119,8 @@ def dashboard(conn):
             LEFT JOIN users u ON u.user_id = sa.staff_id
             WHERE sa.work_date IS NOT NULL
               AND date(sa.work_date) BETWEEN date(?) AND date(?)
-            GROUP BY COALESCE(u.username, 'Unassigned')
+              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'service')
+            GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
             ORDER BY total_tasks DESC, staff ASC
             """,
             (from_iso, to_iso),
@@ -12150,7 +12151,7 @@ def dashboard(conn):
                     LEFT JOIN delivery_orders d ON d.do_number = m.do_number
                     WHERE m.deleted_at IS NULL
                 )
-                SELECT COALESCE(u.username, 'Unassigned') AS staff,
+                SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
                        COUNT(*) AS total_tasks,
                        SUM(CASE WHEN LOWER(work_status) = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
                        SUM(CASE WHEN LOWER(work_status) != 'completed' THEN 1 ELSE 0 END) AS pending_tasks,
@@ -12163,7 +12164,8 @@ def dashboard(conn):
                     sa.customer_id IN ({placeholders})
                     OR sa.do_customer_id IN ({placeholders})
                   )
-                GROUP BY COALESCE(u.username, 'Unassigned')
+                  AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'service')
+                GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
                 ORDER BY total_tasks DESC, staff ASC
                 """.format(placeholders=",".join(["?"] * len(allowed_customers))),
                 (from_iso, to_iso, *allowed_customers, *allowed_customers),
@@ -12194,15 +12196,29 @@ def dashboard(conn):
         sales_staff_summary = df_query(
             conn,
             """
-            SELECT COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned') AS staff,
+            SELECT COALESCE(
+                       NULLIF(TRIM(u.username), ''),
+                       NULLIF(TRIM(up.username), ''),
+                       NULLIF(TRIM(d.sales_person), ''),
+                       'Unassigned'
+                   ) AS staff,
                    COUNT(*) AS total_orders,
                    SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
                    SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
                    ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value
             FROM delivery_orders d
+            LEFT JOIN users u ON u.user_id = d.created_by
+            LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
             WHERE d.deleted_at IS NULL
               AND COALESCE(date(d.delivery_date), date(d.created_at)) BETWEEN date(?) AND date(?)
-            GROUP BY COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned')
+              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
+              AND (up.staff_classification IS NULL OR LOWER(up.staff_classification) = 'sales')
+            GROUP BY COALESCE(
+                NULLIF(TRIM(u.username), ''),
+                NULLIF(TRIM(up.username), ''),
+                NULLIF(TRIM(d.sales_person), ''),
+                'Unassigned'
+            )
             ORDER BY total_orders DESC, staff ASC
             """,
             (from_iso, to_iso),
@@ -12212,16 +12228,30 @@ def dashboard(conn):
             sales_staff_summary = df_query(
                 conn,
                 """
-                SELECT COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned') AS staff,
+                SELECT COALESCE(
+                           NULLIF(TRIM(u.username), ''),
+                           NULLIF(TRIM(up.username), ''),
+                           NULLIF(TRIM(d.sales_person), ''),
+                           'Unassigned'
+                       ) AS staff,
                        COUNT(*) AS total_orders,
                        SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
                        SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
                        ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value
                 FROM delivery_orders d
+                LEFT JOIN users u ON u.user_id = d.created_by
+                LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
                 WHERE d.deleted_at IS NULL
                   AND COALESCE(date(d.delivery_date), date(d.created_at)) BETWEEN date(?) AND date(?)
                   AND d.customer_id IN ({placeholders})
-                GROUP BY COALESCE(NULLIF(TRIM(d.sales_person), ''), 'Unassigned')
+                  AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
+                  AND (up.staff_classification IS NULL OR LOWER(up.staff_classification) = 'sales')
+                GROUP BY COALESCE(
+                    NULLIF(TRIM(u.username), ''),
+                    NULLIF(TRIM(up.username), ''),
+                    NULLIF(TRIM(d.sales_person), ''),
+                    'Unassigned'
+                )
                 ORDER BY total_orders DESC, staff ASC
                 """.format(placeholders=",".join(["?"] * len(allowed_customers))),
                 (from_iso, to_iso, *allowed_customers),
@@ -12246,6 +12276,122 @@ def dashboard(conn):
                 use_container_width=True,
                 hide_index=True,
             )
+
+    st.markdown("### Staff activity history")
+    staff_df = df_query(conn, "SELECT user_id, username FROM users ORDER BY LOWER(username)")
+    staff_map = {
+        int(row["user_id"]): clean_text(row.get("username")) or "Team member"
+        for _, row in staff_df.iterrows()
+    }
+    staff_choices = list(staff_map.keys())
+    if not staff_choices:
+        st.caption("No staff accounts available for activity history.")
+        return
+    history_staff = st.selectbox(
+        "Team member",
+        staff_choices,
+        format_func=lambda uid: staff_map.get(uid, "Team member"),
+        key="dashboard_team_history_staff",
+    )
+    history_range = render_flexible_date_range(
+        "History range",
+        start_value=team_from_date,
+        end_value=team_to_date,
+        key_prefix="dashboard_team_history_range",
+        help="Filter history entries by date.",
+    )
+    history_start = history_end = None
+    if isinstance(history_range, (list, tuple)) and len(history_range) == 2:
+        history_start = to_iso_date(history_range[0])
+        history_end = to_iso_date(history_range[1])
+    elif history_range:
+        history_start = to_iso_date(history_range)
+        history_end = history_start
+    history_event_options = [
+        "quotation",
+        "delivery_order",
+        "work_done",
+        "service",
+        "maintenance",
+        "report",
+        "customer",
+        "user",
+    ]
+    selected_history_events = st.multiselect(
+        "Record types in history",
+        history_event_options,
+        default=history_event_options,
+        key="dashboard_team_history_event_types",
+        help="Filter activity timeline by record type.",
+    )
+    history_keyword = st.text_input(
+        "History keyword",
+        key="dashboard_team_history_keyword",
+        help="Search inside activity details and event names.",
+    )
+
+    history_filters = ["a.user_id = ?"]
+    history_params: list[object] = [int(history_staff)]
+    if history_start:
+        history_filters.append("date(a.created_at) >= date(?)")
+        history_params.append(history_start)
+    if history_end:
+        history_filters.append("date(a.created_at) <= date(?)")
+        history_params.append(history_end)
+    if selected_history_events:
+        placeholders = ",".join(["?"] * len(selected_history_events))
+        history_filters.append(f"LOWER(COALESCE(a.entity_type, '')) IN ({placeholders})")
+        history_params.extend([clean_text(v).lower() for v in selected_history_events])
+    history_clause = " AND ".join(history_filters)
+    history_df = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT a.created_at,
+                   a.event_type,
+                   a.entity_type,
+                   a.description
+            FROM activity_log a
+            WHERE {history_clause}
+            ORDER BY datetime(a.created_at) DESC, a.activity_id DESC
+            LIMIT 250
+            """
+        ),
+        tuple(history_params),
+    )
+    if not history_df.empty and history_keyword:
+        keyword = history_keyword.strip().lower()
+        if keyword:
+            history_df = history_df[
+                history_df.apply(
+                    lambda row: keyword in " ".join(
+                        [
+                            clean_text(row.get("event_type")) or "",
+                            clean_text(row.get("entity_type")) or "",
+                            clean_text(row.get("description")) or "",
+                        ]
+                    ).lower(),
+                    axis=1,
+                )
+            ]
+
+    if history_df.empty:
+        st.caption("No activity history found for the selected staff member.")
+    else:
+        history_df = fmt_dates(history_df, ["created_at"])
+        history_df = history_df.rename(
+            columns={
+                "created_at": "When",
+                "event_type": "Activity",
+                "entity_type": "Type",
+                "description": "Details",
+            }
+        )
+        st.dataframe(
+            history_df[["When", "Activity", "Type", "Details"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 def show_expiry_notifications(conn):
     is_admin = current_user_is_admin()
