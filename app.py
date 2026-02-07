@@ -9244,6 +9244,11 @@ def init_ui():
     )
 # ---------- Auth ----------
 SESSION_TOKEN_PARAM = "session"
+ALLOW_SESSION_PARAM = os.getenv("PS_CRM_ALLOW_SESSION_PARAM", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 DEEP_LINK_PAGE_PARAM = "page"
 DEEP_LINK_TAB_PARAM = "tab"
 DEEP_LINK_ID_PARAM = "id"
@@ -9263,6 +9268,8 @@ SESSION_DURATION_DAYS = _session_duration_days()
 
 
 def _get_session_token_from_url() -> Optional[str]:
+    if not ALLOW_SESSION_PARAM:
+        return None
     params = st.query_params
     token_values = params.get(SESSION_TOKEN_PARAM, [])
     if isinstance(token_values, list):
@@ -9271,10 +9278,15 @@ def _get_session_token_from_url() -> Optional[str]:
 
 
 def _set_session_token_in_url(token: Optional[str]) -> None:
+    if not ALLOW_SESSION_PARAM:
+        if SESSION_TOKEN_PARAM in st.query_params:
+            del st.query_params[SESSION_TOKEN_PARAM]
+        return
     if token:
         st.query_params[SESSION_TOKEN_PARAM] = token
-    else:
-        st.query_params.clear()
+        return
+    if SESSION_TOKEN_PARAM in st.query_params:
+        del st.query_params[SESSION_TOKEN_PARAM]
 
 
 def _read_query_param(params: dict, key: str) -> Optional[str]:
@@ -9295,7 +9307,7 @@ def _build_deep_link_url(
         DEEP_LINK_PAGE_PARAM: page,
     }
     token = st.session_state.get("session_token")
-    if token:
+    if token and ALLOW_SESSION_PARAM:
         payload[SESSION_TOKEN_PARAM] = token
     if tab:
         payload[DEEP_LINK_TAB_PARAM] = tab
