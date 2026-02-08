@@ -95,7 +95,9 @@ FOLLOW_UP_SUGGESTIONS: Dict[str, Optional[int]] = {
 }
 DEFAULT_FOLLOW_UP_CHOICE = "In 3 days"
 INPUT_DATE_FMT = "%Y-%m-%d"
+FOLLOW_UP_DATE_FMT = "%d.%m.%Y"
 DATE_INPUT_PLACEHOLDER = "YYYY-MM-DD or 'tomorrow', 'next friday', 'in 3 days'"
+FOLLOW_UP_INPUT_PLACEHOLDER = "DD.MM.YYYY"
 DEFAULT_REMINDER_TIME = dt_time(9, 0)
 
 
@@ -694,6 +696,13 @@ def parse_human_reminder(value: Any) -> Optional[datetime]:
     return parsed
 
 
+def format_follow_up_date(value: Any) -> str:
+    parsed = parse_human_date(value)
+    if parsed is None:
+        return _clean_text(value) if value is not None else ""
+    return parsed.strftime(FOLLOW_UP_DATE_FMT)
+
+
 def render_human_date_input(
     label: str,
     *,
@@ -702,6 +711,8 @@ def render_human_date_input(
     help: Optional[str] = None,
     disabled: bool = False,
     placeholder: str = DATE_INPUT_PLACEHOLDER,
+    format_hint: str = "YYYY-MM-DD",
+    allow_natural_language: bool = True,
 ) -> Optional[date]:
     parsed_seed = parse_human_date(value)
     default_text = (
@@ -726,9 +737,12 @@ def render_human_date_input(
     parsed = parse_human_date(text)
     if parsed is None:
         if text:
-            st.error(
-                "Enter a valid date such as YYYY-MM-DD, 'tomorrow', 'next friday', or 'in 3 days'."
-            )
+            if allow_natural_language:
+                st.error(
+                    f"Enter a valid date such as {format_hint}, 'tomorrow', 'next friday', or 'in 3 days'."
+                )
+            else:
+                st.error(f"Enter a valid date such as {format_hint}.")
         return None
     normalized = parsed.strftime(INPUT_DATE_FMT)
     if text != normalized and key:
@@ -777,7 +791,7 @@ def build_letter_template_context(
         current_year=str(date.today().year),
     )
     if follow_up_value:
-        context["follow_up_date_long"] = follow_up_value.strftime("%d %B %Y")
+        context["follow_up_date_long"] = follow_up_value.strftime(FOLLOW_UP_DATE_FMT)
     else:
         context["follow_up_date_long"] = ""
     return context
@@ -4915,7 +4929,10 @@ def render_quotation_letter_page(user: Dict) -> None:
             render_human_date_input(
                 "Follow-up date",
                 key=follow_up_key,
-                help="Enter a date like YYYY-MM-DD or 'next friday'.",
+                help="Enter a date like DD.MM.YYYY.",
+                placeholder=FOLLOW_UP_INPUT_PLACEHOLDER,
+                format_hint="DD.MM.YYYY",
+                allow_natural_language=False,
             )
             scheduled_date = _coerce_date(
                 st.session_state.get(follow_up_key)
@@ -4924,11 +4941,11 @@ def render_quotation_letter_page(user: Dict) -> None:
                 delta_days = (scheduled_date - date.today()).days
                 if delta_days >= 0:
                     st.caption(
-                        f"Reminder scheduled in {delta_days} day{'s' if delta_days != 1 else ''} on {scheduled_date:%d %b %Y}."
+                        f"Reminder scheduled in {delta_days} day{'s' if delta_days != 1 else ''} on {scheduled_date.strftime(FOLLOW_UP_DATE_FMT)}."
                     )
                 else:
                     st.caption(
-                        f"Reminder date is {abs(delta_days)} day{'s' if delta_days != -1 else ''} in the past ({scheduled_date:%d %b %Y})."
+                        f"Reminder date is {abs(delta_days)} day{'s' if delta_days != -1 else ''} in the past ({scheduled_date.strftime(FOLLOW_UP_DATE_FMT)})."
                     )
             else:
                 st.caption("Select a follow-up date to enable reminder scheduling.")
@@ -5087,7 +5104,7 @@ def render_quotation_letter_page(user: Dict) -> None:
         ).dt.date
         display_df["follow_up_date"] = pd.to_datetime(
             display_df.get("follow_up_date"), errors="coerce"
-        ).dt.date
+        ).dt.strftime(FOLLOW_UP_DATE_FMT)
         display_df["follow_up_status"] = display_df["follow_up_status"].map(
             LETTER_FOLLOW_UP_LABELS
         ).fillna(display_df["follow_up_status"])
@@ -5155,7 +5172,9 @@ def render_quotation_letter_page(user: Dict) -> None:
             )
             follow_up_date = detail_row.get("follow_up_date")
             if follow_up_date:
-                info_cols[1].write(f"**Follow-up date:** {follow_up_date}")
+                info_cols[1].write(
+                    f"**Follow-up date:** {format_follow_up_date(follow_up_date)}"
+                )
             info_cols[1].write(
                 "**Follow-up status:** "
                 f"{LETTER_FOLLOW_UP_LABELS.get(detail_row.get('follow_up_status'), '—')}"
@@ -5347,7 +5366,10 @@ def render_quotations(user: Dict) -> None:
             follow_up_date_value = render_human_date_input(
                 "Follow-up date (required)",
                 key=follow_up_key,
-                help="Enter a date like YYYY-MM-DD or 'next friday'.",
+                help="Enter a date like DD.MM.YYYY.",
+                placeholder=FOLLOW_UP_INPUT_PLACEHOLDER,
+                format_hint="DD.MM.YYYY",
+                allow_natural_language=False,
             )
         else:
             st.session_state.pop(follow_up_key, None)
@@ -6422,7 +6444,10 @@ def render_admin_filters() -> None:
                 value=follow_start_seed,
                 key="admin_follow_start_date",
                 disabled=not follow_start_enabled,
-                help="Enter a date like YYYY-MM-DD.",
+                help="Enter a date like DD.MM.YYYY.",
+                placeholder=FOLLOW_UP_INPUT_PLACEHOLDER,
+                format_hint="DD.MM.YYYY",
+                allow_natural_language=False,
             )
         if not follow_start_enabled:
             follow_start = None
@@ -6437,7 +6462,10 @@ def render_admin_filters() -> None:
                 value=follow_end_seed,
                 key="admin_follow_end_date",
                 disabled=not follow_end_enabled,
-                help="Enter a date like YYYY-MM-DD.",
+                help="Enter a date like DD.MM.YYYY.",
+                placeholder=FOLLOW_UP_INPUT_PLACEHOLDER,
+                format_hint="DD.MM.YYYY",
+                allow_natural_language=False,
             )
         if not follow_end_enabled:
             follow_end = None
@@ -6941,7 +6969,7 @@ def render_sidebar_reminders(user: Dict) -> None:
     for _, row in notifications.head(5).iterrows():
         due_date = row.get("due_date")
         due_label = (
-            due_date.strftime("%d %b %Y") if pd.notna(due_date) else "Date pending"
+            due_date.strftime(FOLLOW_UP_DATE_FMT) if pd.notna(due_date) else "Date pending"
         )
         prefix = "⚠️" if pd.notna(due_date) and due_date.date() <= date.today() else "🔔"
         st.sidebar.write(f"{prefix} {row.get('message')} ({due_label})")
