@@ -23,7 +23,7 @@ from calendar import monthrange
 from datetime import datetime, timedelta, date, time as dt_time
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 import urllib.parse
 
 from dotenv import load_dotenv
@@ -5782,12 +5782,7 @@ def render_upload_preview(path: Path, *, label: str, key_prefix: str) -> None:
             )
             st.caption("Preview blocked by browser? Use Open preview or Download.")
         if suffix == ".pdf":
-            encoded = base64.b64encode(payload).decode("utf-8")
-            iframe = (
-                f"<iframe src='data:application/pdf;base64,{encoded}' "
-                "width='100%' height='520px' style='border: none;'></iframe>"
-            )
-            st_components_html(iframe, height=540, scrolling=True)
+            st.info("PDF preview disabled to avoid browser blocking. Use Open preview or Download.")
         elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
             st.image(payload, caption=label, use_column_width=True)
         else:
@@ -11392,6 +11387,59 @@ def dashboard(conn):
                 f"Automatic backup failed: {st.session_state['auto_backup_error']}"
             )
 
+        def _resolve_upload_bytes(path_value: Optional[str]) -> tuple[Optional[bytes], Optional[str]]:
+            clean_path = clean_text(path_value)
+            if not clean_path:
+                return None, None
+            resolved_path = resolve_upload_path(clean_path)
+            if not resolved_path or not resolved_path.exists():
+                return None, None
+            try:
+                return resolved_path.read_bytes(), resolved_path.name
+            except OSError:
+                return None, None
+
+        def _render_deleted_file_downloads(
+            title: str,
+            deleted_rows: pd.DataFrame,
+            *,
+            file_column: str,
+            label_builder: Callable[[pd.Series], str],
+            key_prefix: str,
+        ) -> None:
+            if deleted_rows.empty:
+                return
+            options: list[dict[str, str]] = []
+            for _, row in deleted_rows.iterrows():
+                path_value = clean_text(row.get(file_column))
+                if not path_value:
+                    continue
+                label = label_builder(row)
+                options.append({"label": label, "path": path_value})
+            if not options:
+                return
+            st.markdown(f"##### {title}")
+            selected_idx = st.selectbox(
+                "Select deleted file",
+                options=list(range(len(options))),
+                format_func=lambda idx: options[idx]["label"],
+                key=f"{key_prefix}_select",
+            )
+            selected = options[selected_idx]
+            payload, filename = _resolve_upload_bytes(selected["path"])
+            if not payload or not filename:
+                st.caption("Deleted file is no longer available on disk.")
+                return
+            suffix = Path(filename).suffix.lower()
+            if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                st.image(payload, caption=filename, use_column_width=True)
+            st.download_button(
+                "Download deleted file",
+                payload,
+                file_name=filename,
+                key=f"{key_prefix}_download",
+            )
+
         toggle_label = (
             "🗑️ Deleted data"
             if not st.session_state.get("show_deleted_panel")
@@ -11508,6 +11556,18 @@ def dashboard(conn):
                     key="deleted_ops_dl",
                 )
                 st.dataframe(formatted_ops, use_container_width=True)
+                _render_deleted_file_downloads(
+                    "Deleted delivery/work done files",
+                    deleted_ops,
+                    file_column="file_path",
+                    label_builder=lambda row: (
+                        f"{clean_text(row.get('record_type')) or 'Record'} • "
+                        f"{clean_text(row.get('do_number')) or 'N/A'} • "
+                        f"{clean_text(row.get('customer')) or '(customer)'} • "
+                        f"Deleted by {clean_text(row.get('deleted_by_name')) or 'Unknown'}"
+                    ),
+                    key_prefix="deleted_ops_files",
+                )
 
             deleted_documents = df_query(
                 conn,
@@ -11549,6 +11609,17 @@ def dashboard(conn):
                     key="deleted_ops_docs_dl",
                 )
                 st.dataframe(formatted_docs, use_container_width=True)
+                _render_deleted_file_downloads(
+                    "Deleted operations document files",
+                    deleted_documents,
+                    file_column="file_path",
+                    label_builder=lambda row: (
+                        f"{clean_text(row.get('original_name')) or 'Document'} • "
+                        f"{clean_text(row.get('customer')) or '(customer)'} • "
+                        f"Deleted by {clean_text(row.get('deleted_by_name')) or 'Unknown'}"
+                    ),
+                    key_prefix="deleted_ops_docs_files",
+                )
 
             deleted_other_docs = df_query(
                 conn,
@@ -11593,6 +11664,17 @@ def dashboard(conn):
                     key="deleted_other_ops_docs_dl",
                 )
                 st.dataframe(formatted_other_docs, use_container_width=True)
+                _render_deleted_file_downloads(
+                    "Deleted other uploads",
+                    deleted_other_docs,
+                    file_column="file_path",
+                    label_builder=lambda row: (
+                        f"{clean_text(row.get('original_name')) or 'Upload'} • "
+                        f"{clean_text(row.get('customer')) or '(customer)'} • "
+                        f"Deleted by {clean_text(row.get('deleted_by_name')) or 'Unknown'}"
+                    ),
+                    key_prefix="deleted_other_ops_files",
+                )
 
     def _resolve_recent_pdf_bytes(path_value: Optional[str]) -> tuple[Optional[bytes], Optional[str]]:
         clean_path = clean_text(path_value)
@@ -12129,7 +12211,11 @@ def dashboard(conn):
             LEFT JOIN users u ON u.user_id = sa.staff_id
             WHERE sa.work_date IS NOT NULL
               AND date(sa.work_date) BETWEEN date(?) AND date(?)
-              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'service')
+              AND (
+                u.staff_classification IS NULL
+                OR TRIM(u.staff_classification) = ''
+                OR LOWER(TRIM(u.staff_classification)) LIKE 'service%'
+              )
             GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
             ORDER BY total_tasks DESC, staff ASC
             """,
@@ -12178,7 +12264,11 @@ def dashboard(conn):
                     sa.customer_id IN ({placeholders})
                     OR sa.do_customer_id IN ({placeholders})
                   )
-                  AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'service')
+                  AND (
+                    u.staff_classification IS NULL
+                    OR TRIM(u.staff_classification) = ''
+                    OR LOWER(TRIM(u.staff_classification)) LIKE 'service%'
+                  )
                 GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
                 ORDER BY total_tasks DESC, staff ASC
                 """.format(placeholders=",".join(["?"] * len(allowed_customers))),
@@ -12250,39 +12340,63 @@ def dashboard(conn):
                     if staff_docs.empty:
                         continue
                     with st.expander(f"{staff_name} • Service documents", expanded=False):
-                        header_cols = st.columns([2, 2, 2, 2, 2])
-                        header_cols[0].markdown("**Type**")
-                        header_cols[1].markdown("**Date**")
-                        header_cols[2].markdown("**Amount**")
-                        header_cols[3].markdown("**Details**")
-                        header_cols[4].markdown("**PDFs**")
-                        for row_index, row in staff_docs.iterrows():
-                            cols = st.columns([2, 2, 2, 2, 2])
-                            cols[0].write(row.get("record_type") or "Service")
-                            cols[1].write(row.get("record_date") or "—")
-                            cols[2].write(row.get("amount") or "—")
-                            cols[3].write(clean_text(row.get("details")) or "—")
-                            attachments = []
-                            payload, filename = _resolve_recent_pdf_bytes(row.get("file_path"))
-                            if payload and filename:
-                                attachments.append(("Document", payload, filename))
-                            if RECEIPTS_ENABLED:
-                                payload, filename = _resolve_recent_pdf_bytes(
-                                    row.get("payment_receipt_path")
+                        display_cols = ["record_type", "record_date", "amount", "details"]
+                        staff_display = staff_docs[display_cols].rename(
+                            columns={
+                                "record_type": "Type",
+                                "record_date": "Date",
+                                "amount": "Amount",
+                                "details": "Details",
+                            }
+                        )
+                        staff_display["Details"] = staff_display["Details"].apply(
+                            lambda value: clean_text(value) or "—"
+                        )
+                        st.dataframe(
+                            staff_display,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=260,
+                        )
+                        download_options: list[dict[str, str]] = []
+                        for _, row in staff_docs.iterrows():
+                            record_label = clean_text(row.get("record_type")) or "Service"
+                            record_id = clean_text(row.get("record_id")) or "Record"
+                            if clean_text(row.get("file_path")):
+                                download_options.append(
+                                    {
+                                        "label": f"{record_label} {record_id} • Document",
+                                        "path": row.get("file_path"),
+                                    }
                                 )
-                                if payload and filename:
-                                    attachments.append(("Receipt", payload, filename))
-                            if attachments:
-                                for label, payload, filename in attachments:
-                                    cols[4].download_button(
-                                        f"{label}",
-                                        payload,
-                                        file_name=filename,
-                                        key=f"service_doc_{staff_name}_{row_index}_{label}",
-                                        mime="application/pdf",
-                                    )
+                            if RECEIPTS_ENABLED and clean_text(row.get("payment_receipt_path")):
+                                download_options.append(
+                                    {
+                                        "label": f"{record_label} {record_id} • Receipt",
+                                        "path": row.get("payment_receipt_path"),
+                                    }
+                                )
+                        if download_options:
+                            selected_idx = st.selectbox(
+                                "Download service PDF",
+                                options=list(range(len(download_options))),
+                                format_func=lambda idx: download_options[idx]["label"],
+                                key=f"service_doc_download_{staff_name}",
+                            )
+                            selected = download_options[selected_idx]
+                            payload, filename = _resolve_recent_pdf_bytes(selected["path"])
+                            if payload and filename:
+                                st.download_button(
+                                    "Download selected PDF",
+                                    payload,
+                                    file_name=filename,
+                                    key=f"service_doc_download_btn_{staff_name}",
+                                    mime="application/pdf",
+                                )
                             else:
-                                cols[4].write("—")
+                                st.caption("Selected file is unavailable.")
+                        else:
+                            st.caption("No PDFs available for this staff member.")
 
     with team_tab_sales:
         sales_staff_summary = df_query(
@@ -12461,41 +12575,65 @@ def dashboard(conn):
                     if staff_docs.empty:
                         continue
                     with st.expander(f"{staff_name} • Quotation / Order PDFs", expanded=False):
-                        header_cols = st.columns([2, 2, 2, 2, 2, 2])
-                        header_cols[0].markdown("**Type**")
-                        header_cols[1].markdown("**Reference**")
-                        header_cols[2].markdown("**Date**")
-                        header_cols[3].markdown("**Amount**")
-                        header_cols[4].markdown("**Details**")
-                        header_cols[5].markdown("**PDFs**")
-                        for row_index, row in staff_docs.iterrows():
-                            cols = st.columns([2, 2, 2, 2, 2, 2])
-                            cols[0].write(row.get("record_type") or "Document")
-                            cols[1].write(row.get("reference") or "—")
-                            cols[2].write(row.get("record_date") or "—")
-                            cols[3].write(row.get("amount") or "—")
-                            cols[4].write("—")
-                            attachments = []
-                            payload, filename = _resolve_recent_pdf_bytes(row.get("file_path"))
-                            if payload and filename:
-                                attachments.append(("Document", payload, filename))
-                            if RECEIPTS_ENABLED:
-                                payload, filename = _resolve_recent_pdf_bytes(
-                                    row.get("payment_receipt_path")
+                        display_cols = [
+                            "record_type",
+                            "reference",
+                            "record_date",
+                            "amount",
+                        ]
+                        staff_display = staff_docs[display_cols].rename(
+                            columns={
+                                "record_type": "Type",
+                                "reference": "Reference",
+                                "record_date": "Date",
+                                "amount": "Amount",
+                            }
+                        )
+                        st.dataframe(
+                            staff_display,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=260,
+                        )
+                        download_options: list[dict[str, str]] = []
+                        for _, row in staff_docs.iterrows():
+                            record_label = clean_text(row.get("record_type")) or "Document"
+                            record_id = clean_text(row.get("reference")) or clean_text(row.get("record_id")) or "Record"
+                            if clean_text(row.get("file_path")):
+                                download_options.append(
+                                    {
+                                        "label": f"{record_label} {record_id} • Document",
+                                        "path": row.get("file_path"),
+                                    }
                                 )
-                                if payload and filename:
-                                    attachments.append(("Receipt", payload, filename))
-                            if attachments:
-                                for label, payload, filename in attachments:
-                                    cols[5].download_button(
-                                        label,
-                                        payload,
-                                        file_name=filename,
-                                        key=f"sales_doc_{staff_name}_{row_index}_{label}",
-                                        mime="application/pdf",
-                                    )
+                            if RECEIPTS_ENABLED and clean_text(row.get("payment_receipt_path")):
+                                download_options.append(
+                                    {
+                                        "label": f"{record_label} {record_id} • Receipt",
+                                        "path": row.get("payment_receipt_path"),
+                                    }
+                                )
+                        if download_options:
+                            selected_idx = st.selectbox(
+                                "Download sales PDF",
+                                options=list(range(len(download_options))),
+                                format_func=lambda idx: download_options[idx]["label"],
+                                key=f"sales_doc_download_{staff_name}",
+                            )
+                            selected = download_options[selected_idx]
+                            payload, filename = _resolve_recent_pdf_bytes(selected["path"])
+                            if payload and filename:
+                                st.download_button(
+                                    "Download selected PDF",
+                                    payload,
+                                    file_name=filename,
+                                    key=f"sales_doc_download_btn_{staff_name}",
+                                    mime="application/pdf",
+                                )
                             else:
-                                cols[5].write("—")
+                                st.caption("Selected file is unavailable.")
+                        else:
+                            st.caption("No PDFs available for this staff member.")
 
     st.markdown("### Staff activity history")
     staff_df = df_query(conn, "SELECT user_id, username FROM users ORDER BY LOWER(username)")
