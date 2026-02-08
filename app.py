@@ -13404,6 +13404,7 @@ def render_customer_quick_edit_section(
     enable_uploads: bool = True,
 ) -> pd.DataFrame:
     pagination_enabled = enable_pagination and show_editor and not include_leads
+    normalized_phone = ""
     if show_filters:
         sort_dir = st.radio(
             "Sort by created date",
