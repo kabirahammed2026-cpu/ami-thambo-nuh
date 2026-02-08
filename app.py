@@ -8623,6 +8623,21 @@ def _normalize_phone_key(value: Optional[str]) -> Optional[str]:
     return digits
 
 
+def _normalize_phone_digits(value: Optional[str]) -> Optional[str]:
+    phone_key = _normalize_phone_key(value)
+    if not phone_key:
+        return None
+    digits = re.sub(r"[^\d]", "", phone_key)
+    return digits or None
+
+
+def _phone_digits_sql_expr(column: str) -> str:
+    expr = column
+    for token in (" ", "-", "(", ")", "+", ".", "/"):
+        expr = f"REPLACE({expr}, '{token}', '')"
+    return expr
+
+
 def recalc_customer_duplicate_flag(conn, phone):
     phone_key = _normalize_phone_key(phone)
     if not phone_key:
@@ -13401,6 +13416,7 @@ def render_customer_quick_edit_section(
             "Search (name/phone/address/product/DO)",
             key=f"{key_prefix}_search",
         )
+        normalized_phone = _normalize_phone_digits(q)
         if pagination_enabled:
             page_size = st.selectbox(
                 "Rows per page",
@@ -13414,22 +13430,26 @@ def render_customer_quick_edit_section(
         if pagination_enabled:
             page_size = 50
     scope_clause, scope_params = customer_scope_filter("c")
-    search_clause = dedent(
-        """
-        (? = ''
-         OR c.name LIKE '%'||?||'%'
-         OR c.company_name LIKE '%'||?||'%'
-         OR c.phone LIKE '%'||?||'%'
-         OR c.address LIKE '%'||?||'%'
-         OR c.delivery_address LIKE '%'||?||'%'
-         OR c.remarks LIKE '%'||?||'%'
-         OR c.product_info LIKE '%'||?||'%'
-         OR c.delivery_order_code LIKE '%'||?||'%'
-         OR c.sales_person LIKE '%'||?||'%')
-        """
-    ).strip()
+    search_terms: list[tuple[str, object]] = [
+        ("c.name LIKE '%'||?||'%'", q),
+        ("c.company_name LIKE '%'||?||'%'", q),
+        ("c.phone LIKE '%'||?||'%'", q),
+        ("c.address LIKE '%'||?||'%'", q),
+        ("c.delivery_address LIKE '%'||?||'%'", q),
+        ("c.remarks LIKE '%'||?||'%'", q),
+        ("c.product_info LIKE '%'||?||'%'", q),
+        ("c.delivery_order_code LIKE '%'||?||'%'", q),
+        ("c.sales_person LIKE '%'||?||'%'", q),
+    ]
+    if normalized_phone:
+        search_terms.append(
+            (f"{_phone_digits_sql_expr('c.phone')} LIKE '%'||?||'%'", normalized_phone)
+        )
+    search_clause = (
+        "(? = '' OR " + " OR ".join(clause for clause, _ in search_terms) + ")"
+    )
     where_parts = [search_clause]
-    params: list[object] = [q, q, q, q, q, q, q, q, q, q]
+    params: list[object] = [q] + [param for _, param in search_terms]
     if scope_clause:
         where_parts.append(scope_clause)
         params.extend(scope_params)
@@ -16734,6 +16754,7 @@ def operations_page(conn):
     params: list[object] = []
     if search_query:
         like_value = f"%{search_query.strip().lower()}%"
+        normalized_phone = _normalize_phone_digits(search_query)
         where_parts.append(
             "("
             "lower(COALESCE(name, '')) LIKE ? "
@@ -16743,6 +16764,11 @@ def operations_page(conn):
             ")"
         )
         params = [like_value, like_value, like_value, like_value]
+        if normalized_phone:
+            where_parts.append(
+                f"{_phone_digits_sql_expr('phone')} LIKE ?"
+            )
+            params.append(f"%{normalized_phone}%")
     if scope_clause:
         where_parts.append(scope_clause)
         params.extend(scope_params)
