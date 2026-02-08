@@ -12595,10 +12595,10 @@ def dashboard(conn):
     order_metrics = df_query(
         conn,
         f"""
-        SELECT SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
-               SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
-               ROUND(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'delivery_order' THEN COALESCE(total_amount, 0) ELSE 0 END), 2) AS delivery_value,
-               ROUND(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'work_done' THEN COALESCE(total_amount, 0) ELSE 0 END), 2) AS work_order_value
+        SELECT COALESCE(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END), 0) AS delivery_orders,
+               COALESCE(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END), 0) AS work_orders,
+               ROUND(COALESCE(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'delivery_order' THEN COALESCE(total_amount, 0) ELSE 0 END), 0), 2) AS delivery_value,
+               ROUND(COALESCE(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'work_done' THEN COALESCE(total_amount, 0) ELSE 0 END), 0), 2) AS work_order_value
         FROM delivery_orders
         WHERE deleted_at IS NULL
           AND (
@@ -12610,16 +12610,18 @@ def dashboard(conn):
         (history_staff, staff_label, *history_date_params),
     )
     total_quotes = int(
-        quotation_metrics.iloc[0].get("total_quotes") if not quotation_metrics.empty else 0
+        (quotation_metrics.iloc[0].get("total_quotes") if not quotation_metrics.empty else 0)
+        or 0
     )
     total_quote_value = (
         quotation_metrics.iloc[0].get("total_amount") if not quotation_metrics.empty else 0.0
     )
     total_delivery = int(
-        order_metrics.iloc[0].get("delivery_orders") if not order_metrics.empty else 0
+        (order_metrics.iloc[0].get("delivery_orders") if not order_metrics.empty else 0)
+        or 0
     )
     total_work = int(
-        order_metrics.iloc[0].get("work_orders") if not order_metrics.empty else 0
+        (order_metrics.iloc[0].get("work_orders") if not order_metrics.empty else 0) or 0
     )
     total_delivery_value = (
         order_metrics.iloc[0].get("delivery_value") if not order_metrics.empty else 0.0
