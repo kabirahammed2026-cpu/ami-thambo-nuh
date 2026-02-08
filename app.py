@@ -71,8 +71,10 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "ps_crm.db"))
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATE_FMT = "%d-%m-%Y"
+FOLLOW_UP_DATE_FMT = "%d.%m.%Y"
 INPUT_DATE_FMT = "%Y-%m-%d"
 DATE_INPUT_PLACEHOLDER = "YYYY-MM-DD or 'tomorrow', 'next friday', 'in 3 days'"
+FOLLOW_UP_INPUT_PLACEHOLDER = "DD.MM.YYYY"
 DEFAULT_REMINDER_TIME = dt_time(9, 0)
 CURRENCY_SYMBOL = os.getenv("APP_CURRENCY_SYMBOL", "৳")
 BACKUP_DIR = BASE_DIR / "backups"
@@ -3685,7 +3687,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
             severity = "info"
             if pd.notna(follow_dt) and follow_dt.date() <= date.today():
                 severity = "warning"
-            follow_label = format_period_range(follow_date_val, follow_date_val) or (follow_date_val or "(date pending)")
+            follow_label = format_follow_up_date(follow_date_val) or (follow_date_val or "(date pending)")
             alerts.append(
                 {
                     "title": clean_text(row.get("reference")) or "Quotation follow-up",
@@ -3732,9 +3734,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
             severity = "info"
             if pd.notna(follow_dt) and follow_dt.date() <= date.today():
                 severity = "warning"
-            follow_label = format_period_range(
-                follow_date_val, follow_date_val
-            ) or (follow_date_val or "(date pending)")
+            follow_label = format_follow_up_date(follow_date_val) or (follow_date_val or "(date pending)")
             customer_label = clean_text(row.get("customer")) or "(unknown)"
             product_label = " ".join(
                 part
@@ -3827,7 +3827,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                         reminder_date,
                         {
                             "title": title,
-                            "message": f"{message} (due {format_period_range(reminder_iso, reminder_iso)})",
+                            "message": f"{message} (due {format_follow_up_date(reminder_iso)})",
                             "severity": "warning"
                             if reminder_date <= date.today()
                             else "info",
@@ -3866,7 +3866,7 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
             reminder_date = reminder_dt.date() if pd.notna(reminder_dt) else None
             customer_label = clean_text(row.get("customer")) or "(unknown)"
             note_text = clean_text(row.get("note")) or "Reminder"
-            date_label = format_period_range(remind_on, remind_on) or "(date pending)"
+            date_label = format_follow_up_date(remind_on) or "(date pending)"
             alerts.append(
                 {
                     "title": customer_label,
@@ -4157,6 +4157,8 @@ def render_flexible_date_input(
     help: Optional[str] = None,
     disabled: bool = False,
     placeholder: str = DATE_INPUT_PLACEHOLDER,
+    format_hint: str = "YYYY-MM-DD",
+    allow_natural_language: bool = True,
 ) -> Optional[date]:
     parsed_seed = parse_date_value(value)
     default_text = (
@@ -4185,9 +4187,12 @@ def render_flexible_date_input(
     parsed = parse_human_date(text)
     if parsed is None:
         if text:
-            st.error(
-                "Enter a valid date such as YYYY-MM-DD, 'tomorrow', 'next friday', or 'in 3 days'."
-            )
+            if allow_natural_language:
+                st.error(
+                    f"Enter a valid date such as {format_hint}, 'tomorrow', 'next friday', or 'in 3 days'."
+                )
+            else:
+                st.error(f"Enter a valid date such as {format_hint}.")
         return None
     normalized = parsed.strftime(INPUT_DATE_FMT)
     if normalized_key:
@@ -4740,6 +4745,22 @@ def format_period_range(start: Optional[str], end: Optional[str]) -> str:
             return start_label
         return f"{start_label} → {end_label}"
     return start_label or end_label or "—"
+
+
+def format_follow_up_date(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    except Exception:
+        return clean_text(value) or ""
+    if pd.isna(parsed):
+        return clean_text(value) or ""
+    if isinstance(parsed, pd.DatetimeIndex):
+        if len(parsed) == 0:
+            return ""
+        parsed = parsed[0]
+    return pd.Timestamp(parsed).strftime(FOLLOW_UP_DATE_FMT)
 
 
 def _clamp_percentage(value: float) -> float:
@@ -18008,7 +18029,10 @@ def customers_page(conn):
                     value=default_date,
                     key=f"customer_note_reminder_{selected_customer_id}",
                     disabled=not enable_follow_up,
-                    help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                    help="Enter a date like DD.MM.YYYY.",
+                    placeholder=FOLLOW_UP_INPUT_PLACEHOLDER,
+                    format_hint="DD.MM.YYYY",
+                    allow_natural_language=False,
                 )
                 add_note = st.form_submit_button("Add remark", type="primary")
             if add_note:
@@ -18059,9 +18083,7 @@ def customers_page(conn):
                 }
                 editor_df = notes_df.copy()
                 editor_df["remind_on"] = editor_df["remind_on"].apply(
-                    lambda value: parse_date_value(value).strftime(INPUT_DATE_FMT)
-                    if parse_date_value(value) is not None
-                    else ""
+                    lambda value: format_follow_up_date(value)
                 )
                 editor_df["note"] = editor_df["note"].apply(_strip_warranty_tag)
                 editor_df["created_at"] = pd.to_datetime(editor_df["created_at"], errors="coerce")
@@ -18091,8 +18113,8 @@ def customers_page(conn):
                         "note": st.column_config.TextColumn("Remark"),
                         "remind_on": st.column_config.DateColumn(
                             "Reminder date",
-                            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
-                            format="YYYY-MM-DD",
+                            help="Enter a date like DD.MM.YYYY.",
+                            format="DD.MM.YYYY",
                         ),
                         "Done": st.column_config.CheckboxColumn("Completed"),
                         "created_at": st.column_config.DatetimeColumn(
@@ -18146,7 +18168,7 @@ def customers_page(conn):
                             reminder_text = clean_text(row.get("remind_on"))
                             if reminder_text and parse_human_date(reminder_text) is None:
                                 errors.append(
-                                    "A remark has an invalid reminder date. Use YYYY-MM-DD or 'tomorrow'."
+                                    "A remark has an invalid reminder date. Use DD.MM.YYYY."
                                 )
                                 continue
                             reminder_iso = to_iso_date(reminder_text)
@@ -18432,7 +18454,10 @@ def warranties_page(conn):
         reminder_date = render_flexible_date_input(
             "Reminder date",
             value=reminder_default,
-            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            help="Enter a date like DD.MM.YYYY.",
+            placeholder=FOLLOW_UP_INPUT_PLACEHOLDER,
+            format_hint="DD.MM.YYYY",
+            allow_natural_language=False,
             key=f"warranty_followup_reminder_{selected_warranty}",
         )
         submit_followup = st.form_submit_button("Save reminder", type="primary")
@@ -18564,7 +18589,7 @@ def warranties_page(conn):
             if not warranty_id:
                 continue
             warranty_label = warranty_labels.get(warranty_id, "Warranty record")
-            reminder_label = format_period_range(row.get("remind_on"), row.get("remind_on"))
+            reminder_label = format_follow_up_date(row.get("remind_on"))
             created_label = format_period_range(row.get("created_at"), row.get("created_at"))
             note_id = int_or_none(row.get("note_id"))
             is_done = bool(int_or_none(row.get("is_done")))
@@ -21059,8 +21084,10 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 "Next follow-up date",
                 value=follow_up_default,
                 key="quotation_follow_up_date",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
-                placeholder="Leave blank if no follow-up date is needed.",
+                help="Enter a date like DD.MM.YYYY.",
+                placeholder="Leave blank if no follow-up date is needed (DD.MM.YYYY).",
+                format_hint="DD.MM.YYYY",
+                allow_natural_language=False,
             )
         follow_up_notes = st.text_area(
             "Follow-up remarks for admins",
@@ -21112,7 +21139,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
         follow_up_date_seed = parse_date_value(st.session_state.get("quotation_follow_up_date"))
         follow_up_date = follow_up_date_seed.date() if follow_up_date_seed is not None else None
         follow_up_iso = to_iso_date(follow_up_date) if follow_up_date else None
-        follow_up_label = format_period_range(follow_up_iso, follow_up_iso) if follow_up_iso else ""
+        follow_up_label = format_follow_up_date(follow_up_iso) if follow_up_iso else ""
         reminder_label = None
         if follow_up_label:
             reminder_label = f"Reminder scheduled for {follow_up_label}."
@@ -21439,7 +21466,7 @@ def _render_quotation_management(conn):
         parsed = parse_date_value(value)
         if parsed is None:
             return None
-        return parsed.strftime(INPUT_DATE_FMT)
+        return parsed.strftime(FOLLOW_UP_DATE_FMT)
 
     def _render_attachment_preview(
         label: str,
@@ -21562,8 +21589,8 @@ def _render_quotation_management(conn):
         ),
         "follow_up_date": st.column_config.DateColumn(
             "Follow-up date",
-            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
-            format="YYYY-MM-DD",
+            help="Enter a date like DD.MM.YYYY.",
+            format="DD.MM.YYYY",
         ),
         "reminder_label": st.column_config.TextColumn("Reminder"),
         "reference": st.column_config.TextColumn("Reference"),
@@ -21613,7 +21640,7 @@ def _render_quotation_management(conn):
         ]
         if invalid_rows:
             st.error(
-                "Some follow-up dates are invalid. Use formats like YYYY-MM-DD, 'tomorrow', or 'next friday'."
+                "Some follow-up dates are invalid. Use formats like DD.MM.YYYY."
             )
             return
         result = _update_quotation_records(
@@ -21714,8 +21741,10 @@ def _render_quotation_management(conn):
             "Follow-up date",
             value=follow_up_date_seed,
             key="quotation_detail_follow_up_date",
-            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
-            placeholder="Leave blank if no follow-up date is needed.",
+            help="Enter a date like DD.MM.YYYY.",
+            placeholder="Leave blank if no follow-up date is needed (DD.MM.YYYY).",
+            format_hint="DD.MM.YYYY",
+            allow_natural_language=False,
         )
     with col_right:
         follow_up_notes_input = st.text_area(
@@ -21758,9 +21787,7 @@ def _render_quotation_management(conn):
                 return
 
         follow_up_iso = to_iso_date(follow_up_date_input) if follow_up_date_input else None
-        reminder_label = (
-            format_period_range(follow_up_iso, follow_up_iso) if follow_up_iso else None
-        )
+        reminder_label = format_follow_up_date(follow_up_iso) if follow_up_iso else None
         follow_up_history_value = clean_text(selected_row.get("follow_up_history")) or ""
         follow_up_history_entry = None
         current_follow_up_date_iso = to_iso_date(selected_row.get("follow_up_date"))
@@ -25083,7 +25110,7 @@ def _format_reminder_datetime(value: object) -> str:
     parsed = parse_human_date(value)
     if parsed is None:
         return ""
-    return parsed.strftime("%d %b %Y %I:%M %p").lstrip("0")
+    return parsed.strftime("%d.%m.%Y %I:%M %p").lstrip("0")
 
 
 def upsert_reminder(
