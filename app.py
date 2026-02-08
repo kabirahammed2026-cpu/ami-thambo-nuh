@@ -10180,20 +10180,22 @@ def dashboard(conn):
         conn,
         dedent(
             f"""
-            SELECT quotation_id,
-                   reference,
-                   quote_date,
-                   total_amount,
-                   status,
-                   COALESCE(NULLIF(TRIM(customer_name), ''), '—') AS customer_name,
-                   COALESCE(NULLIF(TRIM(customer_company), ''), '—') AS company,
+            SELECT q.quotation_id,
+                   q.reference,
+                   q.quote_date,
+                   q.total_amount,
+                   q.status,
+                   COALESCE(NULLIF(TRIM(q.customer_name), ''), '—') AS customer_name,
+                   COALESCE(NULLIF(TRIM(q.customer_company), ''), '—') AS company,
                    COALESCE(
-                       NULLIF(TRIM(subject), ''),
-                       NULLIF(TRIM(remarks_internal), '')
-                   ) AS product_details
-            FROM quotations
+                       NULLIF(TRIM(q.subject), ''),
+                       NULLIF(TRIM(q.remarks_internal), '')
+                   ) AS product_details,
+                   COALESCE(NULLIF(TRIM(u.username), ''), 'Team member') AS pic
+            FROM quotations q
+            LEFT JOIN users u ON u.user_id = q.created_by
             {quote_clause}
-            ORDER BY datetime(quote_date) DESC, quotation_id DESC
+            ORDER BY datetime(q.quote_date) DESC, q.quotation_id DESC
             LIMIT 20
             """
         ),
@@ -10234,18 +10236,31 @@ def dashboard(conn):
         quotes_df["total_amount"] = quotes_df["total_amount"].apply(
             lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
         )
+        display_quotes = quotes_df.rename(
+            columns={
+                "reference": "Reference",
+                "quote_date": "Date",
+                "total_amount": "Total (BDT)",
+                "status": "Status",
+                "customer_name": "Customer",
+                "company": "Company",
+                "product_details": "Product details",
+                "pic": "PIC",
+            }
+        ).drop(columns=["quotation_id"], errors="ignore")
         st.dataframe(
-            quotes_df.rename(
-                columns={
-                    "reference": "Reference",
-                    "quote_date": "Date",
-                    "total_amount": "Total (BDT)",
-                    "status": "Status",
-                    "customer_name": "Customer",
-                    "company": "Company",
-                    "product_details": "Product details",
-                }
-            ),
+            display_quotes[
+                [
+                    "PIC",
+                    "Reference",
+                    "Date",
+                    "Total (BDT)",
+                    "Status",
+                    "Customer",
+                    "Company",
+                    "Product details",
+                ]
+            ],
             use_container_width=True,
             hide_index=True,
         )
@@ -12103,6 +12118,7 @@ def dashboard(conn):
             """
             WITH service_activity AS (
                 SELECT s.created_by AS staff_id,
+                       'service' AS activity_type,
                        COALESCE(date(s.service_start_date), date(s.service_date), date(s.updated_at)) AS work_date,
                        COALESCE(s.status, '') AS work_status,
                        COALESCE(s.bill_amount, 0) AS amount,
@@ -12113,6 +12129,7 @@ def dashboard(conn):
                 WHERE s.deleted_at IS NULL
                 UNION ALL
                 SELECT m.created_by AS staff_id,
+                       'maintenance' AS activity_type,
                        COALESCE(date(m.maintenance_start_date), date(m.maintenance_date), date(m.updated_at)) AS work_date,
                        COALESCE(m.status, '') AS work_status,
                        COALESCE(m.total_amount, 0) AS amount,
@@ -12126,7 +12143,9 @@ def dashboard(conn):
                    COUNT(*) AS total_tasks,
                    SUM(CASE WHEN LOWER(work_status) = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
                    SUM(CASE WHEN LOWER(work_status) != 'completed' THEN 1 ELSE 0 END) AS pending_tasks,
-                   ROUND(SUM(amount), 2) AS billed_amount
+                   ROUND(SUM(amount), 2) AS billed_amount,
+                   ROUND(SUM(CASE WHEN activity_type = 'service' THEN amount ELSE 0 END), 2) AS service_amount,
+                   ROUND(SUM(CASE WHEN activity_type = 'maintenance' THEN amount ELSE 0 END), 2) AS maintenance_amount
             FROM service_activity sa
             LEFT JOIN users u ON u.user_id = sa.staff_id
             WHERE sa.work_date IS NOT NULL
@@ -12144,6 +12163,7 @@ def dashboard(conn):
                 """
                 WITH service_activity AS (
                     SELECT s.created_by AS staff_id,
+                           'service' AS activity_type,
                            COALESCE(date(s.service_start_date), date(s.service_date), date(s.updated_at)) AS work_date,
                            COALESCE(s.status, '') AS work_status,
                            COALESCE(s.bill_amount, 0) AS amount,
@@ -12154,6 +12174,7 @@ def dashboard(conn):
                     WHERE s.deleted_at IS NULL
                     UNION ALL
                     SELECT m.created_by AS staff_id,
+                           'maintenance' AS activity_type,
                            COALESCE(date(m.maintenance_start_date), date(m.maintenance_date), date(m.updated_at)) AS work_date,
                            COALESCE(m.status, '') AS work_status,
                            COALESCE(m.total_amount, 0) AS amount,
@@ -12167,7 +12188,9 @@ def dashboard(conn):
                        COUNT(*) AS total_tasks,
                        SUM(CASE WHEN LOWER(work_status) = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
                        SUM(CASE WHEN LOWER(work_status) != 'completed' THEN 1 ELSE 0 END) AS pending_tasks,
-                       ROUND(SUM(amount), 2) AS billed_amount
+                       ROUND(SUM(amount), 2) AS billed_amount,
+                       ROUND(SUM(CASE WHEN activity_type = 'service' THEN amount ELSE 0 END), 2) AS service_amount,
+                       ROUND(SUM(CASE WHEN activity_type = 'maintenance' THEN amount ELSE 0 END), 2) AS maintenance_amount
                 FROM service_activity sa
                 LEFT JOIN users u ON u.user_id = sa.staff_id
                 WHERE sa.work_date IS NOT NULL
@@ -12187,9 +12210,10 @@ def dashboard(conn):
         if service_staff_summary.empty:
             st.info("No service staff activity found in the selected date range.")
         else:
-            service_staff_summary["billed_amount"] = service_staff_summary[
-                "billed_amount"
-            ].apply(lambda value: format_money(value) or format_number(value))
+            for col in ["billed_amount", "service_amount", "maintenance_amount"]:
+                service_staff_summary[col] = service_staff_summary[col].apply(
+                    lambda value: format_money(value) or format_number(value)
+                )
             st.dataframe(
                 service_staff_summary.rename(
                     columns={
@@ -12198,11 +12222,88 @@ def dashboard(conn):
                         "completed_tasks": "Completed",
                         "pending_tasks": "Pending",
                         "billed_amount": "Billed",
+                        "service_amount": "Service value",
+                        "maintenance_amount": "Maintenance value",
                     }
                 ),
                 use_container_width=True,
                 hide_index=True,
             )
+            service_docs = df_query(
+                conn,
+                """
+                SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
+                       s.service_id AS record_id,
+                       COALESCE(s.service_start_date, s.service_date, s.updated_at) AS record_date,
+                       s.description AS details,
+                       s.bill_amount AS amount,
+                       s.bill_document_path AS file_path,
+                       s.payment_receipt_path AS payment_receipt_path,
+                       'Service' AS record_type
+                FROM services s
+                LEFT JOIN users u ON u.user_id = s.created_by
+                WHERE s.deleted_at IS NULL
+                  AND date(COALESCE(s.service_start_date, s.service_date, s.updated_at)) BETWEEN date(?) AND date(?)
+                UNION ALL
+                SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
+                       m.maintenance_id AS record_id,
+                       COALESCE(m.maintenance_start_date, m.maintenance_date, m.updated_at) AS record_date,
+                       m.description AS details,
+                       m.total_amount AS amount,
+                       NULL AS file_path,
+                       m.payment_receipt_path AS payment_receipt_path,
+                       'Maintenance' AS record_type
+                FROM maintenance_records m
+                LEFT JOIN users u ON u.user_id = m.created_by
+                WHERE m.deleted_at IS NULL
+                  AND date(COALESCE(m.maintenance_start_date, m.maintenance_date, m.updated_at)) BETWEEN date(?) AND date(?)
+                """,
+                (from_iso, to_iso, from_iso, to_iso),
+            )
+            if not service_docs.empty:
+                st.markdown("##### Service PDFs by staff")
+                service_docs = fmt_dates(service_docs, ["record_date"])
+                service_docs["amount"] = service_docs["amount"].apply(
+                    lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
+                )
+                for staff_name in service_staff_summary["staff"].tolist():
+                    staff_docs = service_docs[service_docs["staff"] == staff_name]
+                    if staff_docs.empty:
+                        continue
+                    with st.expander(f"{staff_name} • Service documents", expanded=False):
+                        header_cols = st.columns([2, 2, 2, 2, 2])
+                        header_cols[0].markdown("**Type**")
+                        header_cols[1].markdown("**Date**")
+                        header_cols[2].markdown("**Amount**")
+                        header_cols[3].markdown("**Details**")
+                        header_cols[4].markdown("**PDFs**")
+                        for row_index, row in staff_docs.iterrows():
+                            cols = st.columns([2, 2, 2, 2, 2])
+                            cols[0].write(row.get("record_type") or "Service")
+                            cols[1].write(row.get("record_date") or "—")
+                            cols[2].write(row.get("amount") or "—")
+                            cols[3].write(clean_text(row.get("details")) or "—")
+                            attachments = []
+                            payload, filename = _resolve_recent_pdf_bytes(row.get("file_path"))
+                            if payload and filename:
+                                attachments.append(("Document", payload, filename))
+                            if RECEIPTS_ENABLED:
+                                payload, filename = _resolve_recent_pdf_bytes(
+                                    row.get("payment_receipt_path")
+                                )
+                                if payload and filename:
+                                    attachments.append(("Receipt", payload, filename))
+                            if attachments:
+                                for label, payload, filename in attachments:
+                                    cols[4].download_button(
+                                        f"{label}",
+                                        payload,
+                                        file_name=filename,
+                                        key=f"service_doc_{staff_name}_{row_index}_{label}",
+                                        mime="application/pdf",
+                                    )
+                            else:
+                                cols[4].write("—")
 
     with team_tab_sales:
         sales_staff_summary = df_query(
@@ -12217,7 +12318,9 @@ def dashboard(conn):
                    COUNT(*) AS total_orders,
                    SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
                    SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
-                   ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value
+                   ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value,
+                   ROUND(SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN COALESCE(d.total_amount, 0) ELSE 0 END), 2) AS delivery_value,
+                   ROUND(SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN COALESCE(d.total_amount, 0) ELSE 0 END), 2) AS work_order_value
             FROM delivery_orders d
             LEFT JOIN users u ON u.user_id = d.created_by
             LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
@@ -12249,7 +12352,9 @@ def dashboard(conn):
                        COUNT(*) AS total_orders,
                        SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
                        SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
-                       ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value
+                       ROUND(SUM(COALESCE(d.total_amount, 0)), 2) AS total_value,
+                       ROUND(SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'delivery_order' THEN COALESCE(d.total_amount, 0) ELSE 0 END), 2) AS delivery_value,
+                       ROUND(SUM(CASE WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done' THEN COALESCE(d.total_amount, 0) ELSE 0 END), 2) AS work_order_value
                 FROM delivery_orders d
                 LEFT JOIN users u ON u.user_id = d.created_by
                 LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
@@ -12272,22 +12377,146 @@ def dashboard(conn):
         if sales_staff_summary.empty:
             st.info("No sales staff activity found in the selected date range.")
         else:
-            sales_staff_summary["total_value"] = sales_staff_summary["total_value"].apply(
-                lambda value: format_money(value) or format_number(value)
+            quotation_summary = df_query(
+                conn,
+                """
+                SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
+                       COUNT(*) AS total_quotes,
+                       ROUND(SUM(COALESCE(q.total_amount, 0)), 2) AS quotation_value
+                FROM quotations q
+                LEFT JOIN users u ON u.user_id = q.created_by
+                WHERE q.deleted_at IS NULL
+                  AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)
+                GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
+                """,
+                (from_iso, to_iso),
             )
+            if not quotation_summary.empty:
+                sales_staff_summary = sales_staff_summary.merge(
+                    quotation_summary, on="staff", how="left"
+                )
+                sales_staff_summary["total_quotes"] = sales_staff_summary[
+                    "total_quotes"
+                ].fillna(0)
+                sales_staff_summary["quotation_value"] = sales_staff_summary[
+                    "quotation_value"
+                ].fillna(0.0)
+            else:
+                sales_staff_summary["total_quotes"] = 0
+                sales_staff_summary["quotation_value"] = 0.0
+            for col in [
+                "total_value",
+                "delivery_value",
+                "work_order_value",
+                "quotation_value",
+            ]:
+                sales_staff_summary[col] = sales_staff_summary[col].apply(
+                    lambda value: format_money(value) or format_number(value)
+                )
             st.dataframe(
                 sales_staff_summary.rename(
                     columns={
                         "staff": "Staff",
+                        "total_quotes": "Quotations",
                         "total_orders": "Total orders",
                         "delivery_orders": "Delivery orders",
                         "work_orders": "Work orders",
-                        "total_value": "Order value",
+                        "quotation_value": "Quotation value",
+                        "delivery_value": "Delivery value",
+                        "work_order_value": "Work order value",
+                        "total_value": "Order value (total)",
                     }
                 ),
                 use_container_width=True,
                 hide_index=True,
             )
+            sales_docs = df_query(
+                conn,
+                """
+                SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
+                       q.quotation_id AS record_id,
+                       q.reference AS reference,
+                       COALESCE(q.quote_date, q.created_at) AS record_date,
+                       q.total_amount AS amount,
+                       q.document_path AS file_path,
+                       q.payment_receipt_path AS payment_receipt_path,
+                       'Quotation' AS record_type
+                FROM quotations q
+                LEFT JOIN users u ON u.user_id = q.created_by
+                WHERE q.deleted_at IS NULL
+                  AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)
+                UNION ALL
+                SELECT COALESCE(
+                           NULLIF(TRIM(u.username), ''),
+                           NULLIF(TRIM(up.username), ''),
+                           NULLIF(TRIM(d.sales_person), ''),
+                           'Unassigned'
+                       ) AS staff,
+                       d.do_number AS record_id,
+                       d.do_number AS reference,
+                       COALESCE(d.delivery_date, d.created_at) AS record_date,
+                       d.total_amount AS amount,
+                       d.file_path AS file_path,
+                       d.payment_receipt_path AS payment_receipt_path,
+                       CASE
+                           WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done'
+                           THEN 'Work order'
+                           ELSE 'Delivery order'
+                       END AS record_type
+                FROM delivery_orders d
+                LEFT JOIN users u ON u.user_id = d.created_by
+                LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
+                WHERE d.deleted_at IS NULL
+                  AND date(COALESCE(d.delivery_date, d.created_at)) BETWEEN date(?) AND date(?)
+                """,
+                (from_iso, to_iso, from_iso, to_iso),
+            )
+            if not sales_docs.empty:
+                st.markdown("##### Sales PDFs by staff")
+                sales_docs = fmt_dates(sales_docs, ["record_date"])
+                sales_docs["amount"] = sales_docs["amount"].apply(
+                    lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
+                )
+                for staff_name in sales_staff_summary["staff"].tolist():
+                    staff_docs = sales_docs[sales_docs["staff"] == staff_name]
+                    if staff_docs.empty:
+                        continue
+                    with st.expander(f"{staff_name} • Quotation / Order PDFs", expanded=False):
+                        header_cols = st.columns([2, 2, 2, 2, 2, 2])
+                        header_cols[0].markdown("**Type**")
+                        header_cols[1].markdown("**Reference**")
+                        header_cols[2].markdown("**Date**")
+                        header_cols[3].markdown("**Amount**")
+                        header_cols[4].markdown("**Details**")
+                        header_cols[5].markdown("**PDFs**")
+                        for row_index, row in staff_docs.iterrows():
+                            cols = st.columns([2, 2, 2, 2, 2, 2])
+                            cols[0].write(row.get("record_type") or "Document")
+                            cols[1].write(row.get("reference") or "—")
+                            cols[2].write(row.get("record_date") or "—")
+                            cols[3].write(row.get("amount") or "—")
+                            cols[4].write("—")
+                            attachments = []
+                            payload, filename = _resolve_recent_pdf_bytes(row.get("file_path"))
+                            if payload and filename:
+                                attachments.append(("Document", payload, filename))
+                            if RECEIPTS_ENABLED:
+                                payload, filename = _resolve_recent_pdf_bytes(
+                                    row.get("payment_receipt_path")
+                                )
+                                if payload and filename:
+                                    attachments.append(("Receipt", payload, filename))
+                            if attachments:
+                                for label, payload, filename in attachments:
+                                    cols[5].download_button(
+                                        label,
+                                        payload,
+                                        file_name=filename,
+                                        key=f"sales_doc_{staff_name}_{row_index}_{label}",
+                                        mime="application/pdf",
+                                    )
+                            else:
+                                cols[5].write("—")
 
     st.markdown("### Staff activity history")
     staff_df = df_query(conn, "SELECT user_id, username FROM users ORDER BY LOWER(username)")
@@ -12340,6 +12569,75 @@ def dashboard(conn):
         "History keyword",
         key="dashboard_team_history_keyword",
         help="Search inside activity details and event names.",
+    )
+    history_date_clause = ""
+    history_date_params: list[object] = []
+    if history_start:
+        history_date_clause += " AND date({column}) >= date(?)"
+        history_date_params.append(history_start)
+    if history_end:
+        history_date_clause += " AND date({column}) <= date(?)"
+        history_date_params.append(history_end)
+
+    staff_label = staff_map.get(history_staff, "Team member")
+    quotation_metrics = df_query(
+        conn,
+        f"""
+        SELECT COUNT(*) AS total_quotes,
+               ROUND(SUM(COALESCE(total_amount, 0)), 2) AS total_amount
+        FROM quotations
+        WHERE deleted_at IS NULL
+          AND created_by = ?
+          {history_date_clause.format(column="COALESCE(quote_date, created_at)")}
+        """,
+        (history_staff, *history_date_params),
+    )
+    order_metrics = df_query(
+        conn,
+        f"""
+        SELECT SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
+               SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
+               ROUND(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'delivery_order' THEN COALESCE(total_amount, 0) ELSE 0 END), 2) AS delivery_value,
+               ROUND(SUM(CASE WHEN COALESCE(record_type, 'delivery_order') = 'work_done' THEN COALESCE(total_amount, 0) ELSE 0 END), 2) AS work_order_value
+        FROM delivery_orders
+        WHERE deleted_at IS NULL
+          AND (
+            created_by = ?
+            OR LOWER(COALESCE(sales_person, '')) = LOWER(?)
+          )
+          {history_date_clause.format(column="COALESCE(delivery_date, created_at)")}
+        """,
+        (history_staff, staff_label, *history_date_params),
+    )
+    total_quotes = int(
+        quotation_metrics.iloc[0].get("total_quotes") if not quotation_metrics.empty else 0
+    )
+    total_quote_value = (
+        quotation_metrics.iloc[0].get("total_amount") if not quotation_metrics.empty else 0.0
+    )
+    total_delivery = int(
+        order_metrics.iloc[0].get("delivery_orders") if not order_metrics.empty else 0
+    )
+    total_work = int(
+        order_metrics.iloc[0].get("work_orders") if not order_metrics.empty else 0
+    )
+    total_delivery_value = (
+        order_metrics.iloc[0].get("delivery_value") if not order_metrics.empty else 0.0
+    )
+    total_work_value = (
+        order_metrics.iloc[0].get("work_order_value") if not order_metrics.empty else 0.0
+    )
+    history_metric_cols = st.columns(5)
+    history_metric_cols[0].metric("Quotations", total_quotes)
+    history_metric_cols[1].metric(
+        "Quotation value", format_money(total_quote_value) or format_number(total_quote_value)
+    )
+    history_metric_cols[2].metric("Delivery orders", total_delivery)
+    history_metric_cols[3].metric(
+        "Delivery value", format_money(total_delivery_value) or format_number(total_delivery_value)
+    )
+    history_metric_cols[4].metric(
+        "Work order value", format_money(total_work_value) or format_number(total_work_value)
     )
 
     history_filters = ["a.user_id = ?"]
@@ -12404,6 +12702,119 @@ def dashboard(conn):
             use_container_width=True,
             hide_index=True,
         )
+    staff_docs = df_query(
+        conn,
+        f"""
+        SELECT 'Quotation' AS record_type,
+               q.reference AS reference,
+               COALESCE(q.quote_date, q.created_at) AS record_date,
+               q.total_amount AS amount,
+               q.document_path AS file_path,
+               q.payment_receipt_path AS payment_receipt_path,
+               COALESCE(NULLIF(TRIM(q.subject), ''), NULLIF(TRIM(q.remarks_internal), ''), '—') AS details
+        FROM quotations q
+        WHERE q.deleted_at IS NULL
+          AND q.created_by = ?
+          {history_date_clause.format(column="COALESCE(q.quote_date, q.created_at)")}
+        UNION ALL
+        SELECT CASE
+                   WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done'
+                   THEN 'Work order'
+                   ELSE 'Delivery order'
+               END AS record_type,
+               d.do_number AS reference,
+               COALESCE(d.delivery_date, d.created_at) AS record_date,
+               d.total_amount AS amount,
+               d.file_path AS file_path,
+               d.payment_receipt_path AS payment_receipt_path,
+               COALESCE(NULLIF(TRIM(d.description), ''), '—') AS details
+        FROM delivery_orders d
+        WHERE d.deleted_at IS NULL
+          AND (
+            d.created_by = ?
+            OR LOWER(COALESCE(d.sales_person, '')) = LOWER(?)
+          )
+          {history_date_clause.format(column="COALESCE(d.delivery_date, d.created_at)")}
+        UNION ALL
+        SELECT 'Service' AS record_type,
+               CAST(s.service_id AS TEXT) AS reference,
+               COALESCE(s.service_start_date, s.service_date, s.updated_at) AS record_date,
+               s.bill_amount AS amount,
+               s.bill_document_path AS file_path,
+               s.payment_receipt_path AS payment_receipt_path,
+               COALESCE(NULLIF(TRIM(s.description), ''), '—') AS details
+        FROM services s
+        WHERE s.deleted_at IS NULL
+          AND s.created_by = ?
+          {history_date_clause.format(column="COALESCE(s.service_start_date, s.service_date, s.updated_at)")}
+        UNION ALL
+        SELECT 'Maintenance' AS record_type,
+               CAST(m.maintenance_id AS TEXT) AS reference,
+               COALESCE(m.maintenance_start_date, m.maintenance_date, m.updated_at) AS record_date,
+               m.total_amount AS amount,
+               NULL AS file_path,
+               m.payment_receipt_path AS payment_receipt_path,
+               COALESCE(NULLIF(TRIM(m.description), ''), '—') AS details
+        FROM maintenance_records m
+        WHERE m.deleted_at IS NULL
+          AND m.created_by = ?
+          {history_date_clause.format(column="COALESCE(m.maintenance_start_date, m.maintenance_date, m.updated_at)")}
+        """,
+        (
+            history_staff,
+            *history_date_params,
+            history_staff,
+            staff_label,
+            *history_date_params,
+            history_staff,
+            *history_date_params,
+            history_staff,
+            *history_date_params,
+        ),
+    )
+    if not staff_docs.empty:
+        st.markdown("##### Staff PDF library")
+        staff_docs = fmt_dates(staff_docs, ["record_date"])
+        staff_docs["amount"] = staff_docs["amount"].apply(
+            lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
+        )
+        header_cols = st.columns([2, 2, 2, 2, 3, 2])
+        header_cols[0].markdown("**Type**")
+        header_cols[1].markdown("**Reference**")
+        header_cols[2].markdown("**Date**")
+        header_cols[3].markdown("**Amount**")
+        header_cols[4].markdown("**Details**")
+        header_cols[5].markdown("**PDFs**")
+        for row_index, row in staff_docs.iterrows():
+            cols = st.columns([2, 2, 2, 2, 3, 2])
+            cols[0].write(row.get("record_type") or "—")
+            cols[1].write(row.get("reference") or "—")
+            cols[2].write(row.get("record_date") or "—")
+            cols[3].write(row.get("amount") or "—")
+            cols[4].write(clean_text(row.get("details")) or "—")
+            attachments = []
+            payload, filename = _resolve_recent_pdf_bytes(row.get("file_path"))
+            if payload and filename:
+                attachments.append(("Document", payload, filename))
+            if RECEIPTS_ENABLED:
+                payload, filename = _resolve_recent_pdf_bytes(
+                    row.get("payment_receipt_path")
+                )
+                if payload and filename:
+                    attachments.append(("Receipt", payload, filename))
+            if attachments:
+                for label, payload, filename in attachments:
+                    cols[5].download_button(
+                        label,
+                        payload,
+                        file_name=filename,
+                        key=f"staff_doc_{history_staff}_{row_index}_{label}",
+                        mime="application/pdf",
+                    )
+            else:
+                cols[5].write("—")
+    else:
+        st.caption("No PDF documents found for the selected staff range.")
 
 def show_expiry_notifications(conn):
     is_admin = current_user_is_admin()
