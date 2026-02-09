@@ -3659,7 +3659,13 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
         conn,
         dedent(
             """
-            SELECT quotation_id, reference, follow_up_date, reminder_label
+            SELECT quotation_id,
+                   reference,
+                   customer_company,
+                   total_amount,
+                   status,
+                   follow_up_date,
+                   reminder_label
             FROM quotations
             WHERE created_by = ?
               AND follow_up_date IS NOT NULL
@@ -3678,12 +3684,24 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
             severity = "info"
             if pd.notna(follow_dt) and follow_dt.date() <= date.today():
                 severity = "warning"
-            follow_label = format_follow_up_date(follow_date_val) or (follow_date_val or "(date pending)")
+            follow_label = format_follow_up_date(follow_date_val) or (
+                follow_date_val or "(date pending)"
+            )
+            customer_label = clean_text(row.get("customer_company")) or "(customer)"
+            amount_label = format_money(row.get("total_amount")) or ""
+            status_label = clean_text(row.get("status")) or ""
+            reminder_note = clean_text(row.get("reminder_label"))
+            message_bits = [part for part in [reminder_note, f"Due {follow_label}"] if part]
+            detail_bits = [customer_label]
+            if amount_label:
+                detail_bits.append(amount_label)
+            if status_label:
+                detail_bits.append(status_label.title())
+            message = " • ".join(message_bits + detail_bits)
             alerts.append(
                 {
                     "title": clean_text(row.get("reference")) or "Quotation follow-up",
-                    "message": clean_text(row.get("reminder_label"))
-                    or f"Follow-up scheduled for {follow_label}",
+                    "message": message,
                     "severity": severity,
                     "deep_link": {
                         "page": "Quotation",
@@ -13298,7 +13316,7 @@ def _render_notification_entry(entry: dict[str, object], *, include_actor: bool 
     message = clean_text(entry.get("message")) or ""
     st.markdown(f"{icon} **{title}**")
     if message:
-        st.write(message)
+        st.caption(message)
     details = entry.get("details") or []
     for detail in list(details)[:5]:
         st.caption(f"• {detail}")
@@ -22064,9 +22082,10 @@ def _render_quotation_management(conn):
 
 def advanced_search_page(conn):
     st.subheader("🔎 Advanced Search")
-    if not current_user_is_admin():
-        st.warning("Advanced filters are available to admins only.")
-        return
+    is_admin = current_user_is_admin()
+    current_user = get_current_user() or {}
+    if not is_admin:
+        st.caption("Staff view is limited to records created by you.")
 
     search_text = st.text_input(
         "Keyword search",
@@ -22101,18 +22120,31 @@ def advanced_search_page(conn):
         key="advanced_search_types",
     )
 
-    staff_df = df_query(conn, "SELECT user_id, username FROM users ORDER BY LOWER(username)")
-    staff_map = {
-        int(row["user_id"]): clean_text(row.get("username")) or "Team member"
-        for _, row in staff_df.iterrows()
-    }
-    staff_choices = list(staff_map.keys())
-    staff_filter = st.multiselect(
-        "Staff filter",
-        staff_choices,
-        format_func=lambda uid: staff_map.get(uid, "Team member"),
-        key="advanced_search_staff",
-    )
+    staff_filter: list[int] = []
+    if is_admin:
+        staff_df = df_query(conn, "SELECT user_id, username FROM users ORDER BY LOWER(username)")
+        staff_map = {
+            int(row["user_id"]): clean_text(row.get("username")) or "Team member"
+            for _, row in staff_df.iterrows()
+        }
+        staff_choices = list(staff_map.keys())
+        staff_filter = st.multiselect(
+            "Staff filter",
+            staff_choices,
+            format_func=lambda uid: staff_map.get(uid, "Team member"),
+            key="advanced_search_staff",
+        )
+    else:
+        user_id = current_user_id()
+        if user_id is None:
+            st.warning("Unable to identify your account for staff filtering.")
+            return
+        staff_map = {
+            int(user_id): clean_text(current_user.get("username")) or "You"
+        }
+        staff_choices = list(staff_map.keys())
+        if staff_choices:
+            staff_filter = staff_choices[:]
 
     start_iso = end_iso = None
     if isinstance(date_window, (list, tuple)) and len(date_window) == 2:
@@ -22318,6 +22350,9 @@ def advanced_search_page(conn):
             mime="text/csv",
             key="advanced_search_download",
         )
+
+    if not is_admin:
+        return
 
     st.markdown("### Staff activity history")
     if not staff_choices:
@@ -29266,6 +29301,7 @@ def main():
             "Quotation",
             "Operations",
             "Warranties",
+            "Advanced Search",
             "Reports",
         ]
     if _debug_diag_enabled():
