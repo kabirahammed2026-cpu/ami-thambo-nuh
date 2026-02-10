@@ -9,3 +9,4 @@ pypdf
 pytesseract
 pdfplumber
 dateparser
+pywebview
