@@ -5116,6 +5116,40 @@ def _ensure_auto_reference(key: str, prefix: str) -> str:
     return reference
 
 
+def _next_duplicate_do_number(
+    conn: sqlite3.Connection,
+    base_number: str,
+) -> str:
+    """Return a unique delivery/work-order number derived from a duplicate base."""
+    normalized_base = clean_text(base_number) or "DO"
+    existing = df_query(
+        conn,
+        """
+        SELECT do_number
+        FROM delivery_orders
+        WHERE LOWER(COALESCE(do_number, '')) = LOWER(?)
+           OR LOWER(COALESCE(do_number, '')) LIKE LOWER(?)
+        """,
+        (normalized_base, f"{normalized_base}-DUP%"),
+    )
+    used_indexes: set[int] = set()
+    for raw in existing.get("do_number", pd.Series(dtype=object)).tolist():
+        value = clean_text(raw)
+        if not value:
+            continue
+        if value.lower() == normalized_base.lower():
+            used_indexes.add(1)
+            continue
+        match = re.match(rf"^{re.escape(normalized_base)}-DUP(\d+)$", value, flags=re.IGNORECASE)
+        if match:
+            with contextlib.suppress(Exception):
+                used_indexes.add(int(match.group(1)))
+    next_index = 2
+    while next_index in used_indexes:
+        next_index += 1
+    return f"{normalized_base}-DUP{next_index}"
+
+
 def _reset_new_customer_form_state() -> None:
     default_products = _default_new_customer_products()
     st.session_state["new_customer_products_rows"] = default_products
@@ -10161,6 +10195,60 @@ def dashboard(conn):
         conn,
         dedent(
             f"""
+            WITH scoped_quotes AS (
+                SELECT q.quotation_id,
+                       q.quote_date,
+                       q.created_at,
+                       q.status,
+                       LOWER(TRIM(COALESCE(q.customer_name, ''))) AS customer_name_key,
+                       LOWER(TRIM(COALESCE(q.customer_company, ''))) AS customer_company_key,
+                       LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(q.customer_contact, '')), ' ', ''), '-', ''), '(', ''), ')', ''), '+', '')) AS customer_contact_key
+                FROM quotations q
+                {quote_clause}
+            ),
+            quote_customer_candidates AS (
+                SELECT sq.quotation_id,
+                       c.customer_id
+                FROM scoped_quotes sq
+                JOIN customers c
+                  ON (
+                        sq.customer_contact_key <> ''
+                        AND LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(c.phone, '')), ' ', ''), '-', ''), '(', ''), ')', ''), '+', '')) = sq.customer_contact_key
+                     )
+                  OR (
+                        sq.customer_name_key <> ''
+                        AND LOWER(TRIM(COALESCE(c.name, ''))) = sq.customer_name_key
+                     )
+                  OR (
+                        sq.customer_company_key <> ''
+                        AND LOWER(TRIM(COALESCE(c.company_name, ''))) = sq.customer_company_key
+                     )
+            ),
+            converted_quotes AS (
+                SELECT DISTINCT qcc.quotation_id
+                FROM quote_customer_candidates qcc
+                WHERE EXISTS (
+                    SELECT 1 FROM delivery_orders d
+                    WHERE d.deleted_at IS NULL AND d.customer_id = qcc.customer_id
+                )
+                   OR EXISTS (
+                    SELECT 1 FROM services s
+                    WHERE s.deleted_at IS NULL AND s.customer_id = qcc.customer_id
+                )
+                   OR EXISTS (
+                    SELECT 1 FROM maintenance_records m
+                    WHERE m.deleted_at IS NULL AND m.customer_id = qcc.customer_id
+                )
+                   OR EXISTS (
+                    SELECT 1 FROM operations_other_documents o
+                    WHERE o.deleted_at IS NULL AND o.customer_id = qcc.customer_id
+                )
+                   OR EXISTS (
+                    SELECT 1 FROM customer_documents cd
+                    WHERE cd.deleted_at IS NULL AND cd.customer_id = qcc.customer_id
+                      AND LOWER(TRIM(COALESCE(cd.doc_type, ''))) IN ('work done', 'workdone')
+                )
+            )
             SELECT COUNT(*) AS total_quotes,
                    SUM(
                        CASE
@@ -10176,9 +10264,15 @@ def dashboard(conn):
                            ELSE 0
                        END
                    ) AS monthly_quotes,
-                   SUM(CASE WHEN LOWER(status) = 'paid' THEN 1 ELSE 0 END) AS paid_quotes
-            FROM quotations
-            {quote_clause}
+                   SUM(CASE WHEN LOWER(status) = 'paid' THEN 1 ELSE 0 END) AS paid_quotes,
+                   SUM(
+                       CASE
+                           WHEN quotation_id IN (SELECT quotation_id FROM converted_quotes)
+                           THEN 1
+                           ELSE 0
+                       END
+                   ) AS converted_quotes
+            FROM scoped_quotes
             """
         ),
         quote_params,
@@ -10214,17 +10308,19 @@ def dashboard(conn):
         weekly_quotes = 0
         monthly_quotes = 0
         paid_quotes = 0
+        converted_quotes = 0
     else:
         total_quotes = int(quote_metrics.iloc[0].get("total_quotes") or 0)
         weekly_quotes = int(quote_metrics.iloc[0].get("weekly_quotes") or 0)
         monthly_quotes = int(quote_metrics.iloc[0].get("monthly_quotes") or 0)
         paid_quotes = int(quote_metrics.iloc[0].get("paid_quotes") or 0)
-    conversion = (paid_quotes / total_quotes) * 100 if total_quotes else 0.0
+        converted_quotes = int(quote_metrics.iloc[0].get("converted_quotes") or 0)
+    conversion = (converted_quotes / total_quotes) * 100 if total_quotes else 0.0
     metrics_cols = st.columns(5)
     metrics_cols[0].metric("Quotations created", total_quotes)
     metrics_cols[1].metric("Weekly quotations", weekly_quotes)
     metrics_cols[2].metric("Monthly quotations", monthly_quotes)
-    metrics_cols[3].metric("Paid / converted", paid_quotes)
+    metrics_cols[3].metric("Paid / converted", f"{paid_quotes} / {converted_quotes}")
     metrics_cols[4].metric("Conversion rate", f"{conversion:.1f}%")
 
     if quotes_df.empty:
@@ -12232,6 +12328,27 @@ def dashboard(conn):
                 FROM maintenance_records m
                 LEFT JOIN delivery_orders d ON d.do_number = m.do_number
                 WHERE m.deleted_at IS NULL
+                UNION ALL
+                SELECT cd.uploaded_by AS staff_id,
+                       'work_done_doc' AS activity_type,
+                       COALESCE(date(cd.uploaded_at), date(cd.updated_at)) AS work_date,
+                       'completed' AS work_status,
+                       0 AS amount,
+                       cd.customer_id,
+                       NULL AS do_customer_id
+                FROM customer_documents cd
+                WHERE cd.deleted_at IS NULL
+                  AND LOWER(TRIM(COALESCE(cd.doc_type, ''))) IN ('work done', 'workdone')
+                UNION ALL
+                SELECT o.uploaded_by AS staff_id,
+                       'operations_doc' AS activity_type,
+                       COALESCE(date(o.document_date), date(o.uploaded_at), date(o.updated_at)) AS work_date,
+                       'completed' AS work_status,
+                       0 AS amount,
+                       o.customer_id,
+                       NULL AS do_customer_id
+                FROM operations_other_documents o
+                WHERE o.deleted_at IS NULL
             )
             SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
                    COUNT(*) AS total_tasks,
@@ -12276,6 +12393,27 @@ def dashboard(conn):
                     FROM maintenance_records m
                     LEFT JOIN delivery_orders d ON d.do_number = m.do_number
                     WHERE m.deleted_at IS NULL
+                    UNION ALL
+                    SELECT cd.uploaded_by AS staff_id,
+                           'work_done_doc' AS activity_type,
+                           COALESCE(date(cd.uploaded_at), date(cd.updated_at)) AS work_date,
+                           'completed' AS work_status,
+                           0 AS amount,
+                           cd.customer_id,
+                           NULL AS do_customer_id
+                    FROM customer_documents cd
+                    WHERE cd.deleted_at IS NULL
+                      AND LOWER(TRIM(COALESCE(cd.doc_type, ''))) IN ('work done', 'workdone')
+                    UNION ALL
+                    SELECT o.uploaded_by AS staff_id,
+                           'operations_doc' AS activity_type,
+                           COALESCE(date(o.document_date), date(o.uploaded_at), date(o.updated_at)) AS work_date,
+                           'completed' AS work_status,
+                           0 AS amount,
+                           o.customer_id,
+                           NULL AS do_customer_id
+                    FROM operations_other_documents o
+                    WHERE o.deleted_at IS NULL
                 )
                 SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
                        COUNT(*) AS total_tasks,
@@ -12504,36 +12642,54 @@ def dashboard(conn):
                 (from_iso, to_iso, *allowed_customers),
             )
 
+        quotation_summary = df_query(
+            conn,
+            """
+            SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
+                   COUNT(*) AS total_quotes,
+                   ROUND(SUM(COALESCE(q.total_amount, 0)), 2) AS quotation_value
+            FROM quotations q
+            LEFT JOIN users u ON u.user_id = q.created_by
+            WHERE q.deleted_at IS NULL
+              AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)
+            GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
+            """,
+            (from_iso, to_iso),
+        )
+
+        if not sales_staff_summary.empty and not quotation_summary.empty:
+            sales_staff_summary = sales_staff_summary.merge(
+                quotation_summary, on="staff", how="outer"
+            )
+        elif sales_staff_summary.empty and not quotation_summary.empty:
+            sales_staff_summary = quotation_summary.copy()
+        elif not sales_staff_summary.empty:
+            sales_staff_summary["total_quotes"] = 0
+            sales_staff_summary["quotation_value"] = 0.0
+
+        if not sales_staff_summary.empty:
+            for col in [
+                "total_orders",
+                "delivery_orders",
+                "work_orders",
+                "total_quotes",
+            ]:
+                if col not in sales_staff_summary.columns:
+                    sales_staff_summary[col] = 0
+                sales_staff_summary[col] = sales_staff_summary[col].fillna(0)
+            for col in [
+                "total_value",
+                "delivery_value",
+                "work_order_value",
+                "quotation_value",
+            ]:
+                if col not in sales_staff_summary.columns:
+                    sales_staff_summary[col] = 0.0
+                sales_staff_summary[col] = sales_staff_summary[col].fillna(0.0)
+
         if sales_staff_summary.empty:
             st.info("No sales staff activity found in the selected date range.")
         else:
-            quotation_summary = df_query(
-                conn,
-                """
-                SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
-                       COUNT(*) AS total_quotes,
-                       ROUND(SUM(COALESCE(q.total_amount, 0)), 2) AS quotation_value
-                FROM quotations q
-                LEFT JOIN users u ON u.user_id = q.created_by
-                WHERE q.deleted_at IS NULL
-                  AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)
-                GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
-                """,
-                (from_iso, to_iso),
-            )
-            if not quotation_summary.empty:
-                sales_staff_summary = sales_staff_summary.merge(
-                    quotation_summary, on="staff", how="left"
-                )
-                sales_staff_summary["total_quotes"] = sales_staff_summary[
-                    "total_quotes"
-                ].fillna(0)
-                sales_staff_summary["quotation_value"] = sales_staff_summary[
-                    "quotation_value"
-                ].fillna(0.0)
-            else:
-                sales_staff_summary["total_quotes"] = 0
-                sales_staff_summary["quotation_value"] = 0.0
             sales_totals = {
                 "staff": int(sales_staff_summary["staff"].nunique()),
                 "orders": int(sales_staff_summary["total_orders"].sum()),
@@ -21632,6 +21788,7 @@ def _render_quotation_management(conn):
         path_value: Optional[str],
         *,
         key_prefix: str,
+        allow_inline_preview: bool = True,
     ) -> None:
         if not path_value:
             st.caption(f"{label}: not attached.")
@@ -21661,24 +21818,25 @@ def _render_quotation_management(conn):
             file_name=resolved.name,
             key=f"{key_prefix}_{resolved.stem}",
         )
-        suffix = resolved.suffix.lower()
-        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
-            with st.expander(f"Preview {label}", expanded=False):
-                st.image(data, caption=resolved.name, use_container_width=True)
-        elif suffix == ".pdf":
-            with st.expander(f"Preview {label}", expanded=False):
-                encoded = base64.b64encode(data).decode("utf-8")
-                st_components_html(
-                    f"""
-                    <iframe
-                        src="data:application/pdf;base64,{encoded}"
-                        width="100%"
-                        height="520"
-                        style="border: none;"
-                    ></iframe>
-                    """,
-                    height=520,
-                )
+        if allow_inline_preview:
+            suffix = resolved.suffix.lower()
+            if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+                with st.expander(f"Preview {label}", expanded=False):
+                    st.image(data, caption=resolved.name, use_container_width=True)
+            elif suffix == ".pdf":
+                with st.expander(f"Preview {label}", expanded=False):
+                    encoded = base64.b64encode(data).decode("utf-8")
+                    st_components_html(
+                        f"""
+                        <iframe
+                            src="data:application/pdf;base64,{encoded}"
+                            width="100%"
+                            height="520"
+                            style="border: none;"
+                        ></iframe>
+                        """,
+                        height=520,
+                    )
 
     quotes_df = quotes_df.copy()
     quotes_df["follow_up_date"] = quotes_df.get("follow_up_date", pd.Series(dtype=object)).apply(
@@ -21881,6 +22039,7 @@ def _render_quotation_management(conn):
         "Quotation document",
         clean_text(selected_row.get("document_path")),
         key_prefix=f"quotation_doc_{selected_detail_id}",
+        allow_inline_preview=False,
     )
     if RECEIPTS_ENABLED:
         _render_attachment_preview(
@@ -23204,6 +23363,7 @@ def _reset_delivery_order_form_state(record_type_key: str) -> None:
     st.session_state[f"{key_prefix}_status"] = "due"
     st.session_state[f"{key_prefix}_delivery_date"] = ""
     st.session_state[f"{key_prefix}_file_path"] = ""
+    st.session_state[f"{record_type_key}_allow_duplicate_ref"] = False
     for key in (f"{key_prefix}_form_loader", f"{key_prefix}_items_editor"):
         st.session_state.pop(key, None)
     for record_key in ("delivery_order", "work_done"):
@@ -23281,6 +23441,7 @@ def delivery_orders_page(
     st.session_state.setdefault(status_key, "due")
     st.session_state.setdefault(delivery_date_key, "")
     st.session_state.setdefault(file_path_key, "")
+    st.session_state.setdefault(f"{record_type_key}_allow_duplicate_ref", False)
     autofill_customer_key = f"{record_type_key}_autofill_customer"
     st.session_state.setdefault(autofill_customer_key, None)
     st.session_state.setdefault(manual_customer_toggle_key, False)
@@ -23489,6 +23650,12 @@ def delivery_orders_page(
         st.caption(
             f"Estimated total: {format_money(estimated_total) or format_number(estimated_total)}"
         )
+        if not selected_existing:
+            st.checkbox(
+                "Allow duplicate reference (save with DUP tag)",
+                key=f"{record_type_key}_allow_duplicate_ref",
+                help="Use this when you intentionally need another entry with the same reference number.",
+            )
         submit = st.form_submit_button(f"Save {record_label_lower}", type="primary")
 
     current_file_path = clean_text(st.session_state.get(file_path_key))
@@ -23530,11 +23697,38 @@ def delivery_orders_page(
                     f"This number is already used for a {conflict_label.replace('_', ' ')}. Choose a different {record_label_lower} number."
                 )
                 return
-            existing = df_query(
+
+            duplicate_ref_matches = df_query(
                 conn,
-                "SELECT file_path, items_payload, total_amount, created_by, status, deleted_at, delivery_date FROM delivery_orders WHERE do_number = ? AND COALESCE(record_type, 'delivery_order') = ?",
+                """
+                SELECT do_number
+                FROM delivery_orders
+                WHERE do_number = ?
+                  AND COALESCE(record_type, 'delivery_order') = ?
+                  AND deleted_at IS NULL
+                """,
                 (cleaned_number, record_type_key),
             )
+            allow_duplicate_ref = bool(
+                st.session_state.get(f"{record_type_key}_allow_duplicate_ref", False)
+            )
+            if (
+                selected_existing is None
+                and not duplicate_ref_matches.empty
+                and not allow_duplicate_ref
+            ):
+                st.warning(
+                    f"{record_label} number {cleaned_number} already exists. If this is an intentional duplicate entry, tick 'Allow duplicate reference' and save again."
+                )
+                return
+            if selected_existing is None:
+                existing = pd.DataFrame()
+            else:
+                existing = df_query(
+                    conn,
+                    "SELECT file_path, items_payload, total_amount, created_by, status, deleted_at, delivery_date FROM delivery_orders WHERE do_number = ? AND COALESCE(record_type, 'delivery_order') = ?",
+                    (cleaned_number, record_type_key),
+                )
             stored_path = None
             existing_status = "due"
             existing_deleted_at = None
@@ -23542,6 +23736,11 @@ def delivery_orders_page(
                 stored_path = clean_text(existing.iloc[0].get("file_path"))
                 existing_status = normalize_delivery_status(existing.iloc[0].get("status"))
                 existing_deleted_at = clean_text(existing.iloc[0].get("deleted_at"))
+
+            final_number = cleaned_number
+            if selected_existing is None and not duplicate_ref_matches.empty:
+                final_number = _next_duplicate_do_number(conn, cleaned_number)
+
             existing_file_path = stored_path
             if document_upload is not None:
                 validation_error = _validate_upload(
@@ -23552,7 +23751,7 @@ def delivery_orders_page(
                 if validation_error:
                     st.error(f"Document upload failed: {validation_error}")
                     return
-                safe_number = _sanitize_path_component(cleaned_number) or record_type_key
+                safe_number = _sanitize_path_component(final_number) or record_type_key
                 doc_ext = _upload_extension(document_upload, default=".pdf")
                 saved_path = save_uploaded_file(
                     document_upload,
@@ -23589,7 +23788,7 @@ def delivery_orders_page(
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
                     """,
                     (
-                        cleaned_number,
+                        final_number,
                         int(selected_customer) if selected_customer else None,
                         clean_text(description),
                         clean_text(sales_person),
@@ -23603,6 +23802,7 @@ def delivery_orders_page(
                         record_type_key,
                     ),
                 )
+                cleaned_number = final_number
             else:
                 existing_creator = existing.iloc[0].get("created_by")
                 cur.execute(
@@ -23668,9 +23868,14 @@ def delivery_orders_page(
             )
 
             st.session_state[reset_pending_key] = True
-            st.session_state[feedback_key] = (
-                f"{record_label} {cleaned_number} saved successfully."
-            )
+            if selected_existing is None and duplicate_ref_matches.shape[0] > 0:
+                st.session_state[feedback_key] = (
+                    f"{record_label} duplicate reference detected. Saved as {cleaned_number}."
+                )
+            else:
+                st.session_state[feedback_key] = (
+                    f"{record_label} {cleaned_number} saved successfully."
+                )
             _safe_rerun()
             return
 
@@ -25883,6 +26088,31 @@ def duplicates_page(conn):
     if not cust_raw.empty:
         cust_raw = cust_raw.copy()
         cust_raw["__phone_key"] = cust_raw["phone"].apply(_normalize_phone_key)
+        duplicate_signals = {
+            "__phone_key": cust_raw["__phone_key"],
+            "__name_key": cust_raw["name"].apply(lambda value: (clean_text(value) or "").lower()),
+            "__company_key": cust_raw["company_name"].apply(lambda value: (clean_text(value) or "").lower()),
+            "__address_key": cust_raw["address"].apply(lambda value: (clean_text(value) or "").lower()),
+            "__delivery_key": cust_raw["delivery_address"].apply(lambda value: (clean_text(value) or "").lower()),
+            "__product_key": cust_raw["product_info"].apply(lambda value: (clean_text(value) or "").lower()),
+            "__do_key": cust_raw["delivery_order_code"].apply(lambda value: (clean_text(value) or "").lower()),
+            "__purchase_key": cust_raw["purchase_date"].apply(
+                lambda value: parse_date_value(value).strftime("%Y-%m-%d")
+                if parse_date_value(value) is not None
+                else ""
+            ),
+        }
+        for key, values in duplicate_signals.items():
+            cust_raw[key] = values
+
+        duplicate_membership = pd.Series(False, index=cust_raw.index)
+        for key in duplicate_signals.keys():
+            non_blank = cust_raw[key].astype(str).str.strip() != ""
+            counts = cust_raw.loc[non_blank, key].value_counts(dropna=False)
+            repeated_values = set(counts[counts > 1].index.tolist())
+            if repeated_values:
+                duplicate_membership = duplicate_membership | cust_raw[key].isin(repeated_values)
+
         phone_counts = (
             cust_raw[cust_raw["__phone_key"].notna()]
             .groupby("__phone_key")["id"]
@@ -25892,8 +26122,11 @@ def duplicates_page(conn):
         cust_raw["__live_dup_flag"] = cust_raw["__phone_key"].apply(
             lambda key: 1 if key and phone_counts.get(key, 0) > 1 else 0
         )
+        cust_raw["__possible_dup_flag"] = duplicate_membership.astype(int)
         duplicate_customers = cust_raw[
-            (cust_raw["dup_flag"] == 1) | (cust_raw["__live_dup_flag"] == 1)
+            (cust_raw["dup_flag"] == 1)
+            | (cust_raw["__live_dup_flag"] == 1)
+            | (cust_raw["__possible_dup_flag"] == 1)
         ].copy()
     if duplicate_customers.empty:
         st.success("No customer duplicates detected at the moment.")
@@ -25970,7 +26203,7 @@ def duplicates_page(conn):
             display_df["Created"] = display_df["Created"].fillna("-")
             st.markdown("#### Duplicate rows")
             st.caption(
-                "Each duplicate set groups rows sharing the same phone, purchase date, and product so you can double-check real multi-unit sales."
+                "Possible duplicates are flagged when any key field matches another row. Phone number is still the strongest unique key and is auto-merged when identical."
             )
             st.dataframe(display_df, use_container_width=True, hide_index=True)
             combined_preview = (
@@ -28116,7 +28349,7 @@ def reports_page(conn):
         previous_hash = st.session_state.get("report_grid_import_file_hash")
         if previous_hash and previous_hash != file_hash:
             _reset_report_import_state(clear_uploader=False)
-        import_payload_is_new = True
+        import_payload_is_new = previous_hash != file_hash
         import_payload = {
             "name": import_file.name,
             "data": import_bytes,
@@ -28124,8 +28357,9 @@ def reports_page(conn):
         }
         st.session_state["report_grid_import_payload"] = import_payload
         st.session_state["report_grid_import_file_hash"] = file_hash
-        st.session_state.pop("report_grid_mapping_choices", None)
-        st.session_state["report_grid_mapping_saved"] = False
+        if import_payload_is_new:
+            st.session_state.pop("report_grid_mapping_choices", None)
+            st.session_state["report_grid_mapping_saved"] = False
 
     if import_payload:
         file_hash = import_payload.get("hash") or st.session_state.get(
