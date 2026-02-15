@@ -12437,6 +12437,79 @@ def dashboard(conn):
             )
             service_staff_summary = scoped_service_activity
 
+        service_report_rows = df_query(
+            conn,
+            """
+            SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
+                   wr.grid_payload
+            FROM work_reports wr
+            LEFT JOIN users u ON u.user_id = wr.user_id
+            WHERE date(wr.period_start) BETWEEN date(?) AND date(?)
+              AND LOWER(COALESCE(wr.report_template, '')) = 'service'
+              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'service')
+            """,
+            (from_iso, to_iso),
+        )
+        if not service_report_rows.empty:
+            report_aggregate: dict[str, dict[str, float]] = {}
+            for _, row in service_report_rows.iterrows():
+                staff_name = clean_text(row.get("staff")) or "Unassigned"
+                grid_rows = parse_report_grid_payload(
+                    row.get("grid_payload"), template_key="service"
+                )
+                if not grid_rows:
+                    continue
+                aggregates = report_aggregate.setdefault(
+                    staff_name,
+                    {
+                        "total_tasks": 0.0,
+                        "completed_tasks": 0.0,
+                        "pending_tasks": 0.0,
+                        "billed_amount": 0.0,
+                        "service_amount": 0.0,
+                        "maintenance_amount": 0.0,
+                    },
+                )
+                for entry in grid_rows:
+                    aggregates["total_tasks"] += 1.0
+                    progress = clean_text(entry.get("progress_status")).lower()
+                    if progress == "done":
+                        aggregates["completed_tasks"] += 1.0
+                    else:
+                        aggregates["pending_tasks"] += 1.0
+                    billed = _coerce_grid_number(
+                        entry.get("bill_price_tk")
+                        or entry.get("amount_tk")
+                        or entry.get("price_tk")
+                    )
+                    if billed is not None:
+                        aggregates["billed_amount"] += billed
+                        aggregates["service_amount"] += billed
+
+            if report_aggregate:
+                report_df = pd.DataFrame(
+                    [{"staff": name, **values} for name, values in report_aggregate.items()]
+                )
+                if service_staff_summary.empty:
+                    service_staff_summary = report_df
+                else:
+                    service_staff_summary = (
+                        pd.concat([service_staff_summary, report_df], ignore_index=True)
+                        .groupby("staff", as_index=False)[
+                            [
+                                "total_tasks",
+                                "completed_tasks",
+                                "pending_tasks",
+                                "billed_amount",
+                                "service_amount",
+                                "maintenance_amount",
+                            ]
+                        ]
+                        .sum()
+                    )
+                for col in ["total_tasks", "completed_tasks", "pending_tasks"]:
+                    service_staff_summary[col] = service_staff_summary[col].round().astype(int)
+
         if service_staff_summary.empty:
             st.info("No service staff activity found in the selected date range.")
         else:
@@ -12652,10 +12725,61 @@ def dashboard(conn):
             LEFT JOIN users u ON u.user_id = q.created_by
             WHERE q.deleted_at IS NULL
               AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)
+              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
             GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
             """,
             (from_iso, to_iso),
         )
+
+        sales_report_summary = df_query(
+            conn,
+            """
+            SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
+                   wr.grid_payload
+            FROM work_reports wr
+            LEFT JOIN users u ON u.user_id = wr.user_id
+            WHERE date(wr.period_start) BETWEEN date(?) AND date(?)
+              AND LOWER(COALESCE(wr.report_template, '')) = 'sales'
+              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
+            """,
+            (from_iso, to_iso),
+        )
+        if not sales_report_summary.empty:
+            report_aggregate: dict[str, dict[str, float]] = {}
+            for _, row in sales_report_summary.iterrows():
+                staff_name = clean_text(row.get("staff")) or "Unassigned"
+                grid_rows = parse_report_grid_payload(
+                    row.get("grid_payload"), template_key="sales"
+                )
+                if not grid_rows:
+                    continue
+                aggregates = report_aggregate.setdefault(
+                    staff_name,
+                    {
+                        "report_entries": 0.0,
+                        "report_value": 0.0,
+                    },
+                )
+                for entry in grid_rows:
+                    aggregates["report_entries"] += 1.0
+                    amount = _coerce_grid_number(
+                        entry.get("amount_tk")
+                        or entry.get("price_tk")
+                        or entry.get("bill_price_tk")
+                    )
+                    if amount is not None:
+                        aggregates["report_value"] += amount
+
+            if report_aggregate:
+                sales_report_df = pd.DataFrame(
+                    [{"staff": name, **values} for name, values in report_aggregate.items()]
+                )
+                if sales_staff_summary.empty:
+                    sales_staff_summary = sales_report_df
+                else:
+                    sales_staff_summary = sales_staff_summary.merge(
+                        sales_report_df, on="staff", how="outer"
+                    )
 
         if not sales_staff_summary.empty and not quotation_summary.empty:
             sales_staff_summary = sales_staff_summary.merge(
@@ -12673,6 +12797,7 @@ def dashboard(conn):
                 "delivery_orders",
                 "work_orders",
                 "total_quotes",
+                "report_entries",
             ]:
                 if col not in sales_staff_summary.columns:
                     sales_staff_summary[col] = 0
@@ -12682,10 +12807,19 @@ def dashboard(conn):
                 "delivery_value",
                 "work_order_value",
                 "quotation_value",
+                "report_value",
             ]:
                 if col not in sales_staff_summary.columns:
                     sales_staff_summary[col] = 0.0
                 sales_staff_summary[col] = sales_staff_summary[col].fillna(0.0)
+            for col in [
+                "total_orders",
+                "delivery_orders",
+                "work_orders",
+                "total_quotes",
+                "report_entries",
+            ]:
+                sales_staff_summary[col] = sales_staff_summary[col].round().astype(int)
 
         if sales_staff_summary.empty:
             st.info("No sales staff activity found in the selected date range.")
@@ -12709,6 +12843,7 @@ def dashboard(conn):
                 "delivery_value",
                 "work_order_value",
                 "quotation_value",
+                "report_value",
             ]:
                 sales_staff_summary[col] = sales_staff_summary[col].apply(
                     lambda value: format_money(value) or format_number(value)
@@ -12722,6 +12857,8 @@ def dashboard(conn):
                         "delivery_orders": "Delivery orders",
                         "work_orders": "Work orders",
                         "quotation_value": "Quotation value",
+                        "report_entries": "Report entries",
+                        "report_value": "Report value",
                         "delivery_value": "Delivery value",
                         "work_order_value": "Work order value",
                         "total_value": "Order value (total)",
