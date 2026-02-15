@@ -12244,11 +12244,6 @@ def dashboard(conn):
             LEFT JOIN users u ON u.user_id = sa.staff_id
             WHERE sa.work_date IS NOT NULL
               AND date(sa.work_date) BETWEEN date(?) AND date(?)
-              AND (
-                u.staff_classification IS NULL
-                OR TRIM(u.staff_classification) = ''
-                OR LOWER(TRIM(u.staff_classification)) LIKE 'service%'
-              )
             GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
             ORDER BY total_tasks DESC, staff ASC
             """,
@@ -12297,11 +12292,6 @@ def dashboard(conn):
                     sa.customer_id IN ({placeholders})
                     OR sa.do_customer_id IN ({placeholders})
                   )
-                  AND (
-                    u.staff_classification IS NULL
-                    OR TRIM(u.staff_classification) = ''
-                    OR LOWER(TRIM(u.staff_classification)) LIKE 'service%'
-                  )
                 GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
                 ORDER BY total_tasks DESC, staff ASC
                 """.format(placeholders=",".join(["?"] * len(allowed_customers))),
@@ -12312,6 +12302,20 @@ def dashboard(conn):
         if service_staff_summary.empty:
             st.info("No service staff activity found in the selected date range.")
         else:
+            service_totals = {
+                "staff": int(service_staff_summary["staff"].nunique()),
+                "tasks": int(service_staff_summary["total_tasks"].sum()),
+                "completed": int(service_staff_summary["completed_tasks"].sum()),
+                "billed": float(service_staff_summary["billed_amount"].sum()),
+            }
+            service_metrics = st.columns(4)
+            service_metrics[0].metric("Active staff", service_totals["staff"])
+            service_metrics[1].metric("Total tasks", service_totals["tasks"])
+            service_metrics[2].metric("Completed", service_totals["completed"])
+            service_metrics[3].metric(
+                "Total billed",
+                format_money(service_totals["billed"]) or format_number(service_totals["billed"]),
+            )
             for col in ["billed_amount", "service_amount", "maintenance_amount"]:
                 service_staff_summary[col] = service_staff_summary[col].apply(
                     lambda value: format_money(value) or format_number(value)
@@ -12530,6 +12534,20 @@ def dashboard(conn):
             else:
                 sales_staff_summary["total_quotes"] = 0
                 sales_staff_summary["quotation_value"] = 0.0
+            sales_totals = {
+                "staff": int(sales_staff_summary["staff"].nunique()),
+                "orders": int(sales_staff_summary["total_orders"].sum()),
+                "quotes": int(sales_staff_summary["total_quotes"].sum()),
+                "value": float(sales_staff_summary["total_value"].sum()),
+            }
+            sales_metrics = st.columns(4)
+            sales_metrics[0].metric("Active staff", sales_totals["staff"])
+            sales_metrics[1].metric("Total orders", sales_totals["orders"])
+            sales_metrics[2].metric("Quotations", sales_totals["quotes"])
+            sales_metrics[3].metric(
+                "Order value",
+                format_money(sales_totals["value"]) or format_number(sales_totals["value"]),
+            )
             for col in [
                 "total_value",
                 "delivery_value",
@@ -27191,6 +27209,68 @@ def _lookup_customer_id_for_merge(
     return None
 
 
+def _sync_report_customers(
+    conn,
+    *,
+    report_owner_id: int,
+    template_key: str,
+    grid_rows: Iterable[dict],
+    period_label: str,
+) -> None:
+    """Ensure report-entered customers are linked into the main customers table."""
+
+    normalized_rows = _normalize_grid_rows(grid_rows, template_key=template_key)
+    if not normalized_rows:
+        return
+
+    for row in normalized_rows:
+        if template_key in {"service", "sales"}:
+            customer_name = clean_text(row.get("customer_name"))
+            company_name = clean_text(row.get("company_name"))
+            phone = clean_text(row.get("phone"))
+            address = clean_text(row.get("address"))
+            product = clean_text(row.get("product_details"))
+        elif template_key == "follow_up":
+            customer_name = clean_text(row.get("client_name"))
+            company_name = None
+            phone = clean_text(row.get("contact"))
+            address = clean_text(row.get("address"))
+            product = clean_text(row.get("product_detail"))
+        else:
+            continue
+
+        if not any([customer_name, company_name, phone, address]):
+            continue
+
+        customer_id = _upsert_customer_from_manual_quotation(
+            conn,
+            name=customer_name,
+            company=company_name,
+            phone=phone,
+            address=address,
+            district=None,
+            reference=f"Report {period_label}",
+            created_by=report_owner_id,
+            lead_status=None,
+        )
+
+        if not customer_id or not product:
+            continue
+
+        existing_product = conn.execute(
+            "SELECT product_info FROM customers WHERE customer_id=?",
+            (int(customer_id),),
+        ).fetchone()
+        current_product = clean_text(existing_product[0]) if existing_product else None
+        if not current_product:
+            conn.execute(
+                "UPDATE customers SET product_info=? WHERE customer_id=?",
+                (product, int(customer_id)),
+            )
+
+    conn.commit()
+
+
 def _sync_report_payment_records(
     conn,
     *,
@@ -27459,7 +27539,17 @@ def upsert_work_report(
                 "Another report already exists for this period. Select it from the dropdown to edit."
             ) from exc
 
+    period_label = format_period_range(start_iso, end_iso)
+    cadence_label = REPORT_PERIOD_OPTIONS.get(key, key.title())
+
     conn.commit()
+    _sync_report_customers(
+        conn,
+        report_owner_id=user_id,
+        template_key=template_key,
+        grid_rows=grid_rows or [],
+        period_label=period_label,
+    )
     _sync_report_payment_records(
         conn,
         report_id=int(effective_id),
@@ -27468,8 +27558,6 @@ def upsert_work_report(
         grid_rows=grid_rows or [],
         period_end=end_iso,
     )
-    cadence_label = REPORT_PERIOD_OPTIONS.get(key, key.title())
-    period_label = format_period_range(start_iso, end_iso)
     owner_label = None
     try:
         owner_row = conn.execute(

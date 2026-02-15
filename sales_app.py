@@ -3951,7 +3951,7 @@ def products_sold_summary(user: Dict, limit: int = 8) -> pd.DataFrame:
     where = ""
     params: List = []
     if user["role"] == "staff":
-        where = "WHERE d.salesperson_id=?"
+        where = "WHERE owner_id=?"
         params.append(user["user_id"])
     query = textwrap.dedent(
         f"""
@@ -3961,17 +3961,24 @@ def products_sold_summary(user: Dict, limit: int = 8) -> pd.DataFrame:
                    COALESCE(qp.quantity, q.quantity, 1) AS quantity
             FROM quotations q
             LEFT JOIN quotation_products qp ON qp.quotation_id = q.quotation_id
+        ),
+        order_rows AS (
+            SELECT
+                d.do_id,
+                COALESCE(q.salesperson_id, d.salesperson_id) AS owner_id,
+                q.quotation_id
+            FROM delivery_orders d
+            LEFT JOIN work_orders w ON w.work_order_id = d.work_order_id
+            JOIN quotations q ON q.quotation_id = COALESCE(d.quotation_id, w.quotation_id)
         )
         SELECT cat.name AS product,
-               COALESCE(u.display_name, u.username) AS salesperson,
+               COALESCE(u.display_name, u.username, 'Unassigned') AS salesperson,
                SUM(pr.quantity) AS quantity,
-               COUNT(DISTINCT d.do_id) AS delivery_orders
-        FROM delivery_orders d
-        LEFT JOIN work_orders w ON w.work_order_id = d.work_order_id
-        JOIN quotations q ON q.quotation_id = COALESCE(d.quotation_id, w.quotation_id)
-        JOIN product_rows pr ON pr.quotation_id = q.quotation_id
+               COUNT(DISTINCT o.do_id) AS delivery_orders
+        FROM order_rows o
+        JOIN product_rows pr ON pr.quotation_id = o.quotation_id
         JOIN categories cat ON cat.category_id = pr.category_id
-        JOIN users u ON u.user_id = d.salesperson_id
+        LEFT JOIN users u ON u.user_id = o.owner_id
         {where}
         GROUP BY cat.name, salesperson
         ORDER BY quantity DESC, delivery_orders DESC, cat.name
