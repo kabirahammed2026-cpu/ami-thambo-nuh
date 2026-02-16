@@ -24896,6 +24896,41 @@ def customer_summary_page(conn):
         )
 
     customer_name = clean_text(info.get("name"))
+    customer_addresses = [
+        token
+        for token in (
+            clean_text(val) for val in re.split(r"[,\n]+", clean_text(info.get("address")) or "")
+        )
+        if token
+    ]
+    customer_products = [
+        token
+        for token in (
+            clean_text(val) for val in re.split(r"[,\n]+", clean_text(info.get("products")) or "")
+        )
+        if token
+    ]
+    customer_names = set()
+    customer_companies = set()
+    customer_rows = df_query(
+        conn,
+        f"""
+        SELECT name, company_name
+        FROM customers
+        WHERE customer_id IN ({placeholders})
+        """,
+        ids,
+    )
+    if not customer_rows.empty:
+        for _, customer_row in customer_rows.iterrows():
+            name_value = clean_text(customer_row.get("name"))
+            company_value = clean_text(customer_row.get("company_name"))
+            if name_value:
+                customer_names.add(name_value)
+            if company_value:
+                customer_companies.add(company_value)
+    if customer_name:
+        customer_names.add(customer_name)
     raw_phone = clean_text(info.get("phone"))
     phone_tokens = []
     if raw_phone:
@@ -24908,13 +24943,31 @@ def customer_summary_page(conn):
     quote_params: list[object] = []
     quote_filters.append(f"customer_id IN ({placeholders})")
     quote_params.extend(ids)
-    if customer_name:
-        quote_filters.append("LOWER(COALESCE(customer_name, '')) = LOWER(?)")
-        quote_filters.append("LOWER(COALESCE(customer_company, '')) = LOWER(?)")
-        quote_params.extend([customer_name, customer_name])
+    for name_value in sorted(customer_names):
+        quote_filters.append("LOWER(TRIM(COALESCE(customer_name, ''))) = LOWER(TRIM(?))")
+        quote_params.append(name_value)
+    for company_value in sorted(customer_companies):
+        quote_filters.append("LOWER(TRIM(COALESCE(customer_company, ''))) = LOWER(TRIM(?))")
+        quote_params.append(company_value)
     for phone in phone_tokens:
-        quote_filters.append("customer_contact LIKE ?")
+        normalized_phone = re.sub(r"[^0-9+]", "", phone)
+        if normalized_phone:
+            quote_filters.append(
+                "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(customer_contact, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '') LIKE ?"
+            )
+            quote_params.append(f"%{normalized_phone}%")
+        quote_filters.append("COALESCE(customer_contact, '') LIKE ?")
         quote_params.append(f"%{phone}%")
+    for address_value in customer_addresses:
+        if len(address_value) >= 6:
+            quote_filters.append("LOWER(COALESCE(customer_address, '')) LIKE LOWER(?)")
+            quote_params.append(f"%{address_value}%")
+    for product_value in customer_products:
+        if len(product_value) >= 3:
+            quote_filters.append(
+                "(LOWER(COALESCE(subject, '')) LIKE LOWER(?) OR LOWER(COALESCE(remarks, '')) LIKE LOWER(?))"
+            )
+            quote_params.extend([f"%{product_value}%", f"%{product_value}%"])
     quotation_docs = pd.DataFrame()
     if quote_filters:
         quote_clause = " OR ".join(quote_filters)
@@ -29475,6 +29528,7 @@ def reports_page(conn):
                 service_table = pd.DataFrame(service_entries)
                 st.dataframe(service_table, use_container_width=True)
             else:
+                service_table = pd.DataFrame()
                 st.info("No service report entries found for the selected dates.")
 
             st.markdown("#### Daily Sales Report")
@@ -29503,6 +29557,7 @@ def reports_page(conn):
                 (range_start_iso, range_end_iso),
             )
             if sales_records.empty:
+                sales_display = pd.DataFrame()
                 st.info("No sales entries found for the selected dates.")
             else:
                 sales_records = fmt_dates(sales_records, ["created_at"])
@@ -29529,6 +29584,108 @@ def reports_page(conn):
                     ],
                     use_container_width=True,
                 )
+
+            st.markdown("#### Admin quick daily summary")
+            quick_lines: list[str] = []
+            sales_summary = pd.DataFrame()
+            if not sales_display.empty:
+                sales_summary = (
+                    sales_display.groupby("Team member", dropna=False)
+                    .agg(total_amount=("total_amount", "sum"), records=("DO/WO No.", "count"))
+                    .reset_index()
+                    .sort_values(["total_amount", "records"], ascending=[False, False])
+                )
+            service_summary = pd.DataFrame()
+            if not service_table.empty:
+                service_summary = (
+                    service_table.groupby("Team member", dropna=False)
+                    .size()
+                    .reset_index(name="service_rows")
+                    .sort_values("service_rows", ascending=False)
+                )
+            uploads_summary = df_query(
+                conn,
+                dedent(
+                    """
+                    SELECT COALESCE(u.username, 'Team member') AS team_member,
+                           COUNT(*) AS upload_count
+                    FROM customer_documents cd
+                    LEFT JOIN users u ON u.user_id = cd.uploaded_by
+                    WHERE cd.deleted_at IS NULL
+                      AND date(COALESCE(cd.uploaded_at, cd.created_at)) >= date(?)
+                      AND date(COALESCE(cd.uploaded_at, cd.created_at)) <= date(?)
+                    GROUP BY COALESCE(u.username, 'Team member')
+                    ORDER BY upload_count DESC, LOWER(team_member)
+                    """
+                ),
+                (range_start_iso, range_end_iso),
+            )
+            upload_map: dict[str, int] = {}
+            if not uploads_summary.empty:
+                upload_map = {
+                    clean_text(row.get("team_member")) or "Team member": int(_coerce_float(row.get("upload_count"), 0))
+                    for _, row in uploads_summary.iterrows()
+                }
+
+            staff_labels: list[str] = []
+            if not sales_summary.empty:
+                staff_labels.extend(
+                    clean_text(val) or "Team member" for val in sales_summary["Team member"].tolist()
+                )
+            if not service_summary.empty:
+                staff_labels.extend(
+                    clean_text(val) or "Team member" for val in service_summary["Team member"].tolist()
+                )
+            staff_labels.extend(upload_map.keys())
+            seen_staff: set[str] = set()
+            ordered_staff: list[str] = []
+            for label in staff_labels:
+                if label in seen_staff:
+                    continue
+                seen_staff.add(label)
+                ordered_staff.append(label)
+
+            for staff_name in ordered_staff[:8]:
+                sales_row = pd.Series(dtype=object)
+                if not sales_summary.empty:
+                    matched = sales_summary[
+                        sales_summary["Team member"].apply(lambda value: clean_text(value) or "Team member")
+                        == staff_name
+                    ]
+                    if not matched.empty:
+                        sales_row = matched.iloc[0]
+                service_count = 0
+                if not service_summary.empty:
+                    service_match = service_summary[
+                        service_summary["Team member"].apply(lambda value: clean_text(value) or "Team member")
+                        == staff_name
+                    ]
+                    if not service_match.empty:
+                        service_count = int(_coerce_float(service_match.iloc[0].get("service_rows"), 0))
+                amount_text = format_money(sales_row.get("total_amount")) if not sales_row.empty else None
+                sales_count = int(_coerce_float(sales_row.get("records"), 0)) if not sales_row.empty else 0
+                uploaded_files = upload_map.get(staff_name, 0)
+                sentence_parts = []
+                if sales_count > 0:
+                    sentence_parts.append(
+                        f"recorded {sales_count} sales item{'s' if sales_count != 1 else ''} (amount {amount_text or format_number(_coerce_float(sales_row.get('total_amount'), 0.0))})"
+                    )
+                if service_count > 0:
+                    sentence_parts.append(
+                        f"submitted {service_count} service update{'s' if service_count != 1 else ''}"
+                    )
+                if uploaded_files > 0:
+                    sentence_parts.append(
+                        f"uploaded {uploaded_files} file{'s' if uploaded_files != 1 else ''}"
+                    )
+                if sentence_parts:
+                    quick_lines.append(f"{staff_name} {'; '.join(sentence_parts)} today.")
+
+            if not quick_lines:
+                st.caption("No staff updates recorded for the selected date range yet.")
+            else:
+                for sentence in quick_lines[:5]:
+                    st.write(f"• {sentence}")
         else:
             st.info("Select a valid date or date range to view daily reports.")
 
