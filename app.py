@@ -1819,6 +1819,10 @@ def ensure_schema_upgrades(conn):
         ensure_data_version_trigger(table, "operations")
     add_column("quotations", "payment_receipt_path", "TEXT")
     add_column("quotations", "items_payload", "TEXT")
+    add_column("quotations", "deleted_at", "TEXT")
+    add_column("quotations", "deleted_by", "INTEGER")
+    add_column("quotations", "customer_id", "INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quotations_customer_id ON quotations(customer_id)")
     add_column("maintenance_records", "maintenance_start_date", "TEXT")
     add_column("maintenance_records", "maintenance_end_date", "TEXT")
     add_column("maintenance_records", "maintenance_product_info", "TEXT")
@@ -1966,10 +1970,6 @@ def ensure_schema_upgrades(conn):
     add_column("service_documents", "uploaded_by", "INTEGER")
     add_column("maintenance_documents", "uploaded_by", "INTEGER")
     add_column("quotations", "salesperson_email", "TEXT")
-    add_column("quotations", "deleted_at", "TEXT")
-    add_column("quotations", "deleted_by", "INTEGER")
-    add_column("quotations", "customer_id", "INTEGER")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_quotations_customer_id ON quotations(customer_id)")
 
     # Backfill quotation.customer_id for older rows where possible.
     conn.execute(
@@ -25411,7 +25411,7 @@ def customer_summary_page(conn):
 
 
 def customers_hub_page(conn):
-    tabs = st.tabs(["Customers", "Customer Summary", "Import", "Scraps", "Duplicates"])
+    tabs = st.tabs(["Customers", "Customer Summary", "Import", "Scraps & Duplicates"])
     with tabs[0]:
         customers_page(conn)
     with tabs[1]:
@@ -25419,9 +25419,7 @@ def customers_hub_page(conn):
     with tabs[2]:
         import_page(conn)
     with tabs[3]:
-        scraps_page(conn)
-    with tabs[4]:
-        duplicates_page(conn)
+        scraps_duplicates_page(conn)
 
 
 def scraps_page(conn):
@@ -26909,11 +26907,10 @@ def duplicates_page(conn):
 
 
 def scraps_duplicates_page(conn):
-    tabs = st.tabs(["Scraps", "Duplicates"])
-    with tabs[0]:
-        scraps_page(conn)
-    with tabs[1]:
-        duplicates_page(conn)
+    st.caption("Review incomplete customer records and possible duplicates in one place.")
+    scraps_page(conn)
+    st.divider()
+    duplicates_page(conn)
 
 
 def users_admin_page(conn):
