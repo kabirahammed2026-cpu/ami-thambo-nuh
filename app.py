@@ -109,6 +109,7 @@ DOCUMENT_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"}
 QUOTATION_EDITOR_PORT = int(os.getenv("QUOTATION_EDITOR_PORT", "8502"))
 
 DEFAULT_QUOTATION_VALID_DAYS = 30
+OPERATIONS_CUSTOMER_PREVIEW_LIMIT = 500
 
 REQUIRED_CUSTOMER_FIELDS = {
     "name": "Name",
@@ -2045,6 +2046,25 @@ def ensure_schema_upgrades(conn):
         "CREATE INDEX IF NOT EXISTS idx_customers_created_by ON customers(created_by)"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customers_created_at ON customers(created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customers_name_ci ON customers(LOWER(TRIM(name)))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customers_name_trim ON customers(TRIM(name))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customers_company_name_ci ON customers(LOWER(TRIM(company_name)))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customers_phone_raw ON customers(phone)"
+    )
+    phone_digits_expr = _phone_digits_sql_expr("COALESCE(phone, '')")
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_customers_phone_digits ON customers({phone_digits_expr})"
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_import_history_imported_by ON import_history(imported_by)"
     )
     conn.execute(
@@ -2383,6 +2403,7 @@ def _load_operations_customers(
     where_clause: str,
     params: tuple,
     version: object,
+    max_rows: int,
 ) -> pd.DataFrame:
     conn = sqlite3.connect(db_path)
     try:
@@ -2400,9 +2421,10 @@ def _load_operations_customers(
             FROM customers
             {where_clause}
             ORDER BY datetime(created_at) DESC, customer_id DESC
+            LIMIT ?
             """,
             conn,
-            params=params,
+            params=params + (int(max_rows),),
         )
     finally:
         conn.close()
@@ -17337,17 +17359,24 @@ def operations_page(conn):
         st.session_state.get("customers_updated_at"),
         st.session_state.get("data_version_customers"),
     )
+    max_rows = 2000 if search_query else OPERATIONS_CUSTOMER_PREVIEW_LIMIT
     customers_df = _load_operations_customers(
         DB_PATH,
         where_clause,
         tuple(params),
         version,
+        max_rows,
     )
     selected_customer_id = None
     selected_customer_label = None
     if customers_df.empty:
         st.info("No customers match that search.")
     else:
+        if not search_query and len(customers_df.index) >= OPERATIONS_CUSTOMER_PREVIEW_LIMIT:
+            st.caption(
+                f"Showing the latest {OPERATIONS_CUSTOMER_PREVIEW_LIMIT} customers for faster loading. "
+                "Use search to find older records."
+            )
         customer_ids = customers_df["customer_id"].astype(int).tolist()
         display_customers = customers_df.copy()
         for col in [
@@ -21070,19 +21099,30 @@ def _upsert_customer_from_manual_quotation(
     cursor = conn.cursor()
 
     existing = None
-    if phone_number and phone_key:
-        existing_rows = cursor.execute(
+    if phone_number:
+        existing = cursor.execute(
             """
             SELECT customer_id, name, company_name, phone, address, delivery_address, remarks
             FROM customers
-            WHERE phone IS NOT NULL AND TRIM(phone) != ''
+            WHERE TRIM(COALESCE(phone, '')) = ?
             ORDER BY customer_id DESC
+            LIMIT 1
             """,
-        ).fetchall()
-        for row in existing_rows:
-            if _normalize_phone_key(row[3]) == phone_key:
-                existing = row
-                break
+            (phone_number,),
+        ).fetchone()
+    if existing is None and phone_key:
+        phone_digits = re.sub(r"[^\d]", "", phone_key)
+        if phone_digits:
+            existing = cursor.execute(
+                f"""
+                SELECT customer_id, name, company_name, phone, address, delivery_address, remarks
+                FROM customers
+                WHERE {_phone_digits_sql_expr("COALESCE(phone, '')")} = ?
+                ORDER BY customer_id DESC
+                LIMIT 1
+                """,
+                (phone_digits,),
+            ).fetchone()
 
     if existing:
         (
@@ -21258,7 +21298,8 @@ def _update_quotation_records(
         cur = conn.execute(
             """
             SELECT status, follow_up_status, follow_up_notes, follow_up_date, follow_up_history, reminder_label,
-                   payment_receipt_path, reference, customer_name, customer_company, customer_contact
+                   payment_receipt_path, reference, customer_name, customer_company, customer_contact,
+                   customer_id
             FROM quotations
             WHERE quotation_id=? AND deleted_at IS NULL
             """,
@@ -21279,6 +21320,7 @@ def _update_quotation_records(
             customer_name,
             customer_company,
             customer_contact,
+            current_customer_id,
         ) = row
         new_reference = clean_text(entry.get("reference")) or clean_text(current_reference)
         new_customer_name = clean_text(entry.get("customer_name")) or clean_text(customer_name)
@@ -21353,6 +21395,17 @@ def _update_quotation_records(
         if status_value == "paid" and not receipt_path and not allow_locked:
             locked.append(quotation_id)
             continue
+        synced_customer_id = _upsert_customer_from_manual_quotation(
+            conn,
+            name=new_customer_name,
+            company=new_customer_company,
+            phone=new_customer_contact,
+            address=None,
+            district=None,
+            reference=new_reference,
+            created_by=current_user_id(),
+            lead_status=LEAD_REMARK_TAG if status_value != "paid" else None,
+        )
         conn.execute(
             """
             UPDATE quotations
@@ -21361,6 +21414,7 @@ def _update_quotation_records(
                 customer_name=?,
                 customer_company=?,
                 customer_contact=?,
+                customer_id=COALESCE(?, customer_id),
                 follow_up_status=?,
                 follow_up_notes=?,
                 follow_up_date=?,
@@ -21376,6 +21430,7 @@ def _update_quotation_records(
                 new_customer_name,
                 new_customer_company,
                 new_customer_contact,
+                synced_customer_id if synced_customer_id is not None else current_customer_id,
                 follow_up_status,
                 follow_up_notes,
                 follow_up_date,
@@ -21443,9 +21498,9 @@ def _update_quotation_records(
         if status_value == "paid" and status_value != current_status:
             _promote_lead_customer(
                 conn,
-                name=customer_name,
-                company=customer_company,
-                phone=customer_contact,
+                name=new_customer_name,
+                company=new_customer_company,
+                phone=new_customer_contact,
             )
     conn.commit()
     _mark_data_changed("quotations", "customers")
