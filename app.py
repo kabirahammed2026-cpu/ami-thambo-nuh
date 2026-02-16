@@ -1825,6 +1825,93 @@ def ensure_schema_upgrades(conn):
     add_column("maintenance_records", "total_amount", "REAL")
 
     ensure_trigger(
+        "quotation_status_from_delivery_orders_insert",
+        """
+        CREATE TRIGGER quotation_status_from_delivery_orders_insert
+        AFTER INSERT ON delivery_orders
+        WHEN NEW.deleted_at IS NULL AND NEW.customer_id IS NOT NULL
+        BEGIN
+            UPDATE quotations
+            SET status = CASE
+                    WHEN LOWER(COALESCE(NEW.record_type, 'delivery_order')) = 'work_done'
+                    THEN 'work done'
+                    ELSE 'do done'
+                END,
+                updated_at = datetime('now')
+            WHERE deleted_at IS NULL
+              AND customer_id = NEW.customer_id
+              AND (
+                    status IS NULL
+                    OR TRIM(status) = ''
+                    OR LOWER(TRIM(status)) = 'pending'
+                );
+        END;
+        """,
+    )
+    ensure_trigger(
+        "quotation_status_from_delivery_orders_update",
+        """
+        CREATE TRIGGER quotation_status_from_delivery_orders_update
+        AFTER UPDATE OF customer_id, record_type, deleted_at ON delivery_orders
+        WHEN NEW.deleted_at IS NULL AND NEW.customer_id IS NOT NULL
+        BEGIN
+            UPDATE quotations
+            SET status = CASE
+                    WHEN LOWER(COALESCE(NEW.record_type, 'delivery_order')) = 'work_done'
+                    THEN 'work done'
+                    ELSE 'do done'
+                END,
+                updated_at = datetime('now')
+            WHERE deleted_at IS NULL
+              AND customer_id = NEW.customer_id
+              AND (
+                    status IS NULL
+                    OR TRIM(status) = ''
+                    OR LOWER(TRIM(status)) = 'pending'
+                );
+        END;
+        """,
+    )
+
+    conn.execute(
+        """
+        UPDATE quotations
+        SET status = CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM delivery_orders d
+                    WHERE d.deleted_at IS NULL
+                      AND d.customer_id = quotations.customer_id
+                      AND LOWER(COALESCE(d.record_type, 'delivery_order')) = 'work_done'
+                )
+                THEN 'work done'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM delivery_orders d
+                    WHERE d.deleted_at IS NULL
+                      AND d.customer_id = quotations.customer_id
+                )
+                THEN 'do done'
+                ELSE status
+            END,
+            updated_at = datetime('now')
+        WHERE deleted_at IS NULL
+          AND customer_id IS NOT NULL
+          AND (
+                status IS NULL
+                OR TRIM(status) = ''
+                OR LOWER(TRIM(status)) = 'pending'
+            )
+          AND EXISTS (
+                SELECT 1
+                FROM delivery_orders d
+                WHERE d.deleted_at IS NULL
+                  AND d.customer_id = quotations.customer_id
+            )
+        """
+    )
+
+    ensure_trigger(
         "prevent_admin_delete",
         """
         CREATE TRIGGER prevent_admin_delete
@@ -11266,10 +11353,19 @@ def dashboard(conn):
                     total_value = format_money(row.get("total_amount")) or format_number(
                         _coerce_float(row.get("total_amount"), 0.0)
                     )
+                    status_text = clean_text(row.get("status")) or "Pending"
+                    status_lower = status_text.lower()
+                    tiny_marker = ""
+                    if status_lower == "work done":
+                        tiny_marker = "<span style='font-size:11px;color:#475569;'>tiny: work done created</span>"
+                    elif status_lower == "do done":
+                        tiny_marker = "<span style='font-size:11px;color:#475569;'>tiny: delivery order created</span>"
                     cols[2].write(
-                        f"{clean_text(row.get('status')).title() if row.get('status') else 'Pending'}\n"
+                        f"{status_text.title()}\n"
                         f"{row.get('quote_date')}\n{total_value}"
                     )
+                    if tiny_marker:
+                        cols[2].markdown(tiny_marker, unsafe_allow_html=True)
 
                     download_key = f"dash_quote_{int(row.get('quotation_id'))}"
                     doc_path = clean_text(row.get("document_path"))
