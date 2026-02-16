@@ -10210,6 +10210,66 @@ def dashboard(conn):
         weekly_reports = 0
         monthly_reports = 0
 
+    if is_admin:
+        complete_count, scrap_count = get_customer_counts(conn)
+        active_warranties = int(
+            df_query(
+                conn,
+                "SELECT COUNT(*) c FROM warranties WHERE status='active' AND date(expiry_date) >= date('now')",
+            ).iloc[0]["c"]
+        )
+        expired_warranties = int(
+            df_query(
+                conn,
+                "SELECT COUNT(*) c FROM warranties WHERE status='active' AND date(expiry_date) < date('now')",
+            ).iloc[0]["c"]
+        )
+        report_iso_today = date.today().isoformat()
+        daily_staff_df = df_query(
+            conn,
+            dedent(
+                """
+                SELECT user_id
+                FROM users
+                WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
+                """
+            ),
+        )
+        daily_submitted_df = df_query(
+            conn,
+            dedent(
+                """
+                SELECT DISTINCT user_id
+                FROM work_reports
+                WHERE period_type='daily' AND date(period_start)=date(?)
+                """
+            ),
+            (report_iso_today,),
+        )
+        daily_team_members = int(daily_staff_df.shape[0])
+        daily_reports_filed = int(daily_submitted_df.shape[0])
+        daily_reports_missing = max(daily_team_members - daily_reports_filed, 0)
+
+        st.markdown("#### Admin daily summary")
+        st.caption(f"Overview for {format_period_range(report_iso_today, report_iso_today)}")
+
+        top_row_1 = st.columns(4)
+        top_row_1[0].metric("Customers", complete_count)
+        top_row_1[1].metric("Scraps", scrap_count)
+        top_row_1[2].metric("Active warranties", active_warranties)
+        top_row_1[3].metric("Expired warranties", expired_warranties)
+
+        top_row_2 = st.columns(4)
+        top_row_2[0].metric("Daily sales", format_sales_amount(sales_metrics["daily"]))
+        top_row_2[1].metric("Weekly sales", format_sales_amount(sales_metrics["weekly"]))
+        top_row_2[2].metric("Monthly sales", format_sales_amount(sales_metrics["monthly"]))
+        top_row_2[3].metric("Total reports", total_reports)
+
+        top_row_3 = st.columns(3)
+        top_row_3[0].metric("Team members", daily_team_members)
+        top_row_3[1].metric("Reports filed (today)", daily_reports_filed)
+        top_row_3[2].metric("Missing reports (today)", daily_reports_missing)
+
     st.markdown("#### Report submissions")
     report_metric_cols = st.columns(3)
     report_metric_cols[0].metric("Total reports", total_reports)
@@ -10496,37 +10556,6 @@ def dashboard(conn):
         _render_dashboard_announcement(allow_edit=False)
 
     if is_admin:
-        col1, col2, col3, col4 = st.columns(4)
-        complete_count, scrap_count = get_customer_counts(conn)
-        with col1:
-            st.metric("Customers", complete_count)
-        with col2:
-            st.metric("Scraps", scrap_count)
-        with col3:
-            st.metric(
-                "Active Warranties",
-                int(
-                    df_query(
-                        conn,
-                        "SELECT COUNT(*) c FROM warranties WHERE status='active' AND date(expiry_date) >= date('now')",
-                    ).iloc[0]["c"]
-                ),
-            )
-        with col4:
-            expired_count = int(
-                df_query(
-                    conn,
-                    "SELECT COUNT(*) c FROM warranties WHERE status='active' AND date(expiry_date) < date('now')",
-                ).iloc[0]["c"]
-            )
-            st.metric("Expired", expired_count)
-
-        st.markdown("#### Sales performance")
-        sales_cols = st.columns(3)
-        sales_cols[0].metric("Daily sales", format_sales_amount(sales_metrics["daily"]))
-        sales_cols[1].metric("Weekly sales", format_sales_amount(sales_metrics["weekly"]))
-        sales_cols[2].metric("Monthly sales", format_sales_amount(sales_metrics["monthly"]))
-
         _render_dashboard_announcement(allow_edit=True)
 
         st.markdown("#### Daily report coverage")
