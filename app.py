@@ -1881,6 +1881,36 @@ def ensure_schema_upgrades(conn):
     add_column("quotations", "salesperson_email", "TEXT")
     add_column("quotations", "deleted_at", "TEXT")
     add_column("quotations", "deleted_by", "INTEGER")
+    add_column("quotations", "customer_id", "INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quotations_customer_id ON quotations(customer_id)")
+
+    # Backfill quotation.customer_id for older rows where possible.
+    conn.execute(
+        """
+        UPDATE quotations
+        SET customer_id = (
+            SELECT c.customer_id
+            FROM customers c
+            WHERE (
+                    TRIM(COALESCE(quotations.customer_contact, '')) <> ''
+                    AND LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(c.phone, '')), ' ', ''), '-', ''), '(', ''), ')', ''), '+', ''))
+                        = LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(quotations.customer_contact, '')), ' ', ''), '-', ''), '(', ''), ')', ''), '+', ''))
+                  )
+               OR (
+                    TRIM(COALESCE(quotations.customer_name, '')) <> ''
+                    AND LOWER(TRIM(COALESCE(c.name, ''))) = LOWER(TRIM(COALESCE(quotations.customer_name, '')))
+                  )
+               OR (
+                    TRIM(COALESCE(quotations.customer_company, '')) <> ''
+                    AND LOWER(TRIM(COALESCE(c.company_name, ''))) = LOWER(TRIM(COALESCE(quotations.customer_company, '')))
+                  )
+            ORDER BY c.customer_id DESC
+            LIMIT 1
+        )
+        WHERE (customer_id IS NULL OR customer_id = 0)
+          AND deleted_at IS NULL
+        """
+    )
 
     # Remove stored email data for privacy; the app no longer collects it.
     if has_column("customers", "email"):
@@ -4441,6 +4471,7 @@ def _fetch_quotation_for_editor(conn, quotation_id: int) -> Optional[dict[str, o
         "customer_address",
         "customer_district",
         "customer_contact",
+        "customer_id",
         "attention_name",
         "attention_title",
         "subject",
@@ -10200,6 +10231,7 @@ def dashboard(conn):
                        q.quote_date,
                        q.created_at,
                        q.status,
+                       q.customer_id AS direct_customer_id,
                        LOWER(TRIM(COALESCE(q.customer_name, ''))) AS customer_name_key,
                        LOWER(TRIM(COALESCE(q.customer_company, ''))) AS customer_company_key,
                        LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(q.customer_contact, '')), ' ', ''), '-', ''), '(', ''), ')', ''), '+', '')) AS customer_contact_key
@@ -10207,6 +10239,11 @@ def dashboard(conn):
                 {quote_clause}
             ),
             quote_customer_candidates AS (
+                SELECT sq.quotation_id,
+                       sq.direct_customer_id AS customer_id
+                FROM scoped_quotes sq
+                WHERE sq.direct_customer_id IS NOT NULL
+                UNION
                 SELECT sq.quotation_id,
                        c.customer_id
                 FROM scoped_quotes sq
@@ -12361,6 +12398,13 @@ def dashboard(conn):
             LEFT JOIN users u ON u.user_id = sa.staff_id
             WHERE sa.work_date IS NOT NULL
               AND date(sa.work_date) BETWEEN date(?) AND date(?)
+              AND (
+                sa.staff_id IS NULL
+                OR (
+                    LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                    AND LOWER(COALESCE(u.staff_classification, '')) = 'service'
+                )
+              )
             GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
             ORDER BY total_tasks DESC, staff ASC
             """,
@@ -12426,6 +12470,13 @@ def dashboard(conn):
                 LEFT JOIN users u ON u.user_id = sa.staff_id
                 WHERE sa.work_date IS NOT NULL
                   AND date(sa.work_date) BETWEEN date(?) AND date(?)
+                  AND (
+                    sa.staff_id IS NULL
+                    OR (
+                        LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                        AND LOWER(COALESCE(u.staff_classification, '')) = 'service'
+                    )
+                  )
                   AND (
                     sa.customer_id IN ({placeholders})
                     OR sa.do_customer_id IN ({placeholders})
@@ -12561,6 +12612,8 @@ def dashboard(conn):
                 LEFT JOIN users u ON u.user_id = s.created_by
                 WHERE s.deleted_at IS NULL
                   AND date(COALESCE(s.service_start_date, s.service_date, s.updated_at)) BETWEEN date(?) AND date(?)
+                  AND LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                  AND LOWER(COALESCE(u.staff_classification, '')) = 'service'
                 UNION ALL
                 SELECT COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned') AS staff,
                        m.maintenance_id AS record_id,
@@ -12574,6 +12627,8 @@ def dashboard(conn):
                 LEFT JOIN users u ON u.user_id = m.created_by
                 WHERE m.deleted_at IS NULL
                   AND date(COALESCE(m.maintenance_start_date, m.maintenance_date, m.updated_at)) BETWEEN date(?) AND date(?)
+                  AND LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                  AND LOWER(COALESCE(u.staff_classification, '')) = 'service'
                 """,
                 (from_iso, to_iso, from_iso, to_iso),
             )
@@ -12667,8 +12722,20 @@ def dashboard(conn):
             LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
             WHERE d.deleted_at IS NULL
               AND COALESCE(date(d.delivery_date), date(d.created_at)) BETWEEN date(?) AND date(?)
-              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
-              AND (up.staff_classification IS NULL OR LOWER(up.staff_classification) = 'sales')
+              AND (
+                    u.user_id IS NULL
+                    OR (
+                        LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                        AND LOWER(COALESCE(u.staff_classification, '')) = 'sales'
+                    )
+                  )
+              AND (
+                    up.user_id IS NULL
+                    OR (
+                        LOWER(COALESCE(up.role, 'staff')) <> 'admin'
+                        AND LOWER(COALESCE(up.staff_classification, '')) = 'sales'
+                    )
+                  )
             GROUP BY COALESCE(
                 NULLIF(TRIM(u.username), ''),
                 NULLIF(TRIM(up.username), ''),
@@ -12702,8 +12769,20 @@ def dashboard(conn):
                 WHERE d.deleted_at IS NULL
                   AND COALESCE(date(d.delivery_date), date(d.created_at)) BETWEEN date(?) AND date(?)
                   AND d.customer_id IN ({placeholders})
-                  AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
-                  AND (up.staff_classification IS NULL OR LOWER(up.staff_classification) = 'sales')
+                  AND (
+                        u.user_id IS NULL
+                        OR (
+                            LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                            AND LOWER(COALESCE(u.staff_classification, '')) = 'sales'
+                        )
+                      )
+                  AND (
+                        up.user_id IS NULL
+                        OR (
+                            LOWER(COALESCE(up.role, 'staff')) <> 'admin'
+                            AND LOWER(COALESCE(up.staff_classification, '')) = 'sales'
+                        )
+                      )
                 GROUP BY COALESCE(
                     NULLIF(TRIM(u.username), ''),
                     NULLIF(TRIM(up.username), ''),
@@ -12725,7 +12804,8 @@ def dashboard(conn):
             LEFT JOIN users u ON u.user_id = q.created_by
             WHERE q.deleted_at IS NULL
               AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)
-              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
+              AND LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+              AND LOWER(COALESCE(u.staff_classification, '')) = 'sales'
             GROUP BY COALESCE(NULLIF(TRIM(u.username), ''), 'Unassigned')
             """,
             (from_iso, to_iso),
@@ -12740,7 +12820,8 @@ def dashboard(conn):
             LEFT JOIN users u ON u.user_id = wr.user_id
             WHERE date(wr.period_start) BETWEEN date(?) AND date(?)
               AND LOWER(COALESCE(wr.report_template, '')) = 'sales'
-              AND (u.staff_classification IS NULL OR LOWER(u.staff_classification) = 'sales')
+              AND LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+              AND LOWER(COALESCE(u.staff_classification, '')) = 'sales'
             """,
             (from_iso, to_iso),
         )
@@ -12877,11 +12958,15 @@ def dashboard(conn):
                        q.total_amount AS amount,
                        q.document_path AS file_path,
                        q.payment_receipt_path AS payment_receipt_path,
+                       COALESCE(NULLIF(TRIM(c.name), ''), NULLIF(TRIM(c.company_name), ''), 'Unknown customer') AS made_for,
                        'Quotation' AS record_type
                 FROM quotations q
                 LEFT JOIN users u ON u.user_id = q.created_by
+                LEFT JOIN customers c ON c.customer_id = q.customer_id
                 WHERE q.deleted_at IS NULL
                   AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)
+                  AND LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                  AND LOWER(COALESCE(u.staff_classification, '')) = 'sales'
                 UNION ALL
                 SELECT COALESCE(
                            NULLIF(TRIM(u.username), ''),
@@ -12895,6 +12980,7 @@ def dashboard(conn):
                        d.total_amount AS amount,
                        d.file_path AS file_path,
                        d.payment_receipt_path AS payment_receipt_path,
+                       COALESCE(NULLIF(TRIM(c.name), ''), NULLIF(TRIM(c.company_name), ''), 'Unknown customer') AS made_for,
                        CASE
                            WHEN COALESCE(d.record_type, 'delivery_order') = 'work_done'
                            THEN 'Work order'
@@ -12903,8 +12989,23 @@ def dashboard(conn):
                 FROM delivery_orders d
                 LEFT JOIN users u ON u.user_id = d.created_by
                 LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
+                LEFT JOIN customers c ON c.customer_id = d.customer_id
                 WHERE d.deleted_at IS NULL
                   AND date(COALESCE(d.delivery_date, d.created_at)) BETWEEN date(?) AND date(?)
+                  AND (
+                        u.user_id IS NULL
+                        OR (
+                            LOWER(COALESCE(u.role, 'staff')) <> 'admin'
+                            AND LOWER(COALESCE(u.staff_classification, '')) = 'sales'
+                        )
+                      )
+                  AND (
+                        up.user_id IS NULL
+                        OR (
+                            LOWER(COALESCE(up.role, 'staff')) <> 'admin'
+                            AND LOWER(COALESCE(up.staff_classification, '')) = 'sales'
+                        )
+                      )
                 """,
                 (from_iso, to_iso, from_iso, to_iso),
             )
@@ -12924,6 +13025,7 @@ def dashboard(conn):
                             "reference",
                             "record_date",
                             "amount",
+                            "made_for",
                         ]
                         staff_display = staff_docs[display_cols].rename(
                             columns={
@@ -12931,6 +13033,7 @@ def dashboard(conn):
                                 "reference": "Reference",
                                 "record_date": "Date",
                                 "amount": "Amount",
+                                "made_for": "Made for",
                             }
                         )
                         st.dataframe(
@@ -12980,7 +13083,7 @@ def dashboard(conn):
                             st.caption("No PDFs available for this staff member.")
 
     st.markdown("### Staff activity history")
-    staff_df = df_query(conn, "SELECT user_id, username FROM users ORDER BY LOWER(username)")
+    staff_df = df_query(conn, "SELECT user_id, username FROM users WHERE LOWER(COALESCE(role, 'staff')) <> 'admin' ORDER BY LOWER(username)")
     staff_map = {
         int(row["user_id"]): clean_text(row.get("username")) or "Team member"
         for _, row in staff_df.iterrows()
@@ -20769,6 +20872,7 @@ def _save_quotation_record(conn, payload: dict) -> Optional[int]:
         "customer_address",
         "customer_district",
         "customer_contact",
+        "customer_id",
         "attention_name",
         "attention_title",
         "subject",
@@ -21687,6 +21791,37 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
         filename = f"{safe_name}.xlsx"
 
         receipt_path = None
+        quotation_customer_id = None
+        if any(
+            clean_text(value)
+            for value in (
+                customer_contact_name,
+                customer_company,
+                customer_contact,
+                customer_address,
+                customer_district,
+            )
+        ):
+            lead_status = LEAD_REMARK_TAG if status_value != "paid" else None
+            quotation_customer_id = _upsert_customer_from_manual_quotation(
+                conn,
+                name=customer_contact_name,
+                company=customer_company,
+                phone=customer_contact,
+                address=customer_address,
+                district=customer_district,
+                reference=reference_value,
+                created_by=current_user_id(),
+                lead_status=lead_status,
+            )
+            if status_value == "paid":
+                _promote_lead_customer(
+                    conn,
+                    name=customer_contact_name,
+                    company=customer_company,
+                    phone=customer_contact,
+                )
+
         payload = {
             "reference": reference_value,
             "quote_date": quotation_date.isoformat(),
@@ -21695,6 +21830,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             "customer_address": customer_address,
             "customer_district": customer_district,
             "customer_contact": customer_contact_combined,
+            "customer_id": quotation_customer_id,
             "attention_name": attention_name,
             "attention_title": attention_title,
             "subject": subject_line,
@@ -21739,35 +21875,6 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 fallback_date=follow_up_iso,
                 message=message,
             )
-        if any(
-            clean_text(value)
-            for value in (
-                customer_contact_name,
-                customer_company,
-                customer_contact,
-                customer_address,
-                customer_district,
-            )
-        ):
-            lead_status = LEAD_REMARK_TAG if status_value != "paid" else None
-            _upsert_customer_from_manual_quotation(
-                conn,
-                name=customer_contact_name,
-                company=customer_company,
-                phone=customer_contact,
-                address=customer_address,
-                district=customer_district,
-                reference=reference_value,
-                created_by=current_user_id(),
-                lead_status=lead_status,
-            )
-            if status_value == "paid":
-                _promote_lead_customer(
-                    conn,
-                    name=customer_contact_name,
-                    company=customer_company,
-                    phone=customer_contact,
-                )
 
         st.session_state[result_key] = {
             "display": display_df,
@@ -24703,6 +24810,8 @@ def customer_summary_page(conn):
         ]
     quote_filters: list[str] = []
     quote_params: list[object] = []
+    quote_filters.append(f"customer_id IN ({placeholders})")
+    quote_params.extend(ids)
     if customer_name:
         quote_filters.append("LOWER(COALESCE(customer_name, '')) = LOWER(?)")
         quote_filters.append("LOWER(COALESCE(customer_company, '')) = LOWER(?)")
@@ -24727,7 +24836,7 @@ def customer_summary_page(conn):
                 WHERE deleted_at IS NULL
                   {"" if is_admin else "AND created_by = ?"}
                   AND ({quote_clause})
-                ORDER BY datetime(quote_date) DESC, quotation_id DESC
+                ORDER BY datetime(COALESCE(quote_date, created_at)) DESC, quotation_id DESC
                 """
             ),
             tuple([viewer_id] + quote_params if not is_admin else quote_params),
