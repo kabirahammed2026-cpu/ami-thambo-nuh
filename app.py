@@ -8864,9 +8864,13 @@ def merge_customers_by_phone(conn, phone: Optional[str]) -> Optional[int]:
     phone_key = _normalize_phone_key(phone_value)
     if not phone_value or not phone_key:
         return None
+    scope_clause, scope_params = customer_scope_filter()
+    where_clause = "WHERE phone IS NOT NULL AND TRIM(phone) != ''"
+    if scope_clause:
+        where_clause += f" AND ({scope_clause})"
     customers_df = df_query(
         conn,
-        """
+        f"""
         SELECT customer_id,
                name,
                company_name,
@@ -8881,9 +8885,10 @@ def merge_customers_by_phone(conn, phone: Optional[str]) -> Optional[int]:
                amount_spent,
                attachment_path
         FROM customers
-        WHERE phone IS NOT NULL AND TRIM(phone) != ''
+        {where_clause}
         ORDER BY customer_id ASC
         """,
+        tuple(scope_params),
     )
     if not customers_df.empty:
         customers_df = customers_df[
@@ -25049,7 +25054,7 @@ def customer_summary_page(conn):
     for product_value in customer_products:
         if len(product_value) >= 3:
             quote_filters.append(
-                "(LOWER(COALESCE(subject, '')) LIKE LOWER(?) OR LOWER(COALESCE(remarks, '')) LIKE LOWER(?))"
+                "(LOWER(COALESCE(subject, '')) LIKE LOWER(?) OR LOWER(COALESCE(remarks_internal, '')) LIKE LOWER(?))"
             )
             quote_params.extend([f"%{product_value}%", f"%{product_value}%"])
     quotation_docs = pd.DataFrame()
@@ -27878,14 +27883,18 @@ def _lookup_customer_id_for_merge(
         params.append(company_value)
     if not clauses:
         return None
+    scope_clause, scope_params = customer_scope_filter()
+    where_expr = f"({' OR '.join(clauses)})"
+    if scope_clause:
+        where_expr = f"{where_expr} AND ({scope_clause})"
     rows = conn.execute(
         f"""
         SELECT customer_id, phone
         FROM customers
-        WHERE {" OR ".join(clauses)}
+        WHERE {where_expr}
         ORDER BY customer_id DESC
         """,
-        tuple(params),
+        tuple(params + list(scope_params)),
     ).fetchall()
     if not rows:
         return None
