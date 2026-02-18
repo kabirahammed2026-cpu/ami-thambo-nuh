@@ -10439,7 +10439,7 @@ def dashboard(conn):
                     key=f"recent_attachment_{row.get('report_id')}_{idx}",
                 )
 
-    quote_scope, quote_params = _quotation_scope_filter()
+    quote_scope, quote_params = _quotation_scope_filter("q")
     quote_clause = quote_scope.replace("WHERE", "WHERE", 1)
     quote_metrics = df_query(
         conn,
@@ -21080,13 +21080,21 @@ def _render_letterhead_preview(
     st.markdown(preview_html, unsafe_allow_html=True)
     return preview_html
 
-def _quotation_scope_filter() -> tuple[str, tuple[object, ...]]:
+def _quotation_scope_filter(alias: str = "") -> tuple[str, tuple[object, ...]]:
+    prefix = f"{alias}." if alias else ""
     if current_user_is_admin():
-        return "WHERE deleted_at IS NULL", ()
+        return f"WHERE {prefix}deleted_at IS NULL", ()
     uid = current_user_id()
     if uid is None:
         return "WHERE 1=0", ()
-    return "WHERE created_by = ? AND deleted_at IS NULL", (uid,)
+    return (
+        f"WHERE {prefix}deleted_at IS NULL "
+        f"AND ({prefix}created_by = ? OR EXISTS ("
+        f"SELECT 1 FROM customers c "
+        f"WHERE c.customer_id = {prefix}customer_id AND c.created_by = ?"
+        f"))",
+        (uid, uid),
+    )
 
 
 def _build_follow_up_history_entry(
@@ -22179,7 +22187,69 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
 def _render_quotation_management(conn):
     st.markdown("### Quotation tracker")
     is_admin = current_user_is_admin()
-    scope_clause, scope_params = _quotation_scope_filter()
+    scope_clause, scope_params = _quotation_scope_filter("q")
+
+    search_query = clean_text(
+        st.text_input(
+            "Find quotation",
+            key="quotation_tracker_search",
+            help="Search by reference, customer, contact, salesperson, or creator.",
+        )
+    )
+    status_filter = st.selectbox(
+        "Status",
+        ["All", "Pending", "Paid", "Rejected", "Work done"],
+        key="quotation_tracker_status_filter",
+    )
+    max_rows_label = st.selectbox(
+        "Rows to show",
+        ["50", "100", "200", "All"],
+        index=2,
+        key="quotation_tracker_limit",
+        help="Increase this if you created many quotations and need older records.",
+    )
+
+    extra_filters: list[str] = []
+    filter_params: list[object] = list(scope_params)
+    if search_query:
+        like_value = f"%{search_query}%"
+        extra_filters.append(
+            "("
+            "q.reference LIKE ? OR "
+            "q.customer_company LIKE ? OR "
+            "q.customer_name LIKE ? OR "
+            "q.customer_contact LIKE ? OR "
+            "q.salesperson_name LIKE ? OR "
+            "u.username LIKE ?"
+            ")"
+        )
+        filter_params.extend([like_value] * 6)
+    if status_filter != "All":
+        extra_filters.append("LOWER(COALESCE(q.status, 'pending')) = LOWER(?)")
+        filter_params.append(status_filter)
+
+    extra_where = ""
+    if extra_filters:
+        extra_where = " AND " + " AND ".join(extra_filters)
+
+    total_matches: Optional[int] = None
+    limit_sql = ""
+    if max_rows_label != "All":
+        total_df = df_query(
+            conn,
+            dedent(
+                f"""
+                SELECT COUNT(*) AS total
+                FROM quotations q
+                LEFT JOIN users u ON u.user_id = q.created_by
+                {scope_clause}{extra_where}
+                """
+            ),
+            tuple(filter_params),
+        )
+        total_matches = int(total_df.iloc[0].get("total") or 0) if not total_df.empty else 0
+        limit_sql = f" LIMIT {int(max_rows_label)}"
+
     quotes_df = df_query(
         conn,
         dedent(
@@ -22191,17 +22261,24 @@ def _render_quotation_management(conn):
                    q.created_by, COALESCE(u.username, '(user)') AS created_by_name
             FROM quotations q
             LEFT JOIN users u ON u.user_id = q.created_by
-            {scope_clause}
-            ORDER BY datetime(q.quote_date) DESC, q.quotation_id DESC
-            LIMIT 50
+            {scope_clause}{extra_where}
+            ORDER BY datetime(q.quote_date) DESC, q.quotation_id DESC{limit_sql}
             """
         ),
-        scope_params,
+        tuple(filter_params),
     )
 
     if quotes_df.empty:
         st.info("No quotations recorded yet. Create a quotation above to start tracking.")
         return
+
+    shown_count = int(quotes_df.shape[0])
+    if total_matches is not None and shown_count < total_matches:
+        st.caption(
+            f"Showing {shown_count} of {total_matches} matching quotations. Increase 'Rows to show' or choose 'All' to load older records."
+        )
+    else:
+        st.caption(f"Showing {shown_count} quotation record{'s' if shown_count != 1 else ''}.")
 
     upload_records = []
     for _, row in quotes_df.iterrows():
@@ -29786,8 +29863,8 @@ def reports_page(conn):
                     FROM customer_documents cd
                     LEFT JOIN users u ON u.user_id = cd.uploaded_by
                     WHERE cd.deleted_at IS NULL
-                      AND date(COALESCE(cd.uploaded_at, cd.created_at)) >= date(?)
-                      AND date(COALESCE(cd.uploaded_at, cd.created_at)) <= date(?)
+                      AND date(COALESCE(cd.uploaded_at, cd.updated_at)) >= date(?)
+                      AND date(COALESCE(cd.uploaded_at, cd.updated_at)) <= date(?)
                     GROUP BY COALESCE(u.username, 'Team member')
                     ORDER BY upload_count DESC, LOWER(team_member)
                     """
