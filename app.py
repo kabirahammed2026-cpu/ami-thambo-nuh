@@ -16236,7 +16236,7 @@ def render_operations_document_uploader(
             if upload_enabled and _guard_double_submit(
                 f"{key_prefix}_do_save",
                 submit_do,
-                submission_fingerprint=_upload_submission_fingerprint(do_file, fallback=f"{customer_id}:delivery_order"),
+                submission_fingerprint=_upload_submission_fingerprint(do_file, fallback=f"{selected_customer}:delivery_order"),
             ):
                 if do_file is None:
                     st.error("Select a delivery order document to upload.")
@@ -16279,7 +16279,7 @@ def render_operations_document_uploader(
             if upload_enabled and _guard_double_submit(
                 f"{key_prefix}_work_done_save",
                 submit_work_done,
-                submission_fingerprint=_upload_submission_fingerprint(work_done_file, fallback=f"{customer_id}:work_done"),
+                submission_fingerprint=_upload_submission_fingerprint(work_done_file, fallback=f"{selected_customer}:work_done"),
             ):
                 if work_done_file is None:
                     st.error("Select a work done document to upload.")
@@ -16322,7 +16322,7 @@ def render_operations_document_uploader(
             if upload_enabled and _guard_double_submit(
                 f"{key_prefix}_service_save",
                 submit_service,
-                submission_fingerprint=_upload_submission_fingerprint(service_file, fallback=f"{customer_id}:service"),
+                submission_fingerprint=_upload_submission_fingerprint(service_file, fallback=f"{selected_customer}:service"),
             ):
                 if service_file is None:
                     st.error("Select a service document to upload.")
@@ -16365,7 +16365,7 @@ def render_operations_document_uploader(
             if upload_enabled and _guard_double_submit(
                 f"{key_prefix}_maintenance_save",
                 submit_maintenance,
-                submission_fingerprint=_upload_submission_fingerprint(maintenance_file, fallback=f"{customer_id}:maintenance"),
+                submission_fingerprint=_upload_submission_fingerprint(maintenance_file, fallback=f"{selected_customer}:maintenance"),
             ):
                 if maintenance_file is None:
                     st.error("Select a maintenance document to upload.")
@@ -16408,7 +16408,7 @@ def render_operations_document_uploader(
             if upload_enabled and _guard_double_submit(
                 f"{key_prefix}_other_save",
                 submit_other,
-                submission_fingerprint=_upload_submission_fingerprint(other_file, fallback=f"{customer_id}:other"),
+                submission_fingerprint=_upload_submission_fingerprint(other_file, fallback=f"{selected_customer}:other"),
             ):
                 if other_file is None:
                     st.error("Select a document to upload.")
