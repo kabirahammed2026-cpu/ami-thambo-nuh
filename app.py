@@ -215,6 +215,7 @@ def normalize_editor_df(
     *,
     numeric_columns: Optional[set[str]] = None,
     date_columns: Optional[set[str]] = None,
+    text_columns: Optional[set[str]] = None,
 ) -> tuple[pd.DataFrame, set[str]]:
     if not isinstance(df, pd.DataFrame):
         return pd.DataFrame(), set()
@@ -222,10 +223,14 @@ def normalize_editor_df(
     normalized_date_columns: set[str] = set()
     numeric_columns = numeric_columns or set()
     date_columns = date_columns or set()
+    text_columns = text_columns or set()
     for col in normalized.columns:
         series = normalized[col]
         if col in numeric_columns:
             normalized[col] = pd.to_numeric(series, errors="coerce")
+            continue
+        if col in text_columns:
+            normalized[col] = series.astype("string").fillna("")
             continue
         if col in date_columns:
             normalized[col] = pd.to_datetime(series, errors="coerce").dt.date
@@ -287,6 +292,7 @@ def safe_data_editor(
 ) -> pd.DataFrame:
     explicit_number_columns: set[str] = set()
     explicit_date_columns: set[str] = set()
+    explicit_text_columns: set[str] = set()
     if column_config:
         for col, config in column_config.items():
             type_name = type(config).__name__
@@ -294,10 +300,13 @@ def safe_data_editor(
                 explicit_number_columns.add(col)
             elif type_name == "DateColumn":
                 explicit_date_columns.add(col)
+            elif type_name == "TextColumn":
+                explicit_text_columns.add(col)
     normalized, date_columns = normalize_editor_df(
         df,
         numeric_columns=explicit_number_columns,
         date_columns=explicit_date_columns,
+        text_columns=explicit_text_columns,
     )
     auto_config, auto_disabled = build_column_config(
         normalized, date_columns, forced_date_columns=explicit_date_columns
