@@ -1588,6 +1588,7 @@ CREATE TABLE IF NOT EXISTS quotations (
     salesperson_email TEXT,
     document_path TEXT,
     items_payload TEXT,
+    remarks TEXT,
     remarks_internal TEXT,
     created_by INTEGER,
     created_at TEXT DEFAULT (datetime('now')),
@@ -1820,6 +1821,8 @@ def ensure_schema_upgrades(conn):
         ensure_data_version_trigger(table, "operations")
     add_column("quotations", "payment_receipt_path", "TEXT")
     add_column("quotations", "items_payload", "TEXT")
+    add_column("quotations", "remarks", "TEXT")
+    add_column("quotations", "remarks_internal", "TEXT")
     add_column("quotations", "deleted_at", "TEXT")
     add_column("quotations", "deleted_by", "INTEGER")
     add_column("quotations", "customer_id", "INTEGER")
