@@ -2123,6 +2123,24 @@ def ensure_schema_upgrades(conn):
         "CREATE INDEX IF NOT EXISTS idx_operations_other_documents_customer ON operations_other_documents(customer_id)"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customer_documents_customer_uploaded ON customer_documents(customer_id, uploaded_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_orders_customer_updated ON delivery_orders(customer_id, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_services_customer_updated ON services(customer_id, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_service_documents_service_uploaded ON service_documents(service_id, uploaded_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_maintenance_records_customer_updated ON maintenance_records(customer_id, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_maintenance_documents_record_uploaded ON maintenance_documents(maintenance_id, uploaded_at DESC)"
+    )
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS work_reports (
             report_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8017,17 +8035,41 @@ def _guard_double_submit(
     submitted: bool,
     *,
     cooldown_seconds: float = 3.0,
+    submission_fingerprint: Optional[str] = None,
 ) -> bool:
     if not submitted:
         return False
     state_key = f"submit_guard_{action_key}"
     last_submit = st.session_state.get(state_key)
+    if isinstance(last_submit, dict):
+        last_ts = last_submit.get("ts")
+        last_fingerprint = clean_text(last_submit.get("fingerprint"))
+    else:
+        last_ts = last_submit
+        last_fingerprint = None
+    current_fingerprint = clean_text(submission_fingerprint)
     now = time.time()
-    if isinstance(last_submit, (int, float)) and now - last_submit < cooldown_seconds:
+    if (
+        isinstance(last_ts, (int, float))
+        and now - last_ts < cooldown_seconds
+        and last_fingerprint == current_fingerprint
+    ):
         st.warning("That was just submitted. Please wait a moment before trying again.")
         return False
-    st.session_state[state_key] = now
+    st.session_state[state_key] = {
+        "ts": now,
+        "fingerprint": current_fingerprint,
+    }
     return True
+
+
+def _upload_submission_fingerprint(uploaded_file, *, fallback: Optional[str] = None) -> str:
+    if uploaded_file is None:
+        return clean_text(fallback) or ""
+    filename = clean_text(getattr(uploaded_file, "name", "")) or ""
+    file_size = getattr(uploaded_file, "size", None)
+    size_part = str(int(file_size)) if isinstance(file_size, (int, float)) else ""
+    return f"{filename}:{size_part}".strip(":") or (clean_text(fallback) or "")
 
 
 def _find_login_cover_image() -> Optional[Path]:
@@ -14564,7 +14606,11 @@ def render_customer_quick_edit_section(
                     }
                     upload_label = f"{doc_type_emoji.get(doc_type, '📎')} Upload {doc_type}"
                     upload_clicked = st.form_submit_button(upload_label)
-                if _guard_double_submit(upload_btn_key, upload_clicked):
+                if _guard_double_submit(
+                    upload_btn_key,
+                    upload_clicked,
+                    submission_fingerprint=_upload_submission_fingerprint(upload_file, fallback=f"{cid}:{doc_type}"),
+                ):
                     if upload_file is None:
                         st.warning("Select a file to upload.")
                     else:
@@ -15883,7 +15929,11 @@ def render_customer_document_uploader(
                 "Save quotation",
                 key=f"{key_prefix}_quote_save",
             )
-            if _guard_double_submit(f"{key_prefix}_quote_save", submit_quote):
+            if _guard_double_submit(
+                f"{key_prefix}_quote_save",
+                submit_quote,
+                submission_fingerprint=_upload_submission_fingerprint(quote_file, fallback=f"{selected_customer}:quotation"),
+            ):
                 if quote_file is None:
                     st.error("Select a quotation document to upload.")
                 else:
@@ -15923,7 +15973,11 @@ def render_customer_document_uploader(
                 "Save work done",
                 key=f"{key_prefix}_work_done_save",
             )
-            if _guard_double_submit(f"{key_prefix}_work_done_save", submit_work_done):
+            if _guard_double_submit(
+                f"{key_prefix}_work_done_save",
+                submit_work_done,
+                submission_fingerprint=_upload_submission_fingerprint(work_done_file, fallback=f"{selected_customer}:work_done"),
+            ):
                 if work_done_file is None:
                     st.error("Select a work done document to upload.")
                 else:
@@ -15968,7 +16022,11 @@ def render_customer_document_uploader(
                 submit_do = st.form_submit_button(
                     "Save delivery order",
                 )
-            if _guard_double_submit(f"{key_prefix}_do_save", submit_do):
+            if _guard_double_submit(
+                f"{key_prefix}_do_save",
+                submit_do,
+                submission_fingerprint=_upload_submission_fingerprint(do_file, fallback=f"{selected_customer}:delivery_order"),
+            ):
                 if do_file is None:
                     st.error("Select a delivery order document to upload.")
                 else:
@@ -16017,7 +16075,11 @@ def render_customer_document_uploader(
                 "Save service/maintenance",
                 key=f"{key_prefix}_service_save",
             )
-            if _guard_double_submit(f"{key_prefix}_service_save", submit_service):
+            if _guard_double_submit(
+                f"{key_prefix}_service_save",
+                submit_service,
+                submission_fingerprint=_upload_submission_fingerprint(service_file, fallback=f"{selected_customer}:service"),
+            ):
                 if service_file is None:
                     st.error("Select a service/maintenance document to upload.")
                 else:
@@ -16171,7 +16233,11 @@ def render_operations_document_uploader(
                     "Save delivery order",
                     disabled=not upload_enabled,
                 )
-            if upload_enabled and _guard_double_submit(f"{key_prefix}_do_save", submit_do):
+            if upload_enabled and _guard_double_submit(
+                f"{key_prefix}_do_save",
+                submit_do,
+                submission_fingerprint=_upload_submission_fingerprint(do_file, fallback=f"{customer_id}:delivery_order"),
+            ):
                 if do_file is None:
                     st.error("Select a delivery order document to upload.")
                 else:
@@ -16211,7 +16277,9 @@ def render_operations_document_uploader(
                     disabled=not upload_enabled,
                 )
             if upload_enabled and _guard_double_submit(
-                f"{key_prefix}_work_done_save", submit_work_done
+                f"{key_prefix}_work_done_save",
+                submit_work_done,
+                submission_fingerprint=_upload_submission_fingerprint(work_done_file, fallback=f"{customer_id}:work_done"),
             ):
                 if work_done_file is None:
                     st.error("Select a work done document to upload.")
@@ -16251,7 +16319,11 @@ def render_operations_document_uploader(
                     "Save service",
                     disabled=not upload_enabled,
                 )
-            if upload_enabled and _guard_double_submit(f"{key_prefix}_service_save", submit_service):
+            if upload_enabled and _guard_double_submit(
+                f"{key_prefix}_service_save",
+                submit_service,
+                submission_fingerprint=_upload_submission_fingerprint(service_file, fallback=f"{customer_id}:service"),
+            ):
                 if service_file is None:
                     st.error("Select a service document to upload.")
                 else:
@@ -16291,7 +16363,9 @@ def render_operations_document_uploader(
                     disabled=not upload_enabled,
                 )
             if upload_enabled and _guard_double_submit(
-                f"{key_prefix}_maintenance_save", submit_maintenance
+                f"{key_prefix}_maintenance_save",
+                submit_maintenance,
+                submission_fingerprint=_upload_submission_fingerprint(maintenance_file, fallback=f"{customer_id}:maintenance"),
             ):
                 if maintenance_file is None:
                     st.error("Select a maintenance document to upload.")
@@ -16331,7 +16405,11 @@ def render_operations_document_uploader(
                     "Save other upload",
                     disabled=not upload_enabled,
                 )
-            if upload_enabled and _guard_double_submit(f"{key_prefix}_other_save", submit_other):
+            if upload_enabled and _guard_double_submit(
+                f"{key_prefix}_other_save",
+                submit_other,
+                submission_fingerprint=_upload_submission_fingerprint(other_file, fallback=f"{customer_id}:other"),
+            ):
                 if other_file is None:
                     st.error("Select a document to upload.")
                 else:
