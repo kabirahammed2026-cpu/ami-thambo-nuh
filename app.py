@@ -29801,7 +29801,8 @@ def reports_page(conn):
                            d.created_at,
                            d.total_amount,
                            d.status,
-                           COALESCE(c.name, c.company_name, '(customer)') AS customer,
+                           COALESCE(c.name, '(customer)') AS customer,
+                           COALESCE(c.company_name, '-') AS company_name,
                            u.username,
                            u.staff_classification
                     FROM delivery_orders d
@@ -29836,11 +29837,21 @@ def reports_page(conn):
                         "created_at": "Date",
                         "status": "Status",
                         "customer": "Customer",
+                        "company_name": "Company",
                     }
                 )
                 st.dataframe(
                     sales_display[
-                        ["Date", "Type", "DO/WO No.", "Customer", "Amount", "Status", "Team member"]
+                        [
+                            "Date",
+                            "Type",
+                            "DO/WO No.",
+                            "Customer",
+                            "Company",
+                            "Amount",
+                            "Status",
+                            "Team member",
+                        ]
                     ],
                     use_container_width=True,
                 )
