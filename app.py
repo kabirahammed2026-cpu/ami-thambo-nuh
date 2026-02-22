@@ -1234,8 +1234,12 @@ def _promote_lead_customer(
     company: Optional[str],
     phone: Optional[str],
 ) -> bool:
-    customer_name = clean_text(name)
-    company_name = clean_text(company)
+    normalized_name, normalized_company, needs_review = _sanitize_customer_identity(
+        name,
+        company,
+    )
+    customer_name = normalized_name or None
+    company_name = normalized_company or None
     phone_number = clean_text(phone)
 
     if not any([customer_name, company_name, phone_number]):
@@ -2507,18 +2511,21 @@ def _load_operations_customers(
     try:
         customers_df = pd.read_sql_query(
             f"""
-            SELECT customer_id,
-                   name,
-                   company_name,
-                   phone,
-                   address,
-                   delivery_address,
-                   sales_person,
-                   remarks,
-                   created_at
-            FROM customers
+            SELECT c.customer_id,
+                   c.name,
+                   c.company_name,
+                   c.phone,
+                   c.address,
+                   c.delivery_address,
+                   c.sales_person,
+                   c.remarks,
+                   c.created_at,
+                   c.created_by,
+                   COALESCE(u.username, '') AS created_by_name
+            FROM customers c
+            LEFT JOIN users u ON u.user_id = c.created_by
             {where_clause}
-            ORDER BY datetime(created_at) DESC, customer_id DESC
+            ORDER BY datetime(c.created_at) DESC, c.customer_id DESC
             LIMIT ?
             """,
             conn,
@@ -2537,6 +2544,7 @@ def _load_operations_customers(
         "address",
         "delivery_address",
         "remarks",
+        "created_by_name",
     ]
     for col in display_columns:
         if col not in customers_df.columns:
@@ -8954,6 +8962,36 @@ def _normalize_phone_digits(value: Optional[str]) -> Optional[str]:
         return None
     digits = re.sub(r"[^\d]", "", phone_key)
     return digits or None
+
+
+def _is_numeric_placeholder_text(value: Optional[str], *, min_digits: int = 6) -> bool:
+    """Return True when a value looks like phone/id text instead of a real name."""
+
+    cleaned = clean_text(value)
+    if not cleaned:
+        return False
+    digits = re.sub(r"\D", "", cleaned)
+    if len(digits) < min_digits:
+        return False
+    non_numeric = re.sub(r"[\d\s\-+()_/.,]", "", cleaned)
+    return non_numeric == ""
+
+
+def _sanitize_customer_identity(
+    name: Optional[str],
+    company: Optional[str],
+) -> tuple[str, str, bool]:
+    """Drop numeric-only placeholders from customer/company labels."""
+
+    clean_name = clean_text(name) or ""
+    clean_company = clean_text(company) or ""
+    name_invalid = bool(clean_name) and _is_numeric_placeholder_text(clean_name)
+    company_invalid = bool(clean_company) and _is_numeric_placeholder_text(clean_company)
+
+    normalized_name = "" if name_invalid else clean_name
+    normalized_company = "" if company_invalid else clean_company
+    needs_review = name_invalid or company_invalid
+    return normalized_name, normalized_company, needs_review
 
 
 def _phone_digits_sql_expr(column: str) -> str:
@@ -17575,11 +17613,19 @@ def operations_page(conn):
             lambda value: _strip_lead_tag(value)
             or ("Lead / chasing" if _is_lead_customer(value) else clean_text(value) or "")
         )
-        customer_display = customer_name.where(customer_name != "", company_name)
+        identity_meta = [
+            _sanitize_customer_identity(raw_name, raw_company)
+            for raw_name, raw_company in zip(customer_name.tolist(), company_name.tolist())
+        ]
+        customer_display = pd.Series([item[0] for item in identity_meta], index=display_customers.index)
+        company_display = pd.Series([item[1] for item in identity_meta], index=display_customers.index)
+        needs_review = pd.Series([item[2] for item in identity_meta], index=display_customers.index)
+        customer_display = customer_display.where(customer_display != "", company_display)
         customer_display = customer_display.where(customer_display != "", phone_value)
         customer_display = customer_display.where(customer_display != "", lead_status)
-        company_display = company_name.where(company_name != "", customer_name)
+        company_display = company_display.where(company_display != "", customer_display)
         company_display = company_display.where(company_display != "", lead_status)
+        lead_status = lead_status.where(~needs_review, "Needs CRM review")
         table_df = pd.DataFrame(
             {
                 "Select": False,
@@ -17591,6 +17637,8 @@ def operations_page(conn):
                 "Delivery address": display_customers["delivery_address"].fillna(""),
             }
         )
+        if current_user_is_admin():
+            table_df["Staff"] = display_customers.get("created_by_name", pd.Series([""] * len(display_customers))).fillna("")
         state_key = "operations_customer_table_state"
         previous_table = st.session_state.get(state_key)
         previous_select = pd.Series(False, index=table_df.index)
@@ -21267,8 +21315,12 @@ def _upsert_customer_from_manual_quotation(
 ) -> Optional[int]:
     """Insert or backfill a customer captured from a manual quotation entry."""
 
-    customer_name = clean_text(name)
-    company_name = clean_text(company)
+    normalized_name, normalized_company, needs_review = _sanitize_customer_identity(
+        name,
+        company,
+    )
+    customer_name = normalized_name or None
+    company_name = normalized_company or None
     phone_number = clean_text(phone)
     phone_key = _normalize_phone_key(phone_number)
     street_address = clean_text(address)
@@ -21353,6 +21405,8 @@ def _upsert_customer_from_manual_quotation(
         remark_parts.append(lead_tag)
     if district_label:
         remark_parts.append(f"District: {district_label}")
+    if needs_review:
+        remark_parts.append("Needs CRM review: numeric placeholder detected in customer/company")
     if reference_label:
         remark_parts.append(f"Quotation ref: {reference_label}")
     remarks_value = " | ".join(remark_parts) if remark_parts else None
@@ -27810,7 +27864,11 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
     old_phone = clean_text(record.get("live_phone")) or clean_text(record.get("phone"))
     old_do = clean_text(record.get("do_number"))
 
-    new_name = clean_text(updates.get("customer_name"))
+    sanitized_name, _, name_needs_review = _sanitize_customer_identity(
+        updates.get("customer_name"),
+        None,
+    )
+    new_name = sanitized_name
     new_phone = clean_text(updates.get("phone"))
     new_address = clean_text(updates.get("address"))
     new_delivery_address = clean_text(updates.get("delivery_address"))
@@ -27818,6 +27876,13 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
     product_label = clean_text(updates.get("product_label"))
     new_do = clean_text(updates.get("do_number"))
     new_remarks = clean_text(updates.get("remarks"))
+    if name_needs_review:
+        review_note = "Needs CRM review: numeric placeholder detected in customer name"
+        if new_remarks:
+            if review_note.lower() not in new_remarks.lower():
+                new_remarks = f"{new_remarks} | {review_note}"
+        else:
+            new_remarks = review_note
     new_amount = parse_amount(updates.get("amount_spent"))
     quantity_value = parse_quantity(updates.get("quantity"), default=1)
     product_name, product_model = split_product_label(product_label)
@@ -28044,8 +28109,12 @@ def _auto_create_customers_from_reports(
 
     created_count = 0
     for entry in normalized_rows:
-        name = clean_text(entry.get("customer_name")) or ""
-        company = clean_text(entry.get("company_name")) or ""
+        normalized_name, normalized_company, needs_review = _sanitize_customer_identity(
+            entry.get("customer_name"),
+            entry.get("company_name"),
+        )
+        name = normalized_name or ""
+        company = normalized_company or ""
         phone = clean_text(entry.get("phone")) or ""
         address = clean_text(entry.get("address")) or ""
         if not (name and company and phone):
@@ -28057,6 +28126,8 @@ def _auto_create_customers_from_reports(
             continue
         display_name = name or company
         remarks = "Auto-added from report entry."
+        if needs_review:
+            remarks = f"{remarks} Needs CRM review: numeric placeholder detected in customer/company."
         conn.execute(
             """
             INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, created_by, dup_flag)
