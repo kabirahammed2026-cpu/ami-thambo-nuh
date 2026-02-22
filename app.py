@@ -1697,6 +1697,51 @@ def init_schema(conn):
         conn.commit()
 
 
+def _normalize_text_seed(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        value = str(value)
+    elif isinstance(value, int):
+        value = str(value)
+    elif isinstance(value, float):
+        if value.is_integer():
+            value = str(int(value))
+        else:
+            value = str(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() in {"none", "null", "nan"}:
+        return None
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    return text or None
+
+
+def _normalize_customers_text_fields(conn):
+    rows = conn.execute(
+        """
+        SELECT customer_id, name, company_name, phone, address, delivery_address, remarks, product_info, delivery_order_code, sales_person
+        FROM customers
+        """
+    ).fetchall()
+    for row in rows:
+        customer_id = int(row[0])
+        normalized = [_normalize_text_seed(value) for value in row[1:]]
+        existing = list(row[1:])
+        if all((old is None and new is None) or str(old) == str(new) for old, new in zip(existing, normalized)):
+            continue
+        conn.execute(
+            """
+            UPDATE customers
+            SET name=?, company_name=?, phone=?, address=?, delivery_address=?, remarks=?, product_info=?, delivery_order_code=?, sales_person=?
+            WHERE customer_id=?
+            """,
+            (*normalized, customer_id),
+        )
+
+
 def ensure_schema_upgrades(conn):
     def has_column(table: str, column: str) -> bool:
         cur = conn.execute(f"PRAGMA table_info({table})")
@@ -1753,6 +1798,7 @@ def ensure_schema_upgrades(conn):
     conn.execute(
         "UPDATE users SET staff_classification='service' WHERE staff_classification IS NULL OR TRIM(staff_classification) = ''"
     )
+    _normalize_customers_text_fields(conn)
     add_column("services", "status", "TEXT DEFAULT 'In progress'")
     add_column("quotations", "follow_up_history", "TEXT")
     add_column("services", "service_start_date", "TEXT")
@@ -2852,12 +2898,23 @@ def upcoming_warranty_breakdown(
 def clean_text(value):
     if value is None:
         return None
+    if isinstance(value, bool):
+        value = str(value)
+    elif isinstance(value, int):
+        value = str(value)
+    elif isinstance(value, float):
+        if value.is_integer():
+            value = str(int(value))
+        else:
+            value = str(value)
     try:
         if pd.isna(value):
             return None
     except Exception:
         pass
     value = str(value).strip()
+    if re.fullmatch(r"[+-]?\d+\.0+", value):
+        value = value.split(".", 1)[0]
     if value.lower() in {"none", "null", "nan"}:
         return None
     return value or None
