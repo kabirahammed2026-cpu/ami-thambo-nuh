@@ -201,6 +201,25 @@ def _looks_like_date_column(column_name: str) -> bool:
     return "date" in lowered or lowered.endswith("_at") or lowered.endswith("_on")
 
 
+def _looks_like_text_column(column_name: str) -> bool:
+    lowered = column_name.lower().strip()
+    text_markers = (
+        "name",
+        "company",
+        "phone",
+        "mobile",
+        "address",
+        "remarks",
+        "comment",
+        "note",
+        "details",
+        "contact",
+        "email",
+        "code",
+    )
+    return any(marker in lowered for marker in text_markers)
+
+
 def _strip_warranty_tag(note: Optional[str]) -> str:
     text = clean_text(note) or ""
     if text.startswith("[Warranty #"):
@@ -226,6 +245,9 @@ def normalize_editor_df(
     text_columns = text_columns or set()
     for col in normalized.columns:
         series = normalized[col]
+        if _looks_like_text_column(str(col)) and col not in numeric_columns:
+            normalized[col] = series.map(lambda value: clean_text(value) or "")
+            continue
         if col in numeric_columns:
             normalized[col] = pd.to_numeric(series, errors="coerce")
             continue
