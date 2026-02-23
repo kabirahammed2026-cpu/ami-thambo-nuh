@@ -2289,6 +2289,14 @@ def current_user_is_admin() -> bool:
     return get_current_user().get("role") == "admin"
 
 
+def current_user_staff_classification() -> str:
+    return (clean_text(get_current_user().get("staff_classification")) or "service").lower()
+
+
+def current_user_is_service_staff() -> bool:
+    return (not current_user_is_admin()) and current_user_staff_classification() == "service"
+
+
 def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     info = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(clean_text(row[1]) == column for row in info)
@@ -2685,7 +2693,7 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
         filters = [
             "d.deleted_at IS NULL",
             "COALESCE(d.record_type, 'delivery_order') IN ('delivery_order', 'work_done')",
-            "d.status = 'paid'",
+            "LOWER(COALESCE(d.status, 'due')) IN ('paid', 'advance', 'advanced')",
             "d.total_amount IS NOT NULL",
         ]
         if scope_clause:
@@ -2704,7 +2712,7 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
     def _sum_quotations(where_clause: str) -> float:
         filters = [
             "q.deleted_at IS NULL",
-            "q.status = 'paid'",
+            "LOWER(COALESCE(q.status, 'due')) IN ('paid', 'advance', 'advanced')",
             "q.total_amount IS NOT NULL",
         ]
         params: list[object] = []
@@ -2724,7 +2732,7 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
     def _sum_services(where_clause: str) -> float:
         filters = [
             "s.deleted_at IS NULL",
-            "s.payment_status = 'paid'",
+            "LOWER(COALESCE(s.payment_status, 'due')) IN ('paid', 'advance', 'advanced')",
             "s.bill_amount IS NOT NULL",
         ]
         params: list[object] = []
@@ -2745,7 +2753,7 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
     def _sum_maintenance(where_clause: str) -> float:
         filters = [
             "m.deleted_at IS NULL",
-            "m.payment_status = 'paid'",
+            "LOWER(COALESCE(m.payment_status, 'due')) IN ('paid', 'advance', 'advanced')",
             "m.total_amount IS NOT NULL",
         ]
         params: list[object] = []
@@ -11146,10 +11154,14 @@ def dashboard(conn):
             ]
 
         def _format_payment_label(value: Optional[str]) -> str:
-            cleaned = clean_text(value)
-            if not cleaned:
-                return "Pending"
-            return cleaned.replace("_", " ").title()
+            cleaned = (clean_text(value) or "").lower().replace("_", " ").strip()
+            if not cleaned or cleaned == "pending":
+                return "Due"
+            if cleaned in {"advanced", "advance"}:
+                return "Advance"
+            if cleaned == "rejected":
+                return "Due"
+            return cleaned.title()
 
         sales_frames: list[pd.DataFrame] = []
         if not staff_sales_df.empty:
@@ -12657,6 +12669,30 @@ def dashboard(conn):
 
     from_iso = team_from_date.isoformat()
     to_iso = team_to_date.isoformat()
+
+    admin_window_stats = df_query(
+        conn,
+        """
+        SELECT
+            (SELECT COUNT(*) FROM quotations q WHERE q.deleted_at IS NULL AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)) AS total_quotations,
+            (SELECT COUNT(*) FROM quotations q WHERE q.deleted_at IS NULL AND LOWER(COALESCE(q.status, 'due')) IN ('paid', 'advance', 'advanced') AND date(COALESCE(q.quote_date, q.created_at)) BETWEEN date(?) AND date(?)) AS quotation_financially_closed,
+            (SELECT COUNT(*) FROM work_reports wr WHERE date(COALESCE(wr.period_end, wr.created_at)) BETWEEN date(?) AND date(?)) AS total_reports,
+            (SELECT COUNT(*) FROM delivery_orders d WHERE d.deleted_at IS NULL AND date(COALESCE(d.delivery_date, d.created_at)) BETWEEN date(?) AND date(?)) AS total_delivery_and_work,
+            (SELECT COUNT(*) FROM services s WHERE s.deleted_at IS NULL AND date(COALESCE(s.service_start_date, s.service_date, s.updated_at)) BETWEEN date(?) AND date(?)) AS total_service_jobs,
+            (SELECT COUNT(*) FROM maintenance_records m WHERE m.deleted_at IS NULL AND date(COALESCE(m.maintenance_start_date, m.maintenance_date, m.updated_at)) BETWEEN date(?) AND date(?)) AS total_maintenance_jobs
+        """,
+        (from_iso, to_iso, from_iso, to_iso, from_iso, to_iso, from_iso, to_iso, from_iso, to_iso, from_iso, to_iso),
+    )
+    if not admin_window_stats.empty:
+        stats_row = admin_window_stats.iloc[0]
+        st.markdown("#### Admin period snapshot")
+        admin_stat_cols = st.columns(6)
+        admin_stat_cols[0].metric("Quotations", int(stats_row.get("total_quotations") or 0))
+        admin_stat_cols[1].metric("Quoted paid/advance", int(stats_row.get("quotation_financially_closed") or 0))
+        admin_stat_cols[2].metric("Reports submitted", int(stats_row.get("total_reports") or 0))
+        admin_stat_cols[3].metric("Delivery + work done", int(stats_row.get("total_delivery_and_work") or 0))
+        admin_stat_cols[4].metric("Service jobs", int(stats_row.get("total_service_jobs") or 0))
+        admin_stat_cols[5].metric("Maintenance jobs", int(stats_row.get("total_maintenance_jobs") or 0))
 
     team_tab_service, team_tab_sales = st.tabs(
         ["Service staff works", "Sales staff works"]
@@ -15114,7 +15150,7 @@ def _render_doc_detail_inputs(
         )
         details["payment_status"] = st.selectbox(
             "Payment status",
-            options=["pending", "paid", "rejected"],
+            options=["due", "paid", "advance"],
             key=f"{key_prefix}_quotation_payment_status",
             format_func=lambda status: status.title(),
         )
@@ -15214,7 +15250,7 @@ def _render_doc_detail_inputs(
             )
         status_value = normalize_delivery_status(details.get("status"))
         details["advance_taken"] = False
-        if status_value == "advanced" and RECEIPTS_ENABLED:
+        if status_value in {"advanced", "advance"} and RECEIPTS_ENABLED:
             details["advance_taken"] = st.checkbox(
                 "Advance payment was received",
                 key=f"{key_prefix}_do_advance_taken",
@@ -15285,7 +15321,7 @@ def _render_doc_detail_inputs(
         )
         details["payment_status"] = st.selectbox(
             "Payment status",
-            ["pending", "advanced", "paid"],
+            ["due", "advance", "paid"],
             key=f"{key_prefix}_service_payment_status",
         )
         details["person_in_charge"] = st.text_input(
@@ -15359,7 +15395,7 @@ def _render_doc_detail_inputs(
         )
         details["payment_status"] = st.selectbox(
             "Payment status",
-            ["pending", "advanced", "paid"],
+            ["due", "advance", "paid"],
             key=f"{key_prefix}_maintenance_payment_status",
         )
         details["person_in_charge"] = st.text_input(
@@ -15511,7 +15547,7 @@ def _save_customer_document_upload(
             return False
         status_value = normalize_delivery_status(details.get("status"))
         if RECEIPTS_ENABLED:
-            if status_value == "advanced" and details.get("advance_receipt_upload") is None:
+            if status_value in {"advanced", "advance"} and details.get("advance_receipt_upload") is None:
                 st.warning("Advance receipt is highly recommended for advanced records.")
             if status_value == "paid":
                 if details.get("receipt_upload") is None:
@@ -15531,7 +15567,7 @@ def _save_customer_document_upload(
                 if details.get("advance_taken") and details.get("advance_receipt_upload") is None:
                     st.warning("Advance receipt is highly recommended when an advance was taken.")
     if doc_type == "Quotation":
-        status_value = clean_text(details.get("payment_status")) or "pending"
+        status_value = clean_text(details.get("payment_status")) or "due"
         if not clean_text(details.get("reference")):
             st.error("Quotation reference is required.")
             return False
@@ -15561,8 +15597,8 @@ def _save_customer_document_upload(
             if details.get("payment_status") == "paid" and details.get("receipt_upload") is None:
                 st.error("Upload a payment receipt before marking this service as paid.")
                 return False
-            if details.get("payment_status") == "advanced" and details.get("receipt_upload") is None:
-                st.warning("Payment receipt is highly recommended for advanced service records.")
+            if details.get("payment_status") in {"advanced", "advance"} and details.get("receipt_upload") is None:
+                st.warning("Payment receipt is highly recommended for advance service records.")
         details["items"] = items_clean
     if doc_type == "Maintenance":
         if not clean_text(details.get("description")):
@@ -15577,8 +15613,8 @@ def _save_customer_document_upload(
             if details.get("payment_status") == "paid" and details.get("receipt_upload") is None:
                 st.error("Upload a payment receipt before marking this maintenance record as paid.")
                 return False
-            if details.get("payment_status") == "advanced" and details.get("receipt_upload") is None:
-                st.warning("Payment receipt is highly recommended for advanced maintenance records.")
+            if details.get("payment_status") in {"advanced", "advance"} and details.get("receipt_upload") is None:
+                st.warning("Payment receipt is highly recommended for advance maintenance records.")
         details["items"] = items_clean
     if doc_type == "Other":
         if not clean_text(details.get("description")):
@@ -15720,7 +15756,7 @@ def _save_customer_document_upload(
         advance_receipt_upload = (
             details.get("advance_receipt_upload") if RECEIPTS_ENABLED else None
         )
-        if status_value == "advanced" and advance_receipt_upload is not None:
+        if status_value in {"advanced", "advance"} and advance_receipt_upload is not None:
             receipt_upload = advance_receipt_upload
         if RECEIPTS_ENABLED and receipt_upload is not None:
             receipt_error = _validate_upload(
@@ -15854,7 +15890,7 @@ def _save_customer_document_upload(
                 remarks,
                 product_info,
                 clean_text(details.get("status")) or DEFAULT_SERVICE_STATUS,
-                details.get("payment_status") or "pending",
+                (clean_text(details.get("payment_status")) or "due").replace("advanced", "advance"),
                 receipt_path,
                 total_amount if total_amount else None,
                 uploader_id,
@@ -15920,7 +15956,7 @@ def _save_customer_document_upload(
                 remarks,
                 product_info,
                 clean_text(details.get("status")) or DEFAULT_SERVICE_STATUS,
-                details.get("payment_status") or "pending",
+                (clean_text(details.get("payment_status")) or "due").replace("advanced", "advance"),
                 receipt_path,
                 total_amount if total_amount else None,
                 uploader_id,
@@ -16340,225 +16376,234 @@ def render_operations_document_uploader(
     with container:
         if not upload_enabled:
             st.info("Select a customer above to upload operations documents.")
-        upload_tabs = st.tabs(
-            ["Delivery order", "Work done", "Service", "Maintenance", "Other uploads"]
-        )
-        with upload_tabs[0]:
-            with st.form(key=f"{key_prefix}_do_form", clear_on_submit=False):
-                do_file = st.file_uploader(
-                    "Delivery order upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_do_file",
-                    help="Upload the delivery order PDF or image.",
-                    disabled=not upload_enabled,
-                )
-                do_details = _render_doc_detail_inputs(
-                    "Delivery order",
-                    key_prefix=f"{key_prefix}_do_details",
-                    defaults=customer_record,
-                )
-                submit_do = st.form_submit_button(
-                    "Save delivery order",
-                    disabled=not upload_enabled,
-                )
-            if upload_enabled and _guard_double_submit(
-                f"{key_prefix}_do_save",
-                submit_do,
-                submission_fingerprint=_upload_submission_fingerprint(do_file, fallback=f"{selected_customer}:delivery_order"),
-            ):
-                if do_file is None:
-                    st.error("Select a delivery order document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Delivery order",
-                        upload_file=do_file,
-                        details=do_details,
+        upload_tab_labels = ["Delivery order", "Work done", "Service", "Maintenance", "Other uploads"]
+        if current_user_is_service_staff():
+            upload_tab_labels = ["Service", "Maintenance", "Other uploads"]
+        upload_tabs = st.tabs(upload_tab_labels)
+        tab_map = {label: tab for label, tab in zip(upload_tab_labels, upload_tabs)}
+        if "Delivery order" in tab_map:
+            with tab_map["Delivery order"]:
+                with st.form(key=f"{key_prefix}_do_form", clear_on_submit=False):
+                    do_file = st.file_uploader(
+                        "Delivery order upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_do_file",
+                        help="Upload the delivery order PDF or image.",
+                        disabled=not upload_enabled,
                     )
-                    if saved:
-                        st.success("Delivery order uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_do_file",
-                            details_key_prefix=f"{key_prefix}_do_details",
+                    do_details = _render_doc_detail_inputs(
+                        "Delivery order",
+                        key_prefix=f"{key_prefix}_do_details",
+                        defaults=customer_record,
+                    )
+                    submit_do = st.form_submit_button(
+                        "Save delivery order",
+                        disabled=not upload_enabled,
+                    )
+                if upload_enabled and _guard_double_submit(
+                    f"{key_prefix}_do_save",
+                    submit_do,
+                    submission_fingerprint=_upload_submission_fingerprint(do_file, fallback=f"{selected_customer}:delivery_order"),
+                ):
+                    if do_file is None:
+                        st.error("Select a delivery order document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
                             doc_type="Delivery order",
+                            upload_file=do_file,
+                            details=do_details,
                         )
+                        if saved:
+                            st.success("Delivery order uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_do_file",
+                                details_key_prefix=f"{key_prefix}_do_details",
+                                doc_type="Delivery order",
+                            )
 
-        with upload_tabs[1]:
-            with st.form(key=f"{key_prefix}_work_done_form", clear_on_submit=False):
-                work_done_file = st.file_uploader(
-                    "Work done upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_work_done_file",
-                    help="Upload completed work slips or PDFs.",
-                    disabled=not upload_enabled,
-                )
-                work_done_details = _render_doc_detail_inputs(
-                    "Work done",
-                    key_prefix=f"{key_prefix}_work_done_details",
-                    defaults=customer_record,
-                )
-                submit_work_done = st.form_submit_button(
-                    "Save work done",
-                    disabled=not upload_enabled,
-                )
-            if upload_enabled and _guard_double_submit(
-                f"{key_prefix}_work_done_save",
-                submit_work_done,
-                submission_fingerprint=_upload_submission_fingerprint(work_done_file, fallback=f"{selected_customer}:work_done"),
-            ):
-                if work_done_file is None:
-                    st.error("Select a work done document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Work done",
-                        upload_file=work_done_file,
-                        details=work_done_details,
+        if "Work done" in tab_map:
+            with tab_map["Work done"]:
+                with st.form(key=f"{key_prefix}_work_done_form", clear_on_submit=False):
+                    work_done_file = st.file_uploader(
+                        "Work done upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_work_done_file",
+                        help="Upload completed work slips or PDFs.",
+                        disabled=not upload_enabled,
                     )
-                    if saved:
-                        st.success("Work done uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_work_done_file",
-                            details_key_prefix=f"{key_prefix}_work_done_details",
+                    work_done_details = _render_doc_detail_inputs(
+                        "Work done",
+                        key_prefix=f"{key_prefix}_work_done_details",
+                        defaults=customer_record,
+                    )
+                    submit_work_done = st.form_submit_button(
+                        "Save work done",
+                        disabled=not upload_enabled,
+                    )
+                if upload_enabled and _guard_double_submit(
+                    f"{key_prefix}_work_done_save",
+                    submit_work_done,
+                    submission_fingerprint=_upload_submission_fingerprint(work_done_file, fallback=f"{selected_customer}:work_done"),
+                ):
+                    if work_done_file is None:
+                        st.error("Select a work done document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
                             doc_type="Work done",
+                            upload_file=work_done_file,
+                            details=work_done_details,
                         )
+                        if saved:
+                            st.success("Work done uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_work_done_file",
+                                details_key_prefix=f"{key_prefix}_work_done_details",
+                                doc_type="Work done",
+                            )
 
-        with upload_tabs[2]:
-            with st.form(key=f"{key_prefix}_service_form", clear_on_submit=False):
-                service_file = st.file_uploader(
-                    "Service upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_service_file",
-                    help="Upload service documents.",
-                    disabled=not upload_enabled,
-                )
-                service_details = _render_doc_detail_inputs(
-                    "Service",
-                    key_prefix=f"{key_prefix}_service_details",
-                    defaults=customer_record,
-                )
-                submit_service = st.form_submit_button(
-                    "Save service",
-                    disabled=not upload_enabled,
-                )
-            if upload_enabled and _guard_double_submit(
-                f"{key_prefix}_service_save",
-                submit_service,
-                submission_fingerprint=_upload_submission_fingerprint(service_file, fallback=f"{selected_customer}:service"),
-            ):
-                if service_file is None:
-                    st.error("Select a service document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Service",
-                        upload_file=service_file,
-                        details=service_details,
+        if "Service" in tab_map:
+            with tab_map["Service"]:
+                with st.form(key=f"{key_prefix}_service_form", clear_on_submit=False):
+                    service_file = st.file_uploader(
+                        "Service upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_service_file",
+                        help="Upload service documents.",
+                        disabled=not upload_enabled,
                     )
-                    if saved:
-                        st.success("Service uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_service_file",
-                            details_key_prefix=f"{key_prefix}_service_details",
+                    service_details = _render_doc_detail_inputs(
+                        "Service",
+                        key_prefix=f"{key_prefix}_service_details",
+                        defaults=customer_record,
+                    )
+                    submit_service = st.form_submit_button(
+                        "Save service",
+                        disabled=not upload_enabled,
+                    )
+                if upload_enabled and _guard_double_submit(
+                    f"{key_prefix}_service_save",
+                    submit_service,
+                    submission_fingerprint=_upload_submission_fingerprint(service_file, fallback=f"{selected_customer}:service"),
+                ):
+                    if service_file is None:
+                        st.error("Select a service document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
                             doc_type="Service",
+                            upload_file=service_file,
+                            details=service_details,
                         )
+                        if saved:
+                            st.success("Service record uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_service_file",
+                                details_key_prefix=f"{key_prefix}_service_details",
+                                doc_type="Service",
+                            )
 
-        with upload_tabs[3]:
-            with st.form(key=f"{key_prefix}_maintenance_form", clear_on_submit=False):
-                maintenance_file = st.file_uploader(
-                    "Maintenance upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_maintenance_file",
-                    help="Upload maintenance documents.",
-                    disabled=not upload_enabled,
-                )
-                maintenance_details = _render_doc_detail_inputs(
-                    "Maintenance",
-                    key_prefix=f"{key_prefix}_maintenance_details",
-                    defaults=customer_record,
-                )
-                submit_maintenance = st.form_submit_button(
-                    "Save maintenance",
-                    disabled=not upload_enabled,
-                )
-            if upload_enabled and _guard_double_submit(
-                f"{key_prefix}_maintenance_save",
-                submit_maintenance,
-                submission_fingerprint=_upload_submission_fingerprint(maintenance_file, fallback=f"{selected_customer}:maintenance"),
-            ):
-                if maintenance_file is None:
-                    st.error("Select a maintenance document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Maintenance",
-                        upload_file=maintenance_file,
-                        details=maintenance_details,
+        if "Maintenance" in tab_map:
+            with tab_map["Maintenance"]:
+                with st.form(key=f"{key_prefix}_maintenance_form", clear_on_submit=False):
+                    maintenance_file = st.file_uploader(
+                        "Maintenance upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_maintenance_file",
+                        help="Upload maintenance documents.",
+                        disabled=not upload_enabled,
                     )
-                    if saved:
-                        st.success("Maintenance uploaded.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_maintenance_file",
-                            details_key_prefix=f"{key_prefix}_maintenance_details",
+                    maintenance_details = _render_doc_detail_inputs(
+                        "Maintenance",
+                        key_prefix=f"{key_prefix}_maintenance_details",
+                        defaults=customer_record,
+                    )
+                    submit_maintenance = st.form_submit_button(
+                        "Save maintenance",
+                        disabled=not upload_enabled,
+                    )
+                if upload_enabled and _guard_double_submit(
+                    f"{key_prefix}_maintenance_save",
+                    submit_maintenance,
+                    submission_fingerprint=_upload_submission_fingerprint(maintenance_file, fallback=f"{selected_customer}:maintenance"),
+                ):
+                    if maintenance_file is None:
+                        st.error("Select a maintenance document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
                             doc_type="Maintenance",
+                            upload_file=maintenance_file,
+                            details=maintenance_details,
                         )
+                        if saved:
+                            st.success("Maintenance record uploaded.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_maintenance_file",
+                                details_key_prefix=f"{key_prefix}_maintenance_details",
+                                doc_type="Maintenance",
+                            )
 
-        with upload_tabs[4]:
-            with st.form(key=f"{key_prefix}_other_form", clear_on_submit=False):
-                other_file = st.file_uploader(
-                    "Other upload",
-                    type=None,
-                    accept_multiple_files=False,
-                    key=f"{key_prefix}_other_file",
-                    help="Upload any other operational documents.",
-                    disabled=not upload_enabled,
-                )
-                other_details = _render_doc_detail_inputs(
-                    "Other",
-                    key_prefix=f"{key_prefix}_other_details",
-                    defaults=customer_record,
-                )
-                submit_other = st.form_submit_button(
-                    "Save other upload",
-                    disabled=not upload_enabled,
-                )
-            if upload_enabled and _guard_double_submit(
-                f"{key_prefix}_other_save",
-                submit_other,
-                submission_fingerprint=_upload_submission_fingerprint(other_file, fallback=f"{selected_customer}:other"),
-            ):
-                if other_file is None:
-                    st.error("Select a document to upload.")
-                else:
-                    saved = _save_customer_document_upload(
-                        conn,
-                        customer_id=int(selected_customer),
-                        customer_record=customer_record,
-                        doc_type="Other",
-                        upload_file=other_file,
-                        details=other_details,
+        if "Other uploads" in tab_map:
+            with tab_map["Other uploads"]:
+                with st.form(key=f"{key_prefix}_other_form", clear_on_submit=False):
+                    other_file = st.file_uploader(
+                        "Other upload",
+                        type=None,
+                        accept_multiple_files=False,
+                        key=f"{key_prefix}_other_file",
+                        help="Upload any additional operations document.",
+                        disabled=not upload_enabled,
                     )
-                    if saved:
-                        st.success("Other upload saved.")
-                        _clear_operations_upload_state(
-                            file_key=f"{key_prefix}_other_file",
-                            details_key_prefix=f"{key_prefix}_other_details",
+                    other_details = _render_doc_detail_inputs(
+                        "Other",
+                        key_prefix=f"{key_prefix}_other_details",
+                        defaults=customer_record,
+                    )
+                    submit_other = st.form_submit_button(
+                        "Save other upload",
+                        disabled=not upload_enabled,
+                    )
+                if upload_enabled and _guard_double_submit(
+                    f"{key_prefix}_other_save",
+                    submit_other,
+                    submission_fingerprint=_upload_submission_fingerprint(other_file, fallback=f"{selected_customer}:other"),
+                ):
+                    if other_file is None:
+                        st.error("Select a document to upload.")
+                    else:
+                        saved = _save_customer_document_upload(
+                            conn,
+                            customer_id=int(selected_customer),
+                            customer_record=customer_record,
                             doc_type="Other",
+                            upload_file=other_file,
+                            details=other_details,
                         )
+                        if saved:
+                            st.success("Other upload saved.")
+                            _clear_operations_upload_state(
+                                file_key=f"{key_prefix}_other_file",
+                                details_key_prefix=f"{key_prefix}_other_details",
+                                doc_type="Other",
+                            )
 
     doc_type_options = ["Delivery order", "Work done", "Service", "Maintenance", "Other"]
+    if current_user_is_service_staff():
+        doc_type_options = ["Service", "Maintenance", "Other"]
     filter_cols = st.columns((1.6, 1.2, 1.1, 1.1))
     with filter_cols[0]:
         search_query = st.text_input(
@@ -16661,6 +16706,10 @@ def render_operations_document_uploader(
                 | (docs_df["maintenance_created_by"].fillna(-1).astype(int) == viewer_id)
                 | (docs_df["other_uploaded_by"].fillna(-1).astype(int) == viewer_id)
             ]
+    if current_user_is_service_staff() and not docs_df.empty:
+        docs_df = docs_df[
+            docs_df["doc_type"].fillna("").isin(["Service", "Maintenance", "Other"])
+        ]
     if customer_filter:
         docs_df = docs_df[docs_df["customer_id"] == int(customer_filter)]
     if doc_type_filter != "All":
@@ -17718,6 +17767,8 @@ def operations_page(conn):
         "Maintenance",
         "Other uploads",
     ]
+    if current_user_is_service_staff():
+        tab_labels = ["Service", "Maintenance", "Other uploads"]
     tab_lookup = {
         "delivery_orders": "Delivery orders",
         "work_done": "Work done",
@@ -17734,6 +17785,8 @@ def operations_page(conn):
         key="operations_tab",
         label_visibility="collapsed",
     )
+    if selected_tab not in tab_labels:
+        selected_tab = tab_labels[0]
     if selected_tab == "Delivery orders":
         st.markdown("### Delivery orders")
         delivery_orders_page(
@@ -18056,7 +18109,7 @@ def customers_page(conn):
                     )
                     service_status = service_cols[2].selectbox(
                         "Service payment status",
-                        options=["pending", "paid"],
+                        options=["due", "advance", "paid"],
                         key="new_customer_service_payment_status",
                         help="Track whether the service has been paid.",
                     )
@@ -18071,7 +18124,7 @@ def customers_page(conn):
                 else:
                     service_date_input = st.session_state.get("new_customer_service_date")
                     service_description = st.session_state.get("new_customer_service_description")
-                    service_status = st.session_state.get("new_customer_service_payment_status", "pending")
+                    service_status = st.session_state.get("new_customer_service_payment_status", "due")
                     service_receipt = st.session_state.get("new_customer_service_receipt")
 
                 if create_maintenance:
@@ -18095,7 +18148,7 @@ def customers_page(conn):
                     )
                     maintenance_status = maintenance_cols[2].selectbox(
                         "Maintenance payment status",
-                        options=["pending", "paid"],
+                        options=["due", "advance", "paid"],
                         key="new_customer_maintenance_payment_status",
                         help="Track whether maintenance has been paid.",
                     )
@@ -18111,7 +18164,7 @@ def customers_page(conn):
                     maintenance_date_input = st.session_state.get("new_customer_maintenance_date")
                     maintenance_description = st.session_state.get("new_customer_maintenance_description")
                     maintenance_status = st.session_state.get(
-                        "new_customer_maintenance_payment_status", "pending"
+                        "new_customer_maintenance_payment_status", "due"
                     )
                     maintenance_receipt = st.session_state.get("new_customer_maintenance_receipt")
             action_cols = st.columns((1, 1))
@@ -18582,9 +18635,11 @@ def customers_page(conn):
                         service_reference = _ensure_auto_reference(
                             "new_customer_auto_service_reference", "SV"
                         )
-                    service_status_value = clean_text(service_status) or "pending"
-                    if service_status_value not in {"pending", "paid"}:
-                        service_status_value = "pending"
+                    service_status_value = clean_text(service_status) or "due"
+                    if service_status_value in {"pending", "advanced"}:
+                        service_status_value = "advance" if service_status_value == "advanced" else "due"
+                    if service_status_value not in {"due", "advance", "paid"}:
+                        service_status_value = "due"
                     service_receipt_path = None
                     if RECEIPTS_ENABLED and service_status_value == "paid":
                         service_receipt_path = store_payment_receipt(
@@ -18648,9 +18703,11 @@ def customers_page(conn):
                         maintenance_reference = _ensure_auto_reference(
                             "new_customer_auto_maintenance_reference", "MT"
                         )
-                    maintenance_status_value = clean_text(maintenance_status) or "pending"
-                    if maintenance_status_value not in {"pending", "paid"}:
-                        maintenance_status_value = "pending"
+                    maintenance_status_value = clean_text(maintenance_status) or "due"
+                    if maintenance_status_value in {"pending", "advanced"}:
+                        maintenance_status_value = "advance" if maintenance_status_value == "advanced" else "due"
+                    if maintenance_status_value not in {"due", "advance", "paid"}:
+                        maintenance_status_value = "due"
                     maintenance_receipt_path = None
                     if RECEIPTS_ENABLED and maintenance_status_value == "paid":
                         maintenance_receipt_path = store_payment_receipt(
@@ -24098,10 +24155,10 @@ def _reset_delivery_order_form_state(record_type_key: str) -> None:
         st.session_state.pop(f"{record_key}_document_upload", None)
 
 
-DELIVERY_STATUS_OPTIONS = ["due", "advanced", "paid"]
+DELIVERY_STATUS_OPTIONS = ["due", "advance", "paid"]
 DELIVERY_STATUS_LABELS = {
     "due": "Due",
-    "advanced": "Advanced",
+    "advance": "Advance",
     "paid": "Paid",
 }
 
@@ -24115,8 +24172,8 @@ def normalize_delivery_status(value: Optional[str]) -> str:
         return normalized
     if normalized in {"pending", "rejected", "overdue"}:
         return "due"
-    if normalized in {"advance", "advanced_payment"}:
-        return "advanced"
+    if normalized in {"advance", "advanced", "advanced_payment"}:
+        return "advance"
     return "due"
 
 
@@ -28305,7 +28362,7 @@ def _sync_report_payment_records(
 
     for idx, row in enumerate(normalized_rows):
         if template_key == "service":
-            status_value = clean_text(row.get("payment_status")) or "pending"
+            status_value = clean_text(row.get("payment_status")) or "due"
             customer_name = clean_text(row.get("customer_name"))
             description = clean_text(row.get("reported_complaints")) or clean_text(
                 row.get("details_remarks")
@@ -28316,7 +28373,7 @@ def _sync_report_payment_records(
             service_date = row.get("work_done_date") or period_end
             bill_amount = _coerce_float(row.get("bill_tk"), 0.0)
         else:
-            status_value = clean_text(row.get("status")) or "pending"
+            status_value = clean_text(row.get("status")) or "due"
             customer_name = clean_text(row.get("client_name"))
             description = clean_text(row.get("notes")) or clean_text(row.get("product_detail"))
             remarks = clean_text(row.get("notes"))
@@ -28326,8 +28383,10 @@ def _sync_report_payment_records(
             bill_amount = None
 
         normalized_status = status_value.strip().lower()
-        if normalized_status not in {"paid", "pending"}:
-            normalized_status = "pending"
+        if normalized_status in {"pending", "advanced", "advance"}:
+            normalized_status = "advance" if normalized_status in {"advanced", "advance"} else "due"
+        if normalized_status not in {"paid", "due", "advance"}:
+            normalized_status = "due"
 
         customer_id = _lookup_customer_id_by_name(conn, customer_name)
         existing = conn.execute(
