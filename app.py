@@ -23652,7 +23652,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     total_amount,
                     updated_at,
                     created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     selected_do,
