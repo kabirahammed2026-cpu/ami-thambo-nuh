@@ -23523,31 +23523,21 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                     key=state_key,
                 )
-        status_value = status_input_widget("maintenance_new", DEFAULT_SERVICE_STATUS)
-        maintenance_status_choice = get_status_choice("maintenance_new")
+        status_value = st.selectbox(
+            "Status",
+            DELIVERY_STATUS_OPTIONS,
+            index=DELIVERY_STATUS_OPTIONS.index("due"),
+            format_func=lambda value: DELIVERY_STATUS_LABELS.get(value, value.title()),
+            key="maintenance_new_payment_status",
+        )
         today = datetime.now().date()
-        if maintenance_status_choice == "Completed":
-            maintenance_period_value = render_flexible_date_range(
-                "Maintenance period",
-                start_value=today,
-                end_value=today,
-                help="Select the start and end dates for the maintenance work.",
-                key_prefix="maintenance_new_period_completed",
-            )
-        elif maintenance_status_choice == "In progress":
-            maintenance_period_value = render_flexible_date_input(
-                "Maintenance start date",
-                value=today,
-                help="Choose when this maintenance began.",
-                key="maintenance_new_period_start",
-            )
-        else:
-            maintenance_period_value = render_flexible_date_input(
-                "Planned start date",
-                value=today,
-                help="Select when this maintenance is scheduled to begin.",
-                key="maintenance_new_period_planned",
-            )
+        maintenance_period_value = render_flexible_date_range(
+            "Maintenance period",
+            start_value=today,
+            end_value=today,
+            help="Select the start and end dates for the maintenance work.",
+            key_prefix="maintenance_new_period",
+        )
         description = st.text_area("Maintenance description")
         remarks = st.text_area("Remarks / updates")
         maintenance_amount_input = st.number_input(
@@ -23623,20 +23613,13 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             maintenance_date_str,
             maintenance_start_str,
             maintenance_end_str,
-        ) = determine_period_strings(
-            maintenance_status_choice, maintenance_period_value
-        )
+        ) = determine_period_strings("Completed", maintenance_period_value)
         valid_entry = True
         if selected_customer is None:
             st.error("Select a customer to log this maintenance entry.")
             valid_entry = False
-        if maintenance_status_choice == "Completed" and (
-            not maintenance_start_str or not maintenance_end_str
-        ):
+        if not maintenance_start_str or not maintenance_end_str:
             st.error("Start and end dates are required for completed maintenance work.")
-            valid_entry = False
-        if maintenance_status_choice != "Completed" and not maintenance_start_str:
-            st.error("Select a start date for this maintenance entry.")
             valid_entry = False
         if valid_entry:
             _cleaned_maintenance_products, maintenance_product_labels = normalize_product_entries(
@@ -23663,6 +23646,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     maintenance_end_date,
                     description,
                     status,
+                    payment_status,
                     remarks,
                     maintenance_product_info,
                     total_amount,
@@ -23677,7 +23661,8 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     maintenance_start_str,
                     maintenance_end_str,
                     clean_text(description),
-                    status_value,
+                    DEFAULT_SERVICE_STATUS,
+                    normalize_delivery_status(status_value),
                     clean_text(remarks),
                     maintenance_product_label,
                     maintenance_amount_value,
@@ -23739,7 +23724,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                m.maintenance_end_date,
                m.maintenance_product_info,
                m.description,
-               m.status,
+               m.payment_status AS status,
                m.remarks,
                m.total_amount,
                m.updated_at,
@@ -23796,7 +23781,10 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         display_df.loc[display_df["Last update"].isna(), "Last update"] = None
         if "status" in display_df.columns:
             display_df["status"] = display_df["status"].apply(
-                lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS
+                lambda x: DELIVERY_STATUS_LABELS.get(
+                    normalize_delivery_status(x),
+                    "Due",
+                )
             )
         if "total_amount" in display_df.columns:
             display_df["maintenance_amount_display"] = display_df["total_amount"].apply(
@@ -23881,12 +23869,14 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             key="maintenance_edit_select",
         )
         selected_record = next(r for r in records if int(r["maintenance_id"]) == int(selected_maintenance_id))
-        new_status = status_input_widget(
-            f"maintenance_edit_{selected_maintenance_id}",
-            selected_record.get("status"),
-        )
-        maintenance_edit_choice = get_status_choice(
-            f"maintenance_edit_{selected_maintenance_id}"
+        new_status = st.selectbox(
+            "Status",
+            DELIVERY_STATUS_OPTIONS,
+            index=DELIVERY_STATUS_OPTIONS.index(
+                normalize_delivery_status(selected_record.get("status"))
+            ),
+            format_func=lambda value: DELIVERY_STATUS_LABELS.get(value, value.title()),
+            key=f"maintenance_edit_{selected_maintenance_id}_payment_status",
         )
         existing_start = ensure_date(selected_record.get("maintenance_start_date")) or ensure_date(
             selected_record.get("maintenance_date")
@@ -23895,28 +23885,13 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         today = datetime.now().date()
         default_start = existing_start or today
         default_end = existing_end or default_start
-        if maintenance_edit_choice == "Completed":
-            maintenance_period_edit = render_flexible_date_range(
-                "Maintenance period",
-                start_value=default_start,
-                end_value=default_end,
-                key_prefix=f"maintenance_edit_{selected_maintenance_id}_period_completed",
-                help="Update the start and end dates for this maintenance record.",
-            )
-        elif maintenance_edit_choice == "In progress":
-            maintenance_period_edit = render_flexible_date_input(
-                "Maintenance start date",
-                value=default_start,
-                key=f"maintenance_edit_{selected_maintenance_id}_period_start",
-                help="Adjust when this maintenance began.",
-            )
-        else:
-            maintenance_period_edit = render_flexible_date_input(
-                "Planned start date",
-                value=default_start,
-                key=f"maintenance_edit_{selected_maintenance_id}_period_planned",
-                help="Adjust when this maintenance is scheduled to begin.",
-            )
+        maintenance_period_edit = render_flexible_date_range(
+            "Maintenance period",
+            start_value=default_start,
+            end_value=default_end,
+            key_prefix=f"maintenance_edit_{selected_maintenance_id}_period",
+            help="Update the start and end dates for this maintenance record.",
+        )
         new_remarks = st.text_area(
             "Remarks",
             value=clean_text(selected_record.get("remarks")) or "",
@@ -23948,19 +23923,12 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 maintenance_date_str,
                 maintenance_start_str,
                 maintenance_end_str,
-            ) = determine_period_strings(
-                maintenance_edit_choice, maintenance_period_edit
-            )
+            ) = determine_period_strings("Completed", maintenance_period_edit)
             valid_update = True
-            if maintenance_edit_choice == "Completed" and (
-                not maintenance_start_str or not maintenance_end_str
-            ):
+            if not maintenance_start_str or not maintenance_end_str:
                 st.error(
                     "Provide both start and end dates for completed maintenance records."
                 )
-                valid_update = False
-            if maintenance_edit_choice != "Completed" and not maintenance_start_str:
-                st.error("Select a start date for this maintenance entry.")
                 valid_update = False
             if valid_update:
                 try:
@@ -23972,6 +23940,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     """
                     UPDATE maintenance_records
                     SET status = ?,
+                        payment_status = ?,
                         remarks = ?,
                         maintenance_date = ?,
                         maintenance_start_date = ?,
@@ -23983,7 +23952,8 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                       AND deleted_at IS NULL
                     """,
                     (
-                        new_status,
+                        DEFAULT_SERVICE_STATUS,
+                        normalize_delivery_status(new_status),
                         clean_text(new_remarks),
                         maintenance_date_str,
                         maintenance_start_str,
