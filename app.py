@@ -450,7 +450,7 @@ SERVICE_REPORT_FIELDS = OrderedDict(
             {
                 "label": "Payment Status",
                 "type": "select",
-                "options": ["Pending", "Paid"],
+                "options": ["Due", "Advance", "Paid"],
                 "help": "Track whether the service has been paid.",
             },
         ),
