@@ -15540,6 +15540,9 @@ def _save_customer_document_upload(
 ) -> bool:
     current_user = get_current_user() or {}
     user_label = clean_text(current_user.get("username")) or ""
+    if current_user_is_service_staff() and doc_type in ("Delivery order", "Work done"):
+        st.error("Service staff can only upload Service, Maintenance, or Other documents.")
+        return False
     if doc_type in ("Delivery order", "Work done"):
         do_number = clean_text(details.get("do_number"))
         if not do_number:
@@ -16512,6 +16515,7 @@ def render_operations_document_uploader(
                                 details_key_prefix=f"{key_prefix}_service_details",
                                 doc_type="Service",
                             )
+                            _safe_rerun()
 
         if "Maintenance" in tab_map:
             with tab_map["Maintenance"]:
@@ -16556,6 +16560,7 @@ def render_operations_document_uploader(
                                 details_key_prefix=f"{key_prefix}_maintenance_details",
                                 doc_type="Maintenance",
                             )
+                            _safe_rerun()
 
         if "Other uploads" in tab_map:
             with tab_map["Other uploads"]:
@@ -16600,6 +16605,7 @@ def render_operations_document_uploader(
                                 details_key_prefix=f"{key_prefix}_other_details",
                                 doc_type="Other",
                             )
+                            _safe_rerun()
 
     doc_type_options = ["Delivery order", "Work done", "Service", "Maintenance", "Other"]
     if current_user_is_service_staff():
@@ -20039,46 +20045,46 @@ def _render_service_section(conn, *, show_heading: bool = True):
             service_id = cur.lastrowid
             if selected_do and selected_customer is not None:
                 link_delivery_order_to_customer(conn, selected_do, selected_customer)
-                saved_docs = attach_documents(
-                    conn,
-                    "service_documents",
-                    "service_id",
-                    service_id,
-                    service_files,
-                    SERVICE_DOCS_DIR,
-                    f"service_{service_id}",
-                    allowed_extensions=DOCUMENT_UPLOAD_EXTENSIONS,
+            saved_docs = attach_documents(
+                conn,
+                "service_documents",
+                "service_id",
+                service_id,
+                service_files,
+                SERVICE_DOCS_DIR,
+                f"service_{service_id}",
+                allowed_extensions=DOCUMENT_UPLOAD_EXTENSIONS,
+            )
+            conn.commit()
+            service_label = do_labels.get(selected_do) if selected_do else None
+            if not service_label:
+                service_label = "Service record"
+            customer_name = None
+            if selected_customer is not None:
+                customer_name = (
+                    label_by_id.get(int(selected_customer))
+                    or customer_label_map.get(int(selected_customer))
                 )
-                conn.commit()
-                service_label = do_labels.get(selected_do) if selected_do else None
-                if not service_label:
-                    service_label = "Service record"
-                customer_name = None
-                if selected_customer is not None:
-                    customer_name = (
-                        label_by_id.get(int(selected_customer))
-                        or customer_label_map.get(int(selected_customer))
-                    )
-                summary_parts = [service_label]
-                if customer_name:
-                    summary_parts.append(customer_name)
-                status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
-                summary_parts.append(f"status {status_label}")
-                log_activity(
-                    conn,
-                    event_type="service_created",
-                    description=" – ".join(summary_parts),
-                    entity_type="service",
-                    entity_id=int(service_id),
-                )
-                message = "Service record saved."
-                if saved_docs:
-                    message = f"{message} Attached {saved_docs} document(s)."
-                if bill_amount_value is not None:
-                    message = f"{message} Recorded service amount {format_money(bill_amount_value)}."
-                st.success(message)
-                _mark_data_changed("operations")
-                _safe_rerun()
+            summary_parts = [service_label]
+            if customer_name:
+                summary_parts.append(customer_name)
+            status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
+            summary_parts.append(f"status {status_label}")
+            log_activity(
+                conn,
+                event_type="service_created",
+                description=" – ".join(summary_parts),
+                entity_type="service",
+                entity_id=int(service_id),
+            )
+            message = "Service record saved."
+            if saved_docs:
+                message = f"{message} Attached {saved_docs} document(s)."
+            if bill_amount_value is not None:
+                message = f"{message} Recorded service amount {format_money(bill_amount_value)}."
+            st.success(message)
+            _mark_data_changed("operations")
+            _safe_rerun()
 
     service_df = df_query(
         conn,
@@ -23652,7 +23658,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     total_amount,
                     updated_at,
                     created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
                 """,
                 (
                     selected_do,
@@ -23666,7 +23672,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     clean_text(remarks),
                     maintenance_product_label,
                     maintenance_amount_value,
-                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     current_user_id(),
                 ),
             )
@@ -23687,30 +23692,30 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             maintenance_label = do_labels.get(selected_do) if selected_do else None
             if not maintenance_label:
                 maintenance_label = "Maintenance record"
-                customer_name = None
-                if selected_customer is not None:
-                    customer_name = (
-                        label_by_id.get(int(selected_customer))
-                        or customer_label_map.get(int(selected_customer))
-                    )
-                summary_parts = [maintenance_label]
-                if customer_name:
-                    summary_parts.append(customer_name)
-                status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
-                summary_parts.append(f"status {status_label}")
-                log_activity(
-                    conn,
-                    event_type="maintenance_created",
-                    description=" – ".join(summary_parts),
-                    entity_type="maintenance",
-                    entity_id=int(maintenance_id),
+            customer_name = None
+            if selected_customer is not None:
+                customer_name = (
+                    label_by_id.get(int(selected_customer))
+                    or customer_label_map.get(int(selected_customer))
                 )
-                message = "Maintenance record saved."
-                if saved_docs:
-                    message = f"{message} Attached {saved_docs} document(s)."
-                st.success(message)
-                _mark_data_changed("operations")
-                _safe_rerun()
+            summary_parts = [maintenance_label]
+            if customer_name:
+                summary_parts.append(customer_name)
+            status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
+            summary_parts.append(f"status {status_label}")
+            log_activity(
+                conn,
+                event_type="maintenance_created",
+                description=" – ".join(summary_parts),
+                entity_type="maintenance",
+                entity_id=int(maintenance_id),
+            )
+            message = "Maintenance record saved."
+            if saved_docs:
+                message = f"{message} Attached {saved_docs} document(s)."
+            st.success(message)
+            _mark_data_changed("operations")
+            _safe_rerun()
 
     maintenance_df = df_query(
         conn,
