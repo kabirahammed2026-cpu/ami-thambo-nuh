@@ -2384,36 +2384,6 @@ def accessible_customer_ids(conn) -> Optional[set[int]]:
     return ids
 
 
-def _resolve_manual_customer_id(
-    conn: sqlite3.Connection, customer_name: Optional[str]
-) -> Optional[int]:
-    cleaned_name = clean_text(customer_name)
-    if not cleaned_name:
-        return None
-    match = df_query(
-        conn,
-        """
-        SELECT customer_id
-        FROM customers
-        WHERE lower(COALESCE(name, '')) = lower(?)
-           OR lower(COALESCE(company_name, '')) = lower(?)
-        ORDER BY customer_id DESC
-        LIMIT 1
-        """,
-        (cleaned_name, cleaned_name),
-    )
-    if not match.empty:
-        return int(match.iloc[0]["customer_id"])
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO customers (name, created_by, dup_flag) VALUES (?, ?, 0)",
-        (cleaned_name, current_user_id()),
-    )
-    conn.commit()
-    _mark_data_changed("customers")
-    return int(cursor.lastrowid)
-
-
 def filter_delivery_orders_for_view(
     do_df: pd.DataFrame,
     allowed_customers: Optional[set[int]],
@@ -11888,7 +11858,7 @@ def dashboard(conn):
             st.caption(" • ".join(backup_lines))
             if not mirror_dir:
                 st.info(
-                    "Tip: set PS_BACKUP_MIRROR_DIR to store automatic backups on a separate Linode volume "
+                    "Tip: set PS_CRM_BACKUP_MIRROR_DIR to store automatic backups on a separate Linode volume "
                     "so older archives (including staff/users database data and uploads) stay available after redeploys.",
                     icon="💾",
                 )
@@ -20043,14 +20013,10 @@ def _render_service_section(conn, *, show_heading: bool = True):
         default_customer = do_customer_map.get(selected_do)
         state_key = "service_customer_link"
         last_do_key = "service_customer_last_do"
-        manual_toggle_key = f"{state_key}_manual_toggle"
-        manual_name_key = f"{state_key}_manual_name"
         linked_customer = default_customer
         if default_customer is not None:
             st.session_state[last_do_key] = selected_do
             st.session_state[state_key] = default_customer
-            st.session_state[manual_toggle_key] = False
-            st.session_state[manual_name_key] = ""
             customer_label = (
                 customer_labels.get(default_customer)
                 or customer_label_map.get(default_customer)
@@ -20064,23 +20030,12 @@ def _render_service_section(conn, *, show_heading: bool = True):
             if st.session_state.get(last_do_key) != selected_do:
                 st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
-            use_manual_customer = st.checkbox(
-                "Enter customer manually",
-                key=manual_toggle_key,
+            linked_customer = st.selectbox(
+                "Customer *",
+                options=choices,
+                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+                key=state_key,
             )
-            if use_manual_customer:
-                manual_name = st.text_input(
-                    "Customer name",
-                    key=manual_name_key,
-                )
-                linked_customer = None
-            else:
-                linked_customer = st.selectbox(
-                    "Customer *",
-                    options=choices,
-                    format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-                    key=state_key,
-                )
         manual_do_code = st.text_input(
             "Delivery order code (optional manual entry)",
             value=clean_text(selected_do) or "",
@@ -20181,10 +20136,6 @@ def _render_service_section(conn, *, show_heading: bool = True):
         selected_customer = (
             linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
         )
-        use_manual_customer = bool(st.session_state.get(manual_toggle_key))
-        manual_name = st.session_state.get(manual_name_key)
-        if use_manual_customer:
-            selected_customer = _resolve_manual_customer_id(conn, manual_name)
         selected_customer = int(selected_customer) if selected_customer is not None else None
         cur = conn.cursor()
         service_date_obj = ensure_date(service_date_value)
@@ -23663,14 +23614,10 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         default_customer = do_customer_map.get(selected_do)
         state_key = "maintenance_customer_link"
         last_do_key = "maintenance_customer_last_do"
-        manual_toggle_key = f"{state_key}_manual_toggle"
-        manual_name_key = f"{state_key}_manual_name"
         linked_customer = default_customer
         if default_customer is not None:
             st.session_state[last_do_key] = selected_do
             st.session_state[state_key] = default_customer
-            st.session_state[manual_toggle_key] = False
-            st.session_state[manual_name_key] = ""
             customer_label = (
                 customer_labels.get(default_customer)
                 or customer_label_map.get(default_customer)
@@ -23684,23 +23631,12 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             if st.session_state.get(last_do_key) != selected_do:
                 st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
-            use_manual_customer = st.checkbox(
-                "Enter customer manually",
-                key=manual_toggle_key,
+            linked_customer = st.selectbox(
+                "Customer *",
+                options=choices,
+                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+                key=state_key,
             )
-            if use_manual_customer:
-                manual_name = st.text_input(
-                    "Customer name",
-                    key=manual_name_key,
-                )
-                linked_customer = None
-            else:
-                linked_customer = st.selectbox(
-                    "Customer *",
-                    options=choices,
-                    format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-                    key=state_key,
-                )
         manual_do_code = st.text_input(
             "Delivery order code (optional manual entry)",
             value=clean_text(selected_do) or "",
@@ -23786,10 +23722,6 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         selected_customer = (
             linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
         )
-        use_manual_customer = bool(st.session_state.get(manual_toggle_key))
-        manual_name = st.session_state.get(manual_name_key)
-        if use_manual_customer:
-            selected_customer = _resolve_manual_customer_id(conn, manual_name)
         selected_customer = int(selected_customer) if selected_customer is not None else None
         cur = conn.cursor()
         maintenance_date_obj = ensure_date(maintenance_date_value)
@@ -24364,8 +24296,6 @@ def delivery_orders_page(
     filter_customer_key = f"{key_prefix}_filter_customer"
     filter_date_toggle_key = f"{key_prefix}_filter_date_toggle"
     filter_date_range_key = f"{key_prefix}_filter_date_range"
-    manual_customer_toggle_key = f"{key_prefix}_customer_manual_toggle"
-    manual_customer_name_key = f"{key_prefix}_customer_manual_name"
 
     if st.session_state.pop(reset_pending_key, False):
         _reset_delivery_order_form_state(record_type_key)
@@ -24382,8 +24312,6 @@ def delivery_orders_page(
     st.session_state.setdefault(file_path_key, "")
     autofill_customer_key = f"{record_type_key}_autofill_customer"
     st.session_state.setdefault(autofill_customer_key, None)
-    st.session_state.setdefault(manual_customer_toggle_key, False)
-    st.session_state.setdefault(manual_customer_name_key, "")
 
     customer_options, customer_labels, _, _ = fetch_customer_choices(conn, only_complete=False)
     scope_clause, scope_params = customer_scope_filter("c")
@@ -24474,8 +24402,6 @@ def delivery_orders_page(
         st.session_state[autofill_customer_key] = None
     else:
         selected_customer_state = int_or_none(st.session_state.get(customer_key))
-        if st.session_state.get(manual_customer_toggle_key):
-            selected_customer_state = None
         last_autofill_customer = int_or_none(st.session_state.get(autofill_customer_key))
         current_number = clean_text(st.session_state.get(number_key))
         suggested_code = None
@@ -24502,24 +24428,12 @@ def delivery_orders_page(
             f"{record_label} number *",
             key=number_key,
         )
-        use_manual_customer = st.checkbox(
-            "Enter customer manually",
-            key=manual_customer_toggle_key,
+        selected_customer = st.selectbox(
+            "Customer",
+            customer_options,
+            format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+            key=customer_key,
         )
-        manual_customer_name = None
-        if use_manual_customer:
-            manual_customer_name = st.text_input(
-                "Customer name",
-                key=manual_customer_name_key,
-            )
-            selected_customer = None
-        else:
-            selected_customer = st.selectbox(
-                "Customer",
-                customer_options,
-                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-                key=customer_key,
-            )
         description = st.text_area(
             "Description / items",
             key=description_key,
@@ -24608,14 +24522,11 @@ def delivery_orders_page(
     if _guard_double_submit(f"{record_type_key}_save_form", submit):
         sales_person = clean_text(get_current_user().get("username"))
         cleaned_number = clean_text(do_number)
-        use_manual_customer = bool(st.session_state.get(manual_customer_toggle_key))
-        manual_customer_name = st.session_state.get(manual_customer_name_key)
-        if use_manual_customer:
-            selected_customer = _resolve_manual_customer_id(conn, manual_customer_name)
+        selected_customer = int_or_none(selected_customer)
         if not cleaned_number:
             st.error(f"{record_label} number is required.")
-        elif use_manual_customer and selected_customer is None:
-            st.error("Enter a customer name for this record.")
+        elif selected_customer is None:
+            st.error("Select a saved customer before saving this record.")
         else:
             cur = conn.cursor()
             conflicting_type = df_query(
@@ -30491,6 +30402,19 @@ def _path_status(path: Path) -> dict[str, object]:
     }
 
 
+def _safe_extract_zip_to_dir(archive_path: Path, destination: Path) -> None:
+    destination_resolved = destination.resolve()
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        for member in zf.infolist():
+            member_path = destination / member.filename
+            member_resolved = member_path.resolve()
+            try:
+                member_resolved.relative_to(destination_resolved)
+            except ValueError as exc:
+                raise RuntimeError(f"Unsafe archive member blocked: {member.filename}") from exc
+        zf.extractall(destination)
+
+
 def _scan_missing_uploads(conn: sqlite3.Connection) -> list[dict[str, str]]:
     checks = [
         ("customer_documents", "file_path"),
@@ -30525,6 +30449,99 @@ def _scan_missing_uploads(conn: sqlite3.Connection) -> list[dict[str, str]]:
                     {"table": table, "column": column, "path": str(path_value)}
                 )
     return missing
+
+
+def _scan_operations_link_issues(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    checks: list[tuple[str, str, str, tuple[object, ...]]] = [
+        (
+            "delivery_orders",
+            "missing_customer",
+            """
+            SELECT do_number AS ref
+            FROM delivery_orders
+            WHERE deleted_at IS NULL
+              AND customer_id IS NULL
+            LIMIT 200
+            """,
+            (),
+        ),
+        (
+            "delivery_orders",
+            "orphan_customer",
+            """
+            SELECT d.do_number AS ref
+            FROM delivery_orders d
+            LEFT JOIN customers c ON c.customer_id = d.customer_id
+            WHERE d.deleted_at IS NULL
+              AND d.customer_id IS NOT NULL
+              AND c.customer_id IS NULL
+            LIMIT 200
+            """,
+            (),
+        ),
+        (
+            "services",
+            "missing_customer",
+            """
+            SELECT CAST(service_id AS TEXT) AS ref
+            FROM services
+            WHERE customer_id IS NULL
+            LIMIT 200
+            """,
+            (),
+        ),
+        (
+            "services",
+            "do_customer_mismatch",
+            """
+            SELECT CAST(s.service_id AS TEXT) AS ref
+            FROM services s
+            JOIN delivery_orders d ON d.do_number = s.do_number
+            WHERE d.deleted_at IS NULL
+              AND s.customer_id IS NOT NULL
+              AND d.customer_id IS NOT NULL
+              AND s.customer_id <> d.customer_id
+            LIMIT 200
+            """,
+            (),
+        ),
+        (
+            "maintenance_records",
+            "missing_customer",
+            """
+            SELECT CAST(maintenance_id AS TEXT) AS ref
+            FROM maintenance_records
+            WHERE customer_id IS NULL
+            LIMIT 200
+            """,
+            (),
+        ),
+        (
+            "maintenance_records",
+            "do_customer_mismatch",
+            """
+            SELECT CAST(m.maintenance_id AS TEXT) AS ref
+            FROM maintenance_records m
+            JOIN delivery_orders d ON d.do_number = m.do_number
+            WHERE d.deleted_at IS NULL
+              AND m.customer_id IS NOT NULL
+              AND d.customer_id IS NOT NULL
+              AND m.customer_id <> d.customer_id
+            LIMIT 200
+            """,
+            (),
+        ),
+    ]
+    for table_name, issue_type, sql, params in checks:
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.Error:
+            continue
+        for row in rows:
+            ref = clean_text(row[0]) or "(unknown)"
+            issues.append({"table": table_name, "issue": issue_type, "record_ref": ref})
+    return issues
 
 
 def _clear_page_state_on_navigation(previous_page: Optional[str]) -> None:
@@ -30670,6 +30687,16 @@ def render_system_diagnostics(conn) -> None:
         except Exception as exc:
             st.error(f"Performance checks failed: {exc}")
 
+    st.subheader("Operations linkage checks")
+    st.caption("Verifies operations records are connected to saved customers and linked DOs.")
+    if st.button("Run operations linkage checks", use_container_width=True):
+        issues = _scan_operations_link_issues(conn)
+        if not issues:
+            st.success("No linkage issues found across delivery orders, service, and maintenance.")
+        else:
+            st.warning(f"Linkage issues found: {len(issues)}")
+            st.dataframe(pd.DataFrame(issues), use_container_width=True, hide_index=True)
+
     st.subheader("Upload diagnostics")
     st.caption(f"Max upload size: {_format_bytes(MAX_UPLOAD_BYTES)}")
     diag_upload = st.file_uploader(
@@ -30737,8 +30764,7 @@ def render_system_diagnostics(conn) -> None:
             latest = backups[-1]
             try:
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    with zipfile.ZipFile(latest, "r") as zf:
-                        zf.extractall(tmpdir)
+                    _safe_extract_zip_to_dir(latest, Path(tmpdir))
                     db_candidates = list(Path(tmpdir).rglob("*.db"))
                 st.success(
                     f"Dry-run restore OK • extracted {latest.name} • "

@@ -59,7 +59,14 @@ def main() -> None:
     storage_dir = _preferred_storage_dir()
     if storage_dir is not None:
         storage_dir.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("APP_STORAGE_DIR", str(storage_dir))
+        if app_script_name == SALES_APP_SCRIPT:
+            sales_storage = storage_dir / "ps-sales"
+            sales_storage.mkdir(parents=True, exist_ok=True)
+            os.environ.setdefault("PS_SALES_DATA_DIR", str(sales_storage))
+        else:
+            crm_storage = storage_dir / "ps-business-suites"
+            crm_storage.mkdir(parents=True, exist_ok=True)
+            os.environ.setdefault("APP_STORAGE_DIR", str(crm_storage))
 
     os.environ.setdefault("BROWSER", "none")
     os.environ["STREAMLIT_THEME_BASE"] = "light"
