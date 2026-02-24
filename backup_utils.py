@@ -89,7 +89,11 @@ def ensure_monthly_backup(
         temp_path.replace(destination)
         mirror_error: Optional[str] = None
         if mirror_dir is None:
-            mirror_override = os.getenv("PS_BACKUP_MIRROR_DIR")
+            mirror_override = (
+                os.getenv("PS_CRM_BACKUP_MIRROR_DIR")
+                or os.getenv("PS_SALES_BACKUP_MIRROR_DIR")
+                or os.getenv("PS_BACKUP_MIRROR_DIR")
+            )
             mirror_dir = Path(mirror_override).expanduser() if mirror_override else None
         if mirror_dir is not None:
             try:

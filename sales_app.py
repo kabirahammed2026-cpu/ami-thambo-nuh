@@ -3028,6 +3028,19 @@ def _path_status(path: Path) -> dict[str, object]:
     }
 
 
+def _safe_extract_zip_to_dir(archive_path: Path, destination: Path) -> None:
+    destination_resolved = destination.resolve()
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        for member in zf.infolist():
+            member_path = destination / member.filename
+            member_resolved = member_path.resolve()
+            try:
+                member_resolved.relative_to(destination_resolved)
+            except ValueError as exc:
+                raise RuntimeError(f"Unsafe archive member blocked: {member.filename}") from exc
+        zf.extractall(destination)
+
+
 def _scan_missing_uploads_sales() -> list[dict[str, str]]:
     checks = [
         ("quotations", "pdf_path"),
@@ -3219,8 +3232,7 @@ def render_system_diagnostics_sales() -> None:
             latest = backups[-1]
             try:
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    with zipfile.ZipFile(latest, "r") as zf:
-                        zf.extractall(tmpdir)
+                    _safe_extract_zip_to_dir(latest, Path(tmpdir))
                     db_candidates = list(Path(tmpdir).rglob("*.db"))
                 st.success(
                     f"Dry-run restore OK • extracted {latest.name} • "

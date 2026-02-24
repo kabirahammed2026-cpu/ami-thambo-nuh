@@ -29,26 +29,27 @@ def _detect_app(archive: zipfile.ZipFile) -> Optional[str]:
 
 
 def _crm_paths(data_dir_override: Optional[str]) -> tuple[Path, Path]:
-    base_dir = (
-        Path(data_dir_override).expanduser()
-        if data_dir_override
-        else Path(os.getenv("APP_STORAGE_DIR", get_storage_dir()))
-    )
-    db_path = Path(os.getenv("DB_PATH", str(base_dir / "ps_crm.db")))
+    if data_dir_override:
+        base_dir = Path(data_dir_override).expanduser()
+        db_path = base_dir / "ps_crm.db"
+    else:
+        base_dir = Path(os.getenv("APP_STORAGE_DIR", get_storage_dir()))
+        db_path = Path(os.getenv("DB_PATH", str(base_dir / "ps_crm.db")))
     return base_dir, db_path
 
 
 def _sales_paths(data_dir_override: Optional[str]) -> tuple[Path, Path]:
     if data_dir_override:
         data_dir = Path(data_dir_override).expanduser()
+        db_path = data_dir / "ps_sales.db"
     else:
         data_dir = load_config().data_dir
-    db_url = os.getenv("PS_SALES_DB_URL", "")
-    prefix = "sqlite:///"
-    if db_url:
-        db_path = Path(db_url[len(prefix) :]) if db_url.startswith(prefix) else Path(db_url)
-    else:
-        db_path = data_dir / "ps_sales.db"
+        db_url = os.getenv("PS_SALES_DB_URL", "")
+        prefix = "sqlite:///"
+        if db_url:
+            db_path = Path(db_url[len(prefix) :]) if db_url.startswith(prefix) else Path(db_url)
+        else:
+            db_path = data_dir / "ps_sales.db"
     return data_dir, db_path
 
 
@@ -63,6 +64,33 @@ def _copy_tree(source: Path, destination: Path) -> list[Path]:
         shutil.copy2(path, target)
         copied.append(target)
     return copied
+
+
+
+
+def _safe_extract_archive(archive: zipfile.ZipFile, destination: Path) -> None:
+    destination_resolved = destination.resolve()
+    for member in archive.infolist():
+        member_path = destination / member.filename
+        try:
+            member_resolved = member_path.resolve()
+            member_resolved.relative_to(destination_resolved)
+        except OSError as exc:
+            raise RuntimeError(f"Invalid archive member path: {member.filename}") from exc
+        except ValueError as exc:
+            raise RuntimeError(f"Unsafe archive member blocked: {member.filename}") from exc
+    archive.extractall(destination)
+
+
+def _select_db_candidate(db_dir: Path, app: str) -> Optional[Path]:
+    expected_name = "ps_crm.db" if app == "crm" else "ps_sales.db"
+    expected = db_dir / expected_name
+    if expected.exists():
+        return expected
+    db_candidates = sorted(db_dir.glob("*.db"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if not db_candidates:
+        return None
+    return db_candidates[0]
 
 
 def _backup_existing_db(db_path: Path) -> Optional[Path]:
@@ -125,22 +153,19 @@ def main() -> int:
             return 0
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            archive.extractall(tmpdir)
             temp_root = Path(tmpdir)
+            _safe_extract_archive(archive, temp_root)
             storage_dir = temp_root / storage_prefix
             db_dir = temp_root / db_prefix
 
-            if db_dir.exists():
-                db_candidates = sorted(db_dir.glob("*.db"))
-            else:
-                db_candidates = []
+            selected_db = _select_db_candidate(db_dir, app) if db_dir.exists() else None
 
-            if db_candidates:
+            if selected_db is not None:
                 backup_path = _backup_existing_db(db_path)
                 if backup_path:
                     print(f"Backed up existing database to {backup_path}")
                 db_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(db_candidates[0], db_path)
+                shutil.copy2(selected_db, db_path)
                 print(f"Restored database to {db_path}")
             else:
                 print("No database file found in archive; skipping DB restore.")
