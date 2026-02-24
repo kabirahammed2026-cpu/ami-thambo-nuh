@@ -12708,6 +12708,7 @@ def dashboard(conn):
     )
 
     with team_tab_service:
+        st.caption(f"Service team view for {format_period_range(from_iso, to_iso)}")
         service_staff_summary = df_query(
             conn,
             """
@@ -12938,13 +12939,28 @@ def dashboard(conn):
                 "completed": int(service_staff_summary["completed_tasks"].sum()),
                 "billed": float(service_staff_summary["billed_amount"].sum()),
             }
-            service_metrics = st.columns(4)
+            completion_rate = (
+                (service_totals["completed"] / service_totals["tasks"]) * 100.0
+                if service_totals["tasks"]
+                else 0.0
+            )
+            avg_task_value = (
+                service_totals["billed"] / service_totals["tasks"]
+                if service_totals["tasks"]
+                else 0.0
+            )
+            service_metrics = st.columns(6)
             service_metrics[0].metric("Active staff", service_totals["staff"])
             service_metrics[1].metric("Total tasks", service_totals["tasks"])
             service_metrics[2].metric("Completed", service_totals["completed"])
-            service_metrics[3].metric(
+            service_metrics[3].metric("Completion rate", f"{completion_rate:.1f}%")
+            service_metrics[4].metric(
                 "Total billed",
                 format_money(service_totals["billed"]) or format_number(service_totals["billed"]),
+            )
+            service_metrics[5].metric(
+                "Avg billed / task",
+                format_money(avg_task_value) or format_number(avg_task_value),
             )
             for col in ["billed_amount", "service_amount", "maintenance_amount"]:
                 service_staff_summary[col] = service_staff_summary[col].apply(
@@ -12965,6 +12981,64 @@ def dashboard(conn):
                 use_container_width=True,
                 hide_index=True,
             )
+            service_daily_summary = df_query(
+                conn,
+                """
+                WITH service_activity AS (
+                    SELECT 'service' AS activity_type,
+                           COALESCE(date(s.service_start_date), date(s.service_date), date(s.updated_at)) AS work_date,
+                           COALESCE(s.bill_amount, 0) AS amount,
+                           COALESCE(s.status, '') AS work_status
+                    FROM services s
+                    LEFT JOIN users su ON su.user_id = s.created_by
+                    WHERE s.deleted_at IS NULL
+                      AND LOWER(COALESCE(su.role, 'staff')) <> 'admin'
+                      AND LOWER(COALESCE(su.staff_classification, '')) = 'service'
+                    UNION ALL
+                    SELECT 'maintenance' AS activity_type,
+                           COALESCE(date(m.maintenance_start_date), date(m.maintenance_date), date(m.updated_at)) AS work_date,
+                           COALESCE(m.total_amount, 0) AS amount,
+                           COALESCE(m.status, '') AS work_status
+                    FROM maintenance_records m
+                    LEFT JOIN users mu ON mu.user_id = m.created_by
+                    WHERE m.deleted_at IS NULL
+                      AND LOWER(COALESCE(mu.role, 'staff')) <> 'admin'
+                      AND LOWER(COALESCE(mu.staff_classification, '')) = 'service'
+                )
+                SELECT work_date,
+                       SUM(CASE WHEN activity_type = 'service' THEN 1 ELSE 0 END) AS service_jobs,
+                       SUM(CASE WHEN activity_type = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_jobs,
+                       COUNT(*) AS total_tasks,
+                       SUM(CASE WHEN LOWER(work_status) = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
+                       ROUND(SUM(amount), 2) AS billed_total
+                FROM service_activity
+                WHERE work_date IS NOT NULL
+                  AND date(work_date) BETWEEN date(?) AND date(?)
+                GROUP BY work_date
+                ORDER BY date(work_date) DESC
+                """,
+                (from_iso, to_iso),
+            )
+            if not service_daily_summary.empty:
+                service_daily_summary = fmt_dates(service_daily_summary, ["work_date"])
+                service_daily_summary["billed_total"] = service_daily_summary["billed_total"].apply(
+                    lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
+                )
+                with st.expander("Daily service/maintenance breakdown", expanded=False):
+                    st.dataframe(
+                        service_daily_summary.rename(
+                            columns={
+                                "work_date": "Date",
+                                "service_jobs": "Service jobs",
+                                "maintenance_jobs": "Maintenance jobs",
+                                "total_tasks": "Total tasks",
+                                "completed_tasks": "Completed",
+                                "billed_total": "Billed total",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             service_docs = df_query(
                 conn,
                 """
@@ -13070,6 +13144,7 @@ def dashboard(conn):
                             st.caption("No PDFs available for this staff member.")
 
     with team_tab_sales:
+        st.caption(f"Sales team view for {format_period_range(from_iso, to_iso)}")
         sales_staff_summary = df_query(
             conn,
             """
@@ -13276,17 +13351,30 @@ def dashboard(conn):
             sales_totals = {
                 "staff": int(sales_staff_summary["staff"].nunique()),
                 "orders": int(sales_staff_summary["total_orders"].sum()),
+                "delivery_orders": int(sales_staff_summary["delivery_orders"].sum()),
+                "work_orders": int(sales_staff_summary["work_orders"].sum()),
                 "quotes": int(sales_staff_summary["total_quotes"].sum()),
                 "value": float(sales_staff_summary["total_value"].sum()),
             }
-            sales_metrics = st.columns(4)
+            avg_order_value = (
+                sales_totals["value"] / sales_totals["orders"]
+                if sales_totals["orders"]
+                else 0.0
+            )
+            sales_metrics = st.columns(6)
             sales_metrics[0].metric("Active staff", sales_totals["staff"])
             sales_metrics[1].metric("Total orders", sales_totals["orders"])
-            sales_metrics[2].metric("Quotations", sales_totals["quotes"])
-            sales_metrics[3].metric(
+            sales_metrics[2].metric("Delivery orders", sales_totals["delivery_orders"])
+            sales_metrics[3].metric("Work orders", sales_totals["work_orders"])
+            sales_metrics[4].metric(
                 "Order value",
                 format_money(sales_totals["value"]) or format_number(sales_totals["value"]),
             )
+            sales_metrics[5].metric(
+                "Avg value / order",
+                format_money(avg_order_value) or format_number(avg_order_value),
+            )
+            st.caption(f"Quotations created: {sales_totals['quotes']}")
             for col in [
                 "total_value",
                 "delivery_value",
@@ -13316,6 +13404,76 @@ def dashboard(conn):
                 use_container_width=True,
                 hide_index=True,
             )
+            sales_daily_summary = df_query(
+                conn,
+                """
+                WITH sales_activity AS (
+                    SELECT COALESCE(date(d.delivery_date), date(d.created_at)) AS work_date,
+                           COALESCE(d.record_type, 'delivery_order') AS activity_type,
+                           COALESCE(d.total_amount, 0) AS amount
+                    FROM delivery_orders d
+                    LEFT JOIN users du ON du.user_id = d.created_by
+                    LEFT JOIN users up ON LOWER(COALESCE(up.username, '')) = LOWER(COALESCE(d.sales_person, ''))
+                    WHERE d.deleted_at IS NULL
+                      AND (
+                            du.user_id IS NULL
+                            OR (
+                                LOWER(COALESCE(du.role, 'staff')) <> 'admin'
+                                AND LOWER(COALESCE(du.staff_classification, '')) = 'sales'
+                            )
+                          )
+                      AND (
+                            up.user_id IS NULL
+                            OR (
+                                LOWER(COALESCE(up.role, 'staff')) <> 'admin'
+                                AND LOWER(COALESCE(up.staff_classification, '')) = 'sales'
+                            )
+                          )
+                    UNION ALL
+                    SELECT COALESCE(date(q.quote_date), date(q.created_at)) AS work_date,
+                           'quotation' AS activity_type,
+                           COALESCE(q.total_amount, 0) AS amount
+                    FROM quotations q
+                    LEFT JOIN users qu ON qu.user_id = q.created_by
+                    WHERE q.deleted_at IS NULL
+                      AND LOWER(COALESCE(qu.role, 'staff')) <> 'admin'
+                      AND LOWER(COALESCE(qu.staff_classification, '')) = 'sales'
+                )
+                SELECT work_date,
+                       SUM(CASE WHEN activity_type = 'delivery_order' THEN 1 ELSE 0 END) AS delivery_orders,
+                       SUM(CASE WHEN activity_type = 'work_done' THEN 1 ELSE 0 END) AS work_orders,
+                       SUM(CASE WHEN activity_type = 'quotation' THEN 1 ELSE 0 END) AS quotations,
+                       ROUND(SUM(CASE WHEN activity_type IN ('delivery_order', 'work_done') THEN amount ELSE 0 END), 2) AS order_value,
+                       ROUND(SUM(CASE WHEN activity_type = 'quotation' THEN amount ELSE 0 END), 2) AS quotation_value
+                FROM sales_activity
+                WHERE work_date IS NOT NULL
+                  AND date(work_date) BETWEEN date(?) AND date(?)
+                GROUP BY work_date
+                ORDER BY date(work_date) DESC
+                """,
+                (from_iso, to_iso),
+            )
+            if not sales_daily_summary.empty:
+                sales_daily_summary = fmt_dates(sales_daily_summary, ["work_date"])
+                for amount_col in ["order_value", "quotation_value"]:
+                    sales_daily_summary[amount_col] = sales_daily_summary[amount_col].apply(
+                        lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
+                    )
+                with st.expander("Daily sales breakdown", expanded=False):
+                    st.dataframe(
+                        sales_daily_summary.rename(
+                            columns={
+                                "work_date": "Date",
+                                "delivery_orders": "Delivery orders",
+                                "work_orders": "Work orders",
+                                "quotations": "Quotations",
+                                "order_value": "Order value",
+                                "quotation_value": "Quotation value",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             sales_docs = df_query(
                 conn,
                 """
@@ -17660,7 +17818,7 @@ def operations_page(conn):
         key="operations_customer_search",
         help="Search by customer name, company, phone, or sales rep.",
     )
-    scope_clause, scope_params = customer_scope_filter()
+    scope_clause, scope_params = customer_scope_filter("c")
     where_parts: list[str] = []
     params: list[object] = []
     if search_query:
@@ -17668,16 +17826,16 @@ def operations_page(conn):
         normalized_phone = _normalize_phone_digits(search_query)
         where_parts.append(
             "("
-            "lower(COALESCE(name, '')) LIKE ? "
-            "OR lower(COALESCE(company_name, '')) LIKE ? "
-            "OR lower(COALESCE(phone, '')) LIKE ? "
-            "OR lower(COALESCE(sales_person, '')) LIKE ?"
+            "lower(COALESCE(c.name, '')) LIKE ? "
+            "OR lower(COALESCE(c.company_name, '')) LIKE ? "
+            "OR lower(COALESCE(c.phone, '')) LIKE ? "
+            "OR lower(COALESCE(c.sales_person, '')) LIKE ?"
             ")"
         )
         params = [like_value, like_value, like_value, like_value]
         if normalized_phone:
             where_parts.append(
-                f"{_phone_digits_sql_expr('phone')} LIKE ?"
+                f"{_phone_digits_sql_expr('c.phone')} LIKE ?"
             )
             params.append(f"%{normalized_phone}%")
     if scope_clause:
@@ -19878,7 +20036,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
 
     with st.form("service_form"):
         selected_do = st.selectbox(
-            "Delivery order",
+            "Delivery order (DO code)",
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
@@ -19924,7 +20082,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     key=state_key,
                 )
         manual_do_code = st.text_input(
-            "DO code (optional manual entry)",
+            "Delivery order code (optional manual entry)",
             value=clean_text(selected_do) or "",
             help="Type a DO code manually when needed.",
             key="service_new_manual_do_code",
@@ -23498,7 +23656,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
 
     with st.form("maintenance_form"):
         selected_do = st.selectbox(
-            "Delivery order",
+            "Delivery order (DO code)",
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
@@ -23544,7 +23702,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     key=state_key,
                 )
         manual_do_code = st.text_input(
-            "DO code (optional manual entry)",
+            "Delivery order code (optional manual entry)",
             value=clean_text(selected_do) or "",
             help="Type a DO code manually when needed.",
             key="maintenance_new_manual_do_code",
