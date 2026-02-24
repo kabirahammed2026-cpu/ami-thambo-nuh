@@ -21925,38 +21925,13 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     st.caption(
         "Upload a quotation (PDF, DOCX, or TXT) to detect customer info, contact details, and line items automatically."
     )
-    is_admin = current_user_is_admin()
-    if is_admin:
-        ocr_cols = st.columns(3)
-        with ocr_cols[0]:
-            skip_ocr = st.checkbox(
-                "Skip OCR",
-                value=bool(st.session_state.get("quotation_prefill_skip_ocr", False)),
-                key="quotation_prefill_skip_ocr",
-                help="Skip OCR entirely and rely on embedded PDF text only.",
-            )
-        with ocr_cols[1]:
-            ocr_all_pages = st.checkbox(
-                "OCR all pages (slow)",
-                value=bool(st.session_state.get("quotation_prefill_ocr_all_pages", False)),
-                key="quotation_prefill_ocr_all_pages",
-                help="Defaults to page 1 only. Enable this if your quotation has data on every page.",
-            )
-        with ocr_cols[2]:
-            strong_ocr = bool(st.session_state.get("quotation_prefill_strong_ocr", False))
-            toggle_label = "Use standard OCR" if strong_ocr else "Stronger OCR (slow)"
-            if st.button(toggle_label, key="quotation_prefill_strong_ocr_toggle"):
-                strong_ocr = not strong_ocr
-                st.session_state["quotation_prefill_strong_ocr"] = strong_ocr
-            if strong_ocr:
-                st.caption("Stronger OCR enabled for the next scan.")
-    else:
-        skip_ocr = False
-        ocr_all_pages = False
-        strong_ocr = False
-        st.session_state["quotation_prefill_skip_ocr"] = False
-        st.session_state["quotation_prefill_ocr_all_pages"] = False
-        st.session_state["quotation_prefill_strong_ocr"] = False
+    skip_ocr = False
+    ocr_all_pages = False
+    strong_ocr = False
+    st.session_state["quotation_prefill_skip_ocr"] = False
+    st.session_state["quotation_prefill_ocr_all_pages"] = False
+    st.session_state["quotation_prefill_strong_ocr"] = False
+    st.caption("OCR runs automatically on page 1 of the uploaded quotation.")
     ocr_dpi = 180
     prefill_upload = st.file_uploader(
         "Quotation file",
@@ -26401,7 +26376,7 @@ def _build_reminder_alerts(
     user = get_current_user() or {}
     is_admin = clean_text(user.get("role")) == "admin"
     viewer_id = current_user_id()
-    allowed_customers = get_accessible_customer_ids(conn)
+    allowed_customers = accessible_customer_ids(conn)
     reminder_status_filter = "= 'done'" if include_resolved else "!= 'done'"
     df = df_query(
         conn,
