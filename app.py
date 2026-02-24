@@ -7123,6 +7123,7 @@ def _build_services_export(conn) -> pd.DataFrame:
                s.service_product_info,
                s.description,
                s.status,
+               s.payment_status,
                s.remarks,
                s.condition_status,
                s.condition_remarks,
@@ -11106,6 +11107,7 @@ def dashboard(conn):
                    s.do_number,
                    s.customer_id,
                    s.created_by,
+                   s.service_date,
                    s.service_product_info,
                    s.description,
                    s.bill_amount,
@@ -11127,6 +11129,7 @@ def dashboard(conn):
                    m.do_number,
                    m.customer_id,
                    m.created_by,
+                   m.maintenance_date,
                    m.maintenance_product_info,
                    m.description,
                    m.total_amount,
@@ -11222,16 +11225,19 @@ def dashboard(conn):
                 axis=1,
             )
             staff_service_df["Sales date"] = pd.to_datetime(
-                staff_service_df["updated_at"], errors="coerce"
+                staff_service_df["service_date"], errors="coerce"
             ).dt.date
+            staff_service_df["Sales date"] = staff_service_df["Sales date"].fillna(
+                pd.to_datetime(staff_service_df["updated_at"], errors="coerce").dt.date
+            )
             staff_service_df["When"] = staff_service_df["updated_at"].apply(
                 lambda value: format_time_ago(value) or format_period_range(value, value)
             )
             staff_service_df["Total (BDT)"] = staff_service_df["bill_amount"].apply(format_sales_amount)
             staff_service_df["Status"] = staff_service_df["payment_status"].apply(_format_payment_label)
             staff_service_df["sort_date"] = pd.to_datetime(
-                staff_service_df["updated_at"], errors="coerce"
-            )
+                staff_service_df["service_date"], errors="coerce"
+            ).fillna(pd.to_datetime(staff_service_df["updated_at"], errors="coerce"))
             sales_frames.append(
                 staff_service_df[
                     [
@@ -11263,8 +11269,11 @@ def dashboard(conn):
                 axis=1,
             )
             staff_maintenance_df["Sales date"] = pd.to_datetime(
-                staff_maintenance_df["updated_at"], errors="coerce"
+                staff_maintenance_df["maintenance_date"], errors="coerce"
             ).dt.date
+            staff_maintenance_df["Sales date"] = staff_maintenance_df["Sales date"].fillna(
+                pd.to_datetime(staff_maintenance_df["updated_at"], errors="coerce").dt.date
+            )
             staff_maintenance_df["When"] = staff_maintenance_df["updated_at"].apply(
                 lambda value: format_time_ago(value) or format_period_range(value, value)
             )
@@ -11275,8 +11284,8 @@ def dashboard(conn):
                 _format_payment_label
             )
             staff_maintenance_df["sort_date"] = pd.to_datetime(
-                staff_maintenance_df["updated_at"], errors="coerce"
-            )
+                staff_maintenance_df["maintenance_date"], errors="coerce"
+            ).fillna(pd.to_datetime(staff_maintenance_df["updated_at"], errors="coerce"))
             sales_frames.append(
                 staff_maintenance_df[
                     [
@@ -13758,6 +13767,7 @@ def show_expiry_notifications(conn):
                s.do_number,
                COALESCE(s.service_start_date, s.service_date) AS start_date,
                s.status,
+               s.payment_status,
                s.description,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                COALESCE(c.company_name, cdo.company_name) AS company
@@ -14105,11 +14115,25 @@ def _render_notification_entry(entry: dict[str, object], *, include_actor: bool 
         st.caption(" · ".join(footer_bits))
 
 
+def _resolve_notification_reminder(conn: sqlite3.Connection, reminder_id: Optional[int]) -> bool:
+    reminder_value = int_or_none(reminder_id)
+    if reminder_value is None:
+        return False
+    conn.execute(
+        "UPDATE reminders SET status='done', updated_at=datetime('now') WHERE reminder_id=?",
+        (int(reminder_value),),
+    )
+    conn.commit()
+    return True
+
+
 def _render_notification_section(
     entries: list[dict[str, object]],
     *,
+    conn: Optional[sqlite3.Connection] = None,
     include_actor: bool = False,
     heading: Optional[str] = None,
+    allow_resolve: bool = False,
 ) -> None:
     if not entries:
         return
@@ -14122,25 +14146,64 @@ def _render_notification_section(
     for entry in entries:
         if not first:
             st.divider()
-        _render_notification_entry(entry, include_actor=include_actor)
+        if allow_resolve and conn is not None and not bool(entry.get("resolved")):
+            row_cols = st.columns([0.82, 0.18])
+            with row_cols[0]:
+                _render_notification_entry(entry, include_actor=include_actor)
+            with row_cols[1]:
+                reminder_id = int_or_none(entry.get("reminder_id"))
+                if reminder_id is not None:
+                    resolved_clicked = st.button(
+                        "✅",
+                        key=f"notification_resolve_{reminder_id}",
+                        help="Mark reminder as resolved",
+                    )
+                    if _guard_double_submit(
+                        f"notification_resolve_{reminder_id}",
+                        resolved_clicked,
+                    ):
+                        if _resolve_notification_reminder(conn, reminder_id):
+                            st.success("Reminder resolved.")
+                            _safe_rerun()
+        else:
+            _render_notification_entry(entry, include_actor=include_actor)
         first = False
 
 
 def _render_notification_body(
+    conn: sqlite3.Connection,
     alerts: list[dict[str, object]],
     activity: list[dict[str, object]],
     reminders: list[dict[str, object]],
+    resolved_reminders: list[dict[str, object]],
 ) -> None:
-    if not alerts and not activity and not reminders:
+    if not alerts and not activity and not reminders and not resolved_reminders:
         st.caption("No notifications yet. Updates will appear here as your team works.")
         return
-    _render_notification_section(reminders, heading="Reminders")
-    if reminders and (alerts or activity):
+    _render_notification_section(
+        reminders,
+        conn=conn,
+        heading="Reminders",
+        allow_resolve=True,
+    )
+    if reminders and resolved_reminders:
         st.divider()
-    _render_notification_section(alerts, heading="Alerts")
+    _render_notification_section(
+        resolved_reminders,
+        conn=conn,
+        heading="Resolved notifications",
+    )
+    if (reminders or resolved_reminders) and (alerts or activity):
+        st.divider()
+    _render_notification_section(alerts, conn=conn, heading="Alerts")
     if alerts and activity:
         st.divider()
-    _render_notification_section(activity, include_actor=True, heading="Recent activity")
+    _render_notification_section(
+        activity,
+        conn=conn,
+        include_actor=True,
+        heading="Recent activity",
+    )
 
 
 def render_notification_bell(conn) -> None:
@@ -14154,6 +14217,7 @@ def render_notification_bell(conn) -> None:
     alerts.extend(_build_staff_alerts(conn, user_id=user_id))
     activity = fetch_activity_feed(conn, limit=ACTIVITY_FEED_LIMIT) if is_admin else []
     reminders = _build_reminder_alerts(conn)
+    resolved_reminders = _build_reminder_alerts(conn, include_resolved=True)
 
     total = len(alerts) + len(activity) + len(reminders)
     label = "🔔" if total == 0 else f"🔔 {total}"
@@ -14168,10 +14232,10 @@ def render_notification_bell(conn) -> None:
         popover = getattr(st, "popover", None)
         if callable(popover):
             with popover(label, help="View alerts and staff activity", use_container_width=True):
-                _render_notification_body(alerts, activity, reminders)
+                _render_notification_body(conn, alerts, activity, reminders, resolved_reminders)
         else:
             with st.expander(f"{label} Notifications", expanded=False):
-                _render_notification_body(alerts, activity, reminders)
+                _render_notification_body(conn, alerts, activity, reminders, resolved_reminders)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -19859,31 +19923,26 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                     key=state_key,
                 )
-        status_value = status_input_widget("service_new", DEFAULT_SERVICE_STATUS)
-        status_choice = get_status_choice("service_new")
+        manual_do_code = st.text_input(
+            "DO code (optional manual entry)",
+            value=clean_text(selected_do) or "",
+            help="Type a DO code manually when needed.",
+            key="service_new_manual_do_code",
+        )
+        status_value = st.selectbox(
+            "Status",
+            DELIVERY_STATUS_OPTIONS,
+            index=DELIVERY_STATUS_OPTIONS.index("due"),
+            format_func=lambda value: DELIVERY_STATUS_LABELS.get(value, value.title()),
+            key="service_new_payment_status",
+        )
         today = datetime.now().date()
-        if status_choice == "Completed":
-            service_period_value = render_flexible_date_range(
-                "Service period",
-                start_value=today,
-                end_value=today,
-                key_prefix="service_new_period_completed",
-                help="Enter start and end dates (any format). We'll standardize to YYYY-MM-DD.",
-            )
-        elif status_choice == "In progress":
-            service_period_value = render_flexible_date_input(
-                "Service start date",
-                value=today,
-                help="Choose when this service work began.",
-                key="service_new_period_start",
-            )
-        else:
-            service_period_value = render_flexible_date_input(
-                "Planned start date",
-                value=today,
-                help="Select when this service is scheduled to begin.",
-                key="service_new_period_planned",
-            )
+        service_date_value = render_flexible_date_input(
+            "Service date",
+            value=today,
+            help="Select the date entered by the service staff.",
+            key="service_new_date",
+        )
         description = st.text_area("Service description")
         remarks = st.text_area("Remarks / updates")
         cond_cols = st.columns(2)
@@ -19970,22 +20029,17 @@ def _render_service_section(conn, *, show_heading: bool = True):
             selected_customer = _resolve_manual_customer_id(conn, manual_name)
         selected_customer = int(selected_customer) if selected_customer is not None else None
         cur = conn.cursor()
-        (
-            service_date_str,
-            service_start_str,
-            service_end_str,
-        ) = determine_period_strings(status_choice, service_period_value)
+        service_date_obj = ensure_date(service_date_value)
+        service_date_str = service_date_obj.strftime("%Y-%m-%d") if service_date_obj else None
+        service_start_str = service_date_str
+        service_end_str = service_date_str
+        selected_do_code = clean_text(manual_do_code) or selected_do
         valid_entry = True
         if selected_customer is None:
             st.error("Select a customer to log this service entry.")
             valid_entry = False
-        if status_choice == "Completed" and (
-            not service_start_str or not service_end_str
-        ):
-            st.error("Start and end dates are required for completed services.")
-            valid_entry = False
-        if status_choice != "Completed" and not service_start_str:
-            st.error("Select a start date for this service entry.")
+        if not service_date_str:
+            st.error("Select a valid service date for this service entry.")
             valid_entry = False
         if valid_entry:
             _cleaned_service_products, service_product_labels = normalize_product_entries(
@@ -20019,32 +20073,34 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     condition_status,
                     condition_remarks,
                     bill_amount,
+                    payment_status,
                     bill_document_path,
                     updated_at,
                     created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    selected_do,
+                    selected_do_code,
                     selected_customer,
                     service_date_str,
                     service_start_str,
                     service_end_str,
                     clean_text(description),
-                    status_value,
+                    DEFAULT_SERVICE_STATUS,
                     clean_text(remarks),
                     service_product_label,
                     condition_value,
                     condition_notes_value,
                     bill_amount_value,
+                    normalize_delivery_status(status_value),
                     None,
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     current_user_id(),
                 ),
             )
             service_id = cur.lastrowid
-            if selected_do and selected_customer is not None:
-                link_delivery_order_to_customer(conn, selected_do, selected_customer)
+            if selected_do_code and selected_customer is not None:
+                link_delivery_order_to_customer(conn, selected_do_code, selected_customer)
             saved_docs = attach_documents(
                 conn,
                 "service_documents",
@@ -20056,7 +20112,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 allowed_extensions=DOCUMENT_UPLOAD_EXTENSIONS,
             )
             conn.commit()
-            service_label = do_labels.get(selected_do) if selected_do else None
+            service_label = do_labels.get(selected_do_code) if selected_do_code else None
             if not service_label:
                 service_label = "Service record"
             customer_name = None
@@ -20068,7 +20124,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
             summary_parts = [service_label]
             if customer_name:
                 summary_parts.append(customer_name)
-            status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
+            status_label = DELIVERY_STATUS_LABELS.get(normalize_delivery_status(status_value), "Due")
             summary_parts.append(f"status {status_label}")
             log_activity(
                 conn,
@@ -20153,8 +20209,10 @@ def _render_service_section(conn, *, show_heading: bool = True):
         )
         display_df["Last update"] = pd.to_datetime(display_df.get("updated_at"), errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
         display_df.loc[display_df["Last update"].isna(), "Last update"] = None
-        if "status" in display_df.columns:
-            display_df["status"] = display_df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
+        if "payment_status" in display_df.columns:
+            display_df["payment_status"] = display_df["payment_status"].apply(
+                lambda x: DELIVERY_STATUS_LABELS.get(normalize_delivery_status(x), "Due")
+            )
         if "condition_status" in display_df.columns:
             display_df["condition_status"] = display_df["condition_status"].apply(
                 lambda x: clean_text(x) or "Not recorded"
@@ -20192,7 +20250,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "service_period": "Service period",
                 "service_product_info": "Products sold",
                 "description": "Description",
-                "status": "Status",
+                "payment_status": "Status",
                 "remarks": "Remarks",
                 "condition_status": "Condition",
                 "condition_remarks": "Condition notes",
@@ -20248,39 +20306,24 @@ def _render_service_section(conn, *, show_heading: bool = True):
             key="service_edit_select",
         )
         selected_record = next(r for r in records if int(r["service_id"]) == int(selected_service_id))
-        new_status = status_input_widget(
-            f"service_edit_{selected_service_id}", selected_record.get("status")
+        new_status = st.selectbox(
+            "Status",
+            DELIVERY_STATUS_OPTIONS,
+            index=DELIVERY_STATUS_OPTIONS.index(
+                normalize_delivery_status(selected_record.get("payment_status"))
+            ),
+            format_func=lambda value: DELIVERY_STATUS_LABELS.get(value, value.title()),
+            key=f"service_edit_{selected_service_id}_payment_status",
         )
-        edit_status_choice = get_status_choice(f"service_edit_{selected_service_id}")
-        existing_start = ensure_date(selected_record.get("service_start_date")) or ensure_date(
-            selected_record.get("service_date")
-        )
-        existing_end = ensure_date(selected_record.get("service_end_date")) or existing_start
+        existing_start = ensure_date(selected_record.get("service_date"))
         today = datetime.now().date()
         default_start = existing_start or today
-        default_end = existing_end or default_start
-        if edit_status_choice == "Completed":
-            edit_period_value = render_flexible_date_range(
-                "Service period",
-                start_value=default_start,
-                end_value=default_end,
-                key_prefix=f"service_edit_{selected_service_id}_period_completed",
-                help="Update the start and end dates for this service.",
-            )
-        elif edit_status_choice == "In progress":
-            edit_period_value = render_flexible_date_input(
-                "Service start date",
-                value=default_start,
-                key=f"service_edit_{selected_service_id}_period_start",
-                help="Adjust when this service began.",
-            )
-        else:
-            edit_period_value = render_flexible_date_input(
-                "Planned start date",
-                value=default_start,
-                key=f"service_edit_{selected_service_id}_period_planned",
-                help="Adjust when this service is scheduled to begin.",
-            )
+        edit_period_value = render_flexible_date_input(
+            "Service date",
+            value=default_start,
+            key=f"service_edit_{selected_service_id}_date",
+            help="Update the entered service date.",
+        )
         new_remarks = st.text_area(
             "Remarks",
             value=clean_text(selected_record.get("remarks")) or "",
@@ -20351,19 +20394,13 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 st.caption("Receipt file not found. Upload a new copy to replace it.")
         save_updates = st.button("Save updates", key="save_service_updates")
         if _guard_double_submit("save_service_updates", save_updates):
-            (
-                service_date_str,
-                service_start_str,
-                service_end_str,
-            ) = determine_period_strings(edit_status_choice, edit_period_value)
+            edit_date_obj = ensure_date(edit_period_value)
+            service_date_str = edit_date_obj.strftime("%Y-%m-%d") if edit_date_obj else None
+            service_start_str = service_date_str
+            service_end_str = service_date_str
             valid_update = True
-            if edit_status_choice == "Completed" and (
-                not service_start_str or not service_end_str
-            ):
-                st.error("Provide both start and end dates for completed services.")
-                valid_update = False
-            if edit_status_choice != "Completed" and not service_start_str:
-                st.error("Select a start date for this service entry.")
+            if not service_start_str:
+                st.error("Select a valid service date for this service entry.")
                 valid_update = False
             if valid_update:
                 condition_update_value = (
@@ -20406,6 +20443,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     """
                     UPDATE services
                     SET status = ?,
+                        payment_status = ?,
                         remarks = ?,
                         service_date = ?,
                         service_start_date = ?,
@@ -20419,7 +20457,8 @@ def _render_service_section(conn, *, show_heading: bool = True):
                       AND deleted_at IS NULL
                     """,
                     (
-                        new_status,
+                        DEFAULT_SERVICE_STATUS,
+                        normalize_delivery_status(new_status),
                         clean_text(new_remarks),
                         service_date_str,
                         service_start_str,
@@ -20434,7 +20473,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 conn.commit()
                 _mark_data_changed("operations")
                 label_text = labels.get(int(selected_service_id), "Service record")
-                status_label = clean_text(new_status) or DEFAULT_SERVICE_STATUS
+                status_label = DELIVERY_STATUS_LABELS.get(normalize_delivery_status(new_status), "Due")
                 message_summary = label_text
                 if status_label:
                     message_summary = f"{label_text} → {status_label}"
@@ -23529,6 +23568,12 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                     key=state_key,
                 )
+        manual_do_code = st.text_input(
+            "DO code (optional manual entry)",
+            value=clean_text(selected_do) or "",
+            help="Type a DO code manually when needed.",
+            key="maintenance_new_manual_do_code",
+        )
         status_value = st.selectbox(
             "Status",
             DELIVERY_STATUS_OPTIONS,
@@ -23537,12 +23582,11 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             key="maintenance_new_payment_status",
         )
         today = datetime.now().date()
-        maintenance_period_value = render_flexible_date_range(
-            "Maintenance period",
-            start_value=today,
-            end_value=today,
-            help="Select the start and end dates for the maintenance work.",
-            key_prefix="maintenance_new_period",
+        maintenance_date_value = render_flexible_date_input(
+            "Maintenance date",
+            value=today,
+            help="Select the date entered by the maintenance staff.",
+            key="maintenance_new_date",
         )
         description = st.text_area("Maintenance description")
         remarks = st.text_area("Remarks / updates")
@@ -23615,17 +23659,19 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             selected_customer = _resolve_manual_customer_id(conn, manual_name)
         selected_customer = int(selected_customer) if selected_customer is not None else None
         cur = conn.cursor()
-        (
-            maintenance_date_str,
-            maintenance_start_str,
-            maintenance_end_str,
-        ) = determine_period_strings("Completed", maintenance_period_value)
+        maintenance_date_obj = ensure_date(maintenance_date_value)
+        maintenance_date_str = (
+            maintenance_date_obj.strftime("%Y-%m-%d") if maintenance_date_obj else None
+        )
+        maintenance_start_str = maintenance_date_str
+        maintenance_end_str = maintenance_date_str
+        selected_do_code = clean_text(manual_do_code) or selected_do
         valid_entry = True
         if selected_customer is None:
             st.error("Select a customer to log this maintenance entry.")
             valid_entry = False
-        if not maintenance_start_str or not maintenance_end_str:
-            st.error("Start and end dates are required for completed maintenance work.")
+        if not maintenance_start_str:
+            st.error("Select a valid maintenance date for this maintenance entry.")
             valid_entry = False
         if valid_entry:
             _cleaned_maintenance_products, maintenance_product_labels = normalize_product_entries(
@@ -23661,7 +23707,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
                 """,
                 (
-                    selected_do,
+                    selected_do_code,
                     selected_customer,
                     maintenance_date_str,
                     maintenance_start_str,
@@ -23676,8 +23722,8 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 ),
             )
             maintenance_id = cur.lastrowid
-            if selected_do and selected_customer is not None:
-                link_delivery_order_to_customer(conn, selected_do, selected_customer)
+            if selected_do_code and selected_customer is not None:
+                link_delivery_order_to_customer(conn, selected_do_code, selected_customer)
             saved_docs = attach_documents(
                 conn,
                 "maintenance_documents",
@@ -23689,7 +23735,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 allowed_extensions=DOCUMENT_UPLOAD_EXTENSIONS,
             )
             conn.commit()
-            maintenance_label = do_labels.get(selected_do) if selected_do else None
+            maintenance_label = do_labels.get(selected_do_code) if selected_do_code else None
             if not maintenance_label:
                 maintenance_label = "Maintenance record"
             customer_name = None
@@ -23701,7 +23747,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             summary_parts = [maintenance_label]
             if customer_name:
                 summary_parts.append(customer_name)
-            status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
+            status_label = DELIVERY_STATUS_LABELS.get(normalize_delivery_status(status_value), "Due")
             summary_parts.append(f"status {status_label}")
             log_activity(
                 conn,
@@ -26350,14 +26396,19 @@ def upsert_reminder(
 
 
 def _build_reminder_alerts(
-    conn: sqlite3.Connection, *, limit: int = 8
+    conn: sqlite3.Connection, *, limit: int = 8, include_resolved: bool = False
 ) -> list[dict[str, object]]:
+    user = get_current_user() or {}
+    is_admin = clean_text(user.get("role")) == "admin"
+    viewer_id = current_user_id()
+    allowed_customers = get_accessible_customer_ids(conn)
+    reminder_status_filter = "= 'done'" if include_resolved else "!= 'done'"
     df = df_query(
         conn,
-        """
+        f"""
         SELECT reminder_id, entity_type, entity_id, remind_at, message, status
         FROM reminders
-        WHERE COALESCE(status, 'pending') != 'done'
+        WHERE COALESCE(status, 'pending') {reminder_status_filter}
         ORDER BY datetime(remind_at) ASC
         LIMIT ?
         """,
@@ -26365,6 +26416,73 @@ def _build_reminder_alerts(
     )
     if df.empty:
         return []
+
+    if not is_admin:
+        quote_ids = {
+            int(row.get("entity_id"))
+            for row in df.to_dict("records")
+            if clean_text(row.get("entity_type")) == "quotation"
+            and int_or_none(row.get("entity_id")) is not None
+        }
+        note_ids = {
+            int(row.get("entity_id"))
+            for row in df.to_dict("records")
+            if clean_text(row.get("entity_type")) == "customer_note"
+            and int_or_none(row.get("entity_id")) is not None
+        }
+        quote_owner_map: dict[int, tuple[Optional[int], Optional[int]]] = {}
+        note_customer_map: dict[int, Optional[int]] = {}
+        if quote_ids:
+            placeholders = ",".join("?" for _ in quote_ids)
+            quote_df = df_query(
+                conn,
+                f"""
+                SELECT quotation_id, created_by, customer_id
+                FROM quotations
+                WHERE quotation_id IN ({placeholders})
+                """,
+                tuple(sorted(quote_ids)),
+            )
+            for _, row in quote_df.iterrows():
+                quote_owner_map[int(row.get("quotation_id"))] = (
+                    int_or_none(row.get("created_by")),
+                    int_or_none(row.get("customer_id")),
+                )
+        if note_ids:
+            placeholders = ",".join("?" for _ in note_ids)
+            note_df = df_query(
+                conn,
+                f"""
+                SELECT note_id, customer_id
+                FROM customer_notes
+                WHERE note_id IN ({placeholders})
+                """,
+                tuple(sorted(note_ids)),
+            )
+            for _, row in note_df.iterrows():
+                note_customer_map[int(row.get("note_id"))] = int_or_none(row.get("customer_id"))
+
+        visible_rows: list[dict[str, object]] = []
+        for record in df.to_dict("records"):
+            entity_type = clean_text(record.get("entity_type"))
+            entity_id = int_or_none(record.get("entity_id"))
+            is_visible = False
+            if entity_type == "quotation" and entity_id is not None:
+                created_by, customer_id = quote_owner_map.get(entity_id, (None, None))
+                if viewer_id is not None and created_by is not None and int(created_by) == int(viewer_id):
+                    is_visible = True
+                elif allowed_customers is not None and customer_id in allowed_customers:
+                    is_visible = True
+            elif entity_type == "customer_note" and entity_id is not None:
+                customer_id = note_customer_map.get(entity_id)
+                if allowed_customers is not None and customer_id in allowed_customers:
+                    is_visible = True
+            if is_visible:
+                visible_rows.append(record)
+        df = pd.DataFrame(visible_rows)
+        if df.empty:
+            return []
+
     now = datetime.now()
     alerts: list[dict[str, object]] = []
     for record in df.to_dict("records"):
@@ -26378,9 +26496,11 @@ def _build_reminder_alerts(
         title = "Reminder due" if due else "Upcoming reminder"
         alerts.append(
             {
+                "reminder_id": int_or_none(record.get("reminder_id")),
                 "title": title,
                 "message": message or entity_label,
                 "severity": "warning" if due else "info",
+                "resolved": clean_text(record.get("status")) == "done",
                 "details": [f"Due {_format_reminder_datetime(remind_at)}"]
                 if remind_at
                 else [],
