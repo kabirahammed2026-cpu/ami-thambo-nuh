@@ -18531,6 +18531,23 @@ def customers_page(conn):
                 if create_delivery_order:
                     if not do_serial:
                         do_serial = _ensure_auto_reference("new_customer_auto_do_code", "DO")
+                    existing_active_do = conn.execute(
+                        """
+                        SELECT 1
+                        FROM delivery_orders
+                        WHERE do_number = ?
+                          AND COALESCE(record_type, 'delivery_order') = 'delivery_order'
+                          AND deleted_at IS NULL
+                        LIMIT 1
+                        """,
+                        (do_serial,),
+                    ).fetchone()
+                    if existing_active_do:
+                        original_do_serial = do_serial
+                        do_serial = _next_duplicate_do_number(conn, do_serial)
+                        st.info(
+                            f"Delivery order code {original_do_serial} already exists. Saved as {do_serial} instead."
+                        )
                     stored_path = None
                     do_receipt_path = None
                     cur = conn.cursor()
@@ -18869,7 +18886,7 @@ def customers_page(conn):
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
                         """,
                         (
-                            service_reference,
+                            do_serial if create_delivery_order else None,
                             cid,
                             service_date_str,
                             service_date_str,
@@ -18937,7 +18954,7 @@ def customers_page(conn):
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                         """,
                         (
-                            maintenance_reference,
+                            do_serial if create_delivery_order else None,
                             cid,
                             maintenance_date_str,
                             maintenance_date_str,
@@ -30774,7 +30791,7 @@ def render_system_diagnostics(conn) -> None:
                 st.error(f"Dry-run restore failed: {exc}")
 
 # ---------- Main ----------
-def main():
+def _run_main_app() -> None:
     st.session_state["_render_id"] = st.session_state.get("_render_id", 0) + 1
     render_id = st.session_state["_render_id"]
     logger = _get_logger()
@@ -30959,6 +30976,22 @@ def main():
             users_admin_page(conn)
         elif page == "System Diagnostics":
             render_system_diagnostics(conn)
+
+
+def main() -> None:
+    try:
+        _run_main_app()
+    except Exception as exc:
+        name = exc.__class__.__name__
+        if name in {"RerunException", "StopException"}:
+            raise
+        logger = _get_logger()
+        logger.exception("Unhandled runtime error in CRM app")
+        st.error(
+            "The app hit an unexpected error and could not render this page. "
+            "Please refresh. If this repeats, share the time and your last action."
+        )
+        st.exception(exc)
 
 if __name__ == "__main__":
     if _streamlit_runtime_active():
