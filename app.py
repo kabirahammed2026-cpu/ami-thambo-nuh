@@ -19632,9 +19632,10 @@ def warranties_page(conn):
         expiry_raw = selected_record.get("expiry_date")
         expiry_dt = pd.to_datetime(expiry_raw, errors="coerce")
         expiry_date = expiry_dt.date() if pd.notna(expiry_dt) else None
-        reminder_default = date.today()
+        reminder_default: Optional[date] = None
+        suggested_reminder: Optional[date] = None
         if expiry_date:
-            reminder_default = max(date.today(), expiry_date - timedelta(days=3))
+            suggested_reminder = max(date.today(), expiry_date - timedelta(days=3))
         expiry_label = format_period_range(expiry_raw, expiry_raw)
         product_label = " ".join(
             part
@@ -19663,7 +19664,11 @@ def warranties_page(conn):
         reminder_date = render_flexible_date_input(
             "Reminder date",
             value=reminder_default,
-            help="Enter a date like DD.MM.YYYY.",
+            help=(
+                "Optional. Leave blank if no reminder date is needed."
+                if suggested_reminder is None
+                else f"Optional. Leave blank if no reminder date is needed. Suggested: {suggested_reminder.strftime(INPUT_DATE_FMT)}."
+            ),
             placeholder=FOLLOW_UP_INPUT_PLACEHOLDER,
             format_hint="DD.MM.YYYY",
             allow_natural_language=False,
