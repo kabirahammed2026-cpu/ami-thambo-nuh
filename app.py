@@ -8101,6 +8101,12 @@ def apply_theme_css(*, sidebar_hidden: bool = False) -> None:
             border-color: var(--ps-button-border) !important;
             color: var(--ps-button-text) !important;
         }}
+        [data-testid="stSkeleton"],
+        .stSkeleton,
+        [class*="stSkeleton"] {{
+            display: none !important;
+            visibility: hidden !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -30593,6 +30599,11 @@ def _clear_page_state_on_navigation(previous_page: Optional[str]) -> None:
             st.session_state.pop(key, None)
 
 
+def _render_navigation_loading_shell(target_page: str) -> None:
+    st.markdown("### Loading page…")
+    st.caption(f"Preparing {target_page}. This should only take a moment.")
+
+
 def _run_storage_roundtrip(base_dir: Path) -> dict[str, str]:
     start = time.perf_counter()
     test_path = base_dir / ".diag_storage_roundtrip"
@@ -30954,6 +30965,11 @@ def _run_main_app() -> None:
     if st.session_state.pop("_nav_transition", False):
         _clear_page_state_on_navigation(st.session_state.pop("_nav_previous_page", None))
         page_container.empty()
+        st.session_state["_defer_page_render_once"] = True
+    if st.session_state.pop("_defer_page_render_once", False):
+        with page_container.container():
+            _render_navigation_loading_shell(page)
+        st.rerun()
     with page_container.container():
         st.session_state.page = page
         show_expiry_notifications(conn)
