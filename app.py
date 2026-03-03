@@ -370,6 +370,15 @@ SERVICE_REPORT_FIELDS = OrderedDict(
             },
         ),
         (
+            "first_communication_date",
+            {
+                "label": "First Communication Date",
+                "type": "date",
+                "format": "DD-MM-YYYY",
+                "help": "Date of the first contact with this customer.",
+            },
+        ),
+        (
             "address",
             {
                 "label": "Address",
@@ -552,6 +561,15 @@ FOLLOW_UP_REPORT_FIELDS = OrderedDict(
             {"label": "Date", "type": "date", "format": "DD-MM-YYYY"},
         ),
         ("client_name", {"label": "Customer Name", "type": "text"}),
+        (
+            "first_communication_date",
+            {
+                "label": "First Communication Date",
+                "type": "date",
+                "format": "DD-MM-YYYY",
+                "help": "Date of the first contact with this customer.",
+            },
+        ),
         ("address", {"label": "Address", "type": "text"}),
         ("contact", {"label": "Phone", "type": "text"}),
         ("product_detail", {"label": "Product Detail", "type": "text"}),
@@ -818,6 +836,14 @@ REPORT_COLUMN_ALIASES = {
     "client_name": ["client_name", "customer_name", "customer", "client"],
     "address": ["address", "location"],
     "contact": ["phone", "contact", "mobile"],
+    "first_communication_date": [
+        "first_communication_date",
+        "first communication date",
+        "first_contact_date",
+        "first contact date",
+        "communication_date",
+        "initial communication date",
+    ],
     "product_detail": ["product_detail", "product detail", "product details", "product"],
     "notes": ["remarks", "notes", "comment", "comments"],
     "person_in_charge": ["person_in_charge", "person in charge", "incharge", "responsible"],
@@ -2457,7 +2483,14 @@ def _load_customer_group_rows(
     conn = sqlite3.connect(db_path)
     try:
         return pd.read_sql_query(
-            f"SELECT customer_id, TRIM(name) AS name FROM customers {where_clause}",
+            f"""
+            SELECT customer_id,
+                   TRIM(name) AS name,
+                   TRIM(COALESCE(company_name, '')) AS company_name,
+                   TRIM(COALESCE(phone, '')) AS phone
+            FROM customers
+            {where_clause}
+            """,
             conn,
             params=params,
         )
@@ -6308,19 +6341,15 @@ def normalize_report_window(period_type: str, start_value, end_value) -> tuple[s
         if anchor is None:
             raise ValueError("Select a date for the daily report.")
         start_date = end_date = anchor
-    elif key == "weekly":
-        anchor = start_date or end_date
-        if anchor is None:
-            raise ValueError("Select a week for the report.")
-        start_date = anchor - timedelta(days=anchor.weekday())
-        end_date = start_date + timedelta(days=6)
     else:
-        anchor = start_date or end_date
-        if anchor is None:
-            raise ValueError("Select a month for the report.")
-        start_date = anchor.replace(day=1)
-        last_day = monthrange(start_date.year, start_date.month)[1]
-        end_date = date(start_date.year, start_date.month, last_day)
+        if start_date is None and end_date is None:
+            if key == "weekly":
+                raise ValueError("Select a date range for the weekly report.")
+            raise ValueError("Select a date range for the monthly report.")
+        if start_date is None:
+            start_date = end_date
+        if end_date is None:
+            end_date = start_date
 
     if start_date > end_date:
         start_date, end_date = end_date, start_date
@@ -6358,27 +6387,41 @@ def build_customer_groups(conn, only_complete: bool = True):
     df = _load_customer_group_rows(DB_PATH, where_clause, tuple(params), version)
     if df.empty:
         return [], {}
-    df["name"] = df["name"].fillna("")
-    df["norm_name"] = df["name"].astype(str).str.strip()
-    df.sort_values(by=["norm_name", "customer_id"], inplace=True)
+    for col in ["name", "company_name", "phone"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+    df["display_key"] = df.apply(
+        lambda row: _preferred_customer_label(
+            row.get("name"),
+            row.get("company_name"),
+            row.get("phone"),
+        ),
+        axis=1,
+    )
+    df["display_key"] = df.apply(
+        lambda row: (
+            f"Customer record #{int(row.get('customer_id'))}"
+            if clean_text(row.get("display_key")) == "Customer record"
+            else row.get("display_key")
+        ),
+        axis=1,
+    )
+    df["sort_key"] = df["display_key"].astype(str).str.strip().str.lower()
+    df.sort_values(by=["sort_key", "customer_id"], inplace=True)
     groups = []
     label_by_id = {}
-    for norm_name, group in df.groupby("norm_name", sort=False):
+    for display_key, group in df.groupby("display_key", sort=False):
         ids = group["customer_id"].astype(int).tolist()
         primary = ids[0]
-        raw_name = clean_text(group.iloc[0].get("name"))
         count = len(ids)
-        base_label = raw_name or "Customer record"
-        if raw_name and count > 1:
-            display_label = f"{base_label} ({count} records)"
-        else:
-            display_label = base_label
+        base_label = clean_text(display_key) or "Customer record"
+        display_label = f"{base_label} ({count} records)" if count > 1 else base_label
         groups.append(
             {
-                "norm_name": norm_name,
+                "norm_name": base_label,
                 "primary_id": primary,
                 "ids": ids,
-                "raw_name": raw_name,
+                "raw_name": base_label,
                 "label": display_label,
                 "count": count,
             }
@@ -8977,6 +9020,41 @@ def _sanitize_customer_identity(
     normalized_company = "" if company_invalid else clean_company
     needs_review = name_invalid or company_invalid
     return normalized_name, normalized_company, needs_review
+
+
+def _normalize_phone_display(value: Optional[str]) -> str:
+    """Normalize phone display (supports Bengali digits) and prefer BD-friendly prefixes."""
+
+    cleaned = clean_text(value)
+    if not cleaned:
+        return ""
+    cleaned = cleaned.translate(str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789"))
+    digits = re.sub(r"\D", "", cleaned)
+    if not digits:
+        return cleaned
+    if digits.startswith("880"):
+        return digits
+    if digits.startswith("0"):
+        return digits
+    if len(digits) >= 8:
+        return f"0{digits}"
+    return digits
+
+
+def _preferred_customer_label(
+    name: Optional[str],
+    company: Optional[str],
+    phone: Optional[str],
+) -> str:
+    normalized_name, normalized_company, _ = _sanitize_customer_identity(name, company)
+    if normalized_name:
+        return normalized_name
+    if normalized_company:
+        return normalized_company
+    phone_label = _normalize_phone_display(phone)
+    if phone_label:
+        return f"Phone {phone_label}"
+    return "Customer record"
 
 
 def _phone_digits_sql_expr(column: str) -> str:
@@ -17874,10 +17952,11 @@ def operations_page(conn):
         company_display = pd.Series([item[1] for item in identity_meta], index=display_customers.index)
         needs_review = pd.Series([item[2] for item in identity_meta], index=display_customers.index)
         customer_display = customer_display.where(customer_display != "", company_display)
-        customer_display = customer_display.where(customer_display != "", phone_value)
         customer_display = customer_display.where(customer_display != "", lead_status)
+        customer_display = customer_display.where(customer_display != "", "-")
         company_display = company_display.where(company_display != "", customer_display)
         company_display = company_display.where(company_display != "", lead_status)
+        company_display = company_display.where(company_display != "", "-")
         lead_status = lead_status.where(~needs_review, "Needs CRM review")
         table_df = pd.DataFrame(
             {
@@ -25027,27 +25106,12 @@ def customer_summary_page(conn):
         value=False,
         help="Enable this to hide incomplete customer records from the summary.",
     )
-    complete_clause = customer_complete_clause()
-    name_clause = "TRIM(COALESCE(name, '')) <> ''"
-    scope_clause, scope_params = customer_scope_filter()
-    where_parts = [complete_clause if show_complete_only else name_clause]
-    params: list[object] = []
-    if scope_clause:
-        where_parts.append(scope_clause)
-        params.extend(scope_params)
-    where_sql = " AND ".join(where_parts)
-    customers = df_query(
+    options, labels, group_map, _ = fetch_customer_choices(
         conn,
-        f"""
-        SELECT TRIM(name) AS name, GROUP_CONCAT(customer_id) AS ids, COUNT(*) AS cnt
-        FROM customers
-        WHERE {where_sql}
-        GROUP BY TRIM(name)
-        ORDER BY TRIM(name) ASC
-        """,
-        tuple(params),
+        only_complete=show_complete_only,
     )
-    if customers.empty:
+    available_options = [opt for opt in options if opt is not None]
+    if not available_options:
         if show_complete_only:
             st.info(
                 "No complete customers available for your account. Check the Scraps page for records that need details."
@@ -25056,15 +25120,14 @@ def customer_summary_page(conn):
             st.info("No customers available for your account yet.")
         return
 
-    names = customers["name"].tolist()
-    name_map = {
-        row["name"]: f"{row['name']} ({int(row['cnt'])} records)" if int(row["cnt"]) > 1 else row["name"]
-        for _, row in customers.iterrows()
-    }
-    sel_name = st.selectbox("Select customer", names, format_func=lambda n: name_map.get(n, n))
-    row = customers[customers["name"] == sel_name].iloc[0]
-    ids = [int(i) for i in str(row["ids"]).split(",") if i]
-    cnt = int(row["cnt"])
+    selected_primary = st.selectbox(
+        "Select customer",
+        available_options,
+        format_func=lambda cid: labels.get(cid, "Customer record"),
+        index=0,
+    )
+    ids = [int(i) for i in group_map.get(selected_primary, [selected_primary]) if i is not None]
+    cnt = len(ids)
 
     placeholder_block = ','.join('?' * len(ids))
     info = df_query(
@@ -25072,6 +25135,7 @@ def customer_summary_page(conn):
         f"""
         SELECT
             MAX(name) AS name,
+            MAX(company_name) AS company_name,
             GROUP_CONCAT(DISTINCT phone) AS phone,
             GROUP_CONCAT(DISTINCT address) AS address,
             GROUP_CONCAT(DISTINCT purchase_date) AS purchase_dates,
@@ -25083,8 +25147,19 @@ def customer_summary_page(conn):
         ids,
     ).iloc[0].to_dict()
 
-    st.write("**Name:**", info.get("name") or blank_label)
-    st.write("**Phone:**", info.get("phone"))
+    display_name = _preferred_customer_label(
+        info.get("name"),
+        info.get("company_name"),
+        info.get("phone"),
+    )
+    st.write("**Name:**", display_name or blank_label)
+    phone_values = [
+        _normalize_phone_display(part)
+        for part in str(info.get("phone") or "").split(",")
+        if clean_text(part)
+    ]
+    phone_values = [val for val in phone_values if val]
+    st.write("**Phone:**", ", ".join(dict.fromkeys(phone_values)) or blank_label)
     st.write("**Address:**", info.get("address"))
     st.write("**Product:**", info.get("products"))
     st.write("**Delivery order:**", info.get("do_codes"))
@@ -29194,6 +29269,11 @@ def reports_page(conn):
         st.session_state.pop("report_grid_import_payload", None)
         st.session_state.pop("report_grid_mapping_choices", None)
         st.session_state.pop("report_grid_mapping_saved", None)
+        st.session_state.pop("report_period_daily", None)
+        st.session_state.pop("report_period_weekly_start", None)
+        st.session_state.pop("report_period_weekly_end", None)
+        st.session_state.pop("report_period_monthly_start", None)
+        st.session_state.pop("report_period_monthly_end", None)
 
     editing_record: Optional[dict] = None
     if selected_report_id is not None and not selectable_reports.empty:
@@ -29578,24 +29658,20 @@ def reports_page(conn):
                 f"Selected window: {format_period_range(to_iso_date(start_date), to_iso_date(end_date))}"
             )
         else:
-            base_month = default_start if editing_record else today
-            try:
-                month_seed = base_month.replace(day=1)
-            except Exception:
-                month_seed = date(today.year, today.month, 1)
-            month_value = render_flexible_date_input(
-                "Month",
-                value=month_seed,
-                key="report_period_monthly",
-                help="Enter any date in the month; we'll standardize to YYYY-MM-DD.",
+            base_start = default_start if editing_record else date(today.year, today.month, 1)
+            base_end = default_end if editing_record else today
+            month_value = render_flexible_date_range(
+                "Monthly range",
+                start_value=base_start,
+                end_value=base_end,
+                key_prefix="report_period_monthly",
+                help="Choose the start and end dates for this monthly report window.",
             )
-            month_seed = month_value or month_seed
-            if not isinstance(month_seed, date):
-                month_seed = date(today.year, today.month, 1)
-            month_start = month_seed.replace(day=1)
-            last_day = monthrange(month_start.year, month_start.month)[1]
-            month_end = date(month_start.year, month_start.month, last_day)
-            start_date, end_date = month_start, month_end
+            if isinstance(month_value, (list, tuple)) and len(month_value) == 2:
+                start_date, end_date = month_value
+            else:
+                start_date = month_value
+                end_date = month_value
             st.caption(
                 f"Selected window: {format_period_range(to_iso_date(start_date), to_iso_date(end_date))}"
             )
@@ -29725,22 +29801,6 @@ def reports_page(conn):
                     if normalized_key == "daily":
                         if normalized_start != today or normalized_end != today:
                             validation_error = "Daily reports can only be submitted for today."
-                    elif normalized_key == "weekly":
-                        if today.weekday() != 5:
-                            validation_error = "Weekly reports can only be submitted on Saturdays."
-                        elif not (
-                            normalized_start == current_week_start
-                            and normalized_end == current_week_end
-                        ):
-                            validation_error = (
-                                "Weekly reports must cover the current week (Monday to Sunday)."
-                            )
-                    elif normalized_key == "monthly":
-                        if not (
-                            normalized_start == current_month_start
-                            and normalized_end == current_month_end
-                        ):
-                            validation_error = "Monthly reports must cover the current month."
                 if validation_error:
                     st.error(validation_error)
                     save_allowed = False
