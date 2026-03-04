@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import hashlib
 import logging
 import os
@@ -1837,12 +1838,18 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS notifications (
-                notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id         INTEGER NOT NULL,
-                message         TEXT NOT NULL,
-                due_date        TEXT NOT NULL,
-                read            INTEGER NOT NULL DEFAULT 0,
-                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                notification_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id            INTEGER NOT NULL,
+                message            TEXT NOT NULL,
+                due_date           TEXT NOT NULL,
+                read               INTEGER NOT NULL DEFAULT 0,
+                target_page        TEXT,
+                target_entity_type TEXT,
+                target_entity_id   INTEGER,
+                target_payload     TEXT,
+                target_anchor      TEXT,
+                event_key        TEXT,
+                created_at         TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
             );
 
@@ -1874,6 +1881,20 @@ def init_db() -> None:
              WHERE display_name IS NULL OR TRIM(display_name) = ''
             """
         )
+        cur.execute("PRAGMA table_info(notifications)")
+        notification_columns = {row[1] for row in cur.fetchall()}
+        if "target_page" not in notification_columns:
+            cur.execute("ALTER TABLE notifications ADD COLUMN target_page TEXT")
+        if "target_entity_type" not in notification_columns:
+            cur.execute("ALTER TABLE notifications ADD COLUMN target_entity_type TEXT")
+        if "target_entity_id" not in notification_columns:
+            cur.execute("ALTER TABLE notifications ADD COLUMN target_entity_id INTEGER")
+        if "target_payload" not in notification_columns:
+            cur.execute("ALTER TABLE notifications ADD COLUMN target_payload TEXT")
+        if "target_anchor" not in notification_columns:
+            cur.execute("ALTER TABLE notifications ADD COLUMN target_anchor TEXT")
+        if "event_key" not in notification_columns:
+            cur.execute("ALTER TABLE notifications ADD COLUMN event_key TEXT")
         cur.execute("PRAGMA table_info(companies)")
         company_columns = {row[1] for row in cur.fetchall()}
         if "delivery_address" not in company_columns:
@@ -2434,7 +2455,12 @@ def export_data_frames() -> Dict[str, pd.DataFrame]:
         """
     )
     frames["Notifications"] = fetchall_df(
-        "SELECT notification_id, user_id, message, due_date, read, created_at FROM notifications"
+        """
+        SELECT notification_id, user_id, message, due_date, read,
+               target_page, target_entity_type, target_entity_id,
+               target_payload, target_anchor, event_key, created_at
+        FROM notifications
+        """
     )
     return frames
 
@@ -2546,8 +2572,47 @@ def update_setting(key: str, value: int) -> None:
         cur.execute("REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(value)))
 
 
-def create_notification(user_id: int, message: str, due_date: date) -> None:
-    NOTIFICATION_SCHEDULER.create_notification(user_id, message, due_date)
+def _serialize_notification_payload(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not payload:
+        return None
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _parse_notification_payload(payload: object) -> Dict[str, Any]:
+    if not payload:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    try:
+        parsed = json.loads(str(payload))
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def create_notification(
+    user_id: int,
+    message: str,
+    due_date: date,
+    *,
+    target_page: Optional[str] = None,
+    target_entity_type: Optional[str] = None,
+    target_entity_id: Optional[int] = None,
+    target_payload: Optional[Dict[str, Any]] = None,
+    target_anchor: Optional[str] = None,
+    event_key: Optional[str] = None,
+) -> None:
+    NOTIFICATION_SCHEDULER.create_notification(
+        user_id,
+        message,
+        due_date,
+        target_page=target_page,
+        target_entity_type=target_entity_type,
+        target_entity_id=target_entity_id,
+        target_payload=_serialize_notification_payload(target_payload),
+        target_anchor=target_anchor,
+        event_key=event_key,
+    )
 
 
 def mark_notification_read(notification_id: int) -> None:
@@ -2563,8 +2628,11 @@ def get_user_notifications(user_id: int, include_read: bool = False) -> pd.DataF
     params: List = [user_id]
     if not include_read:
         query += " AND read=0"
-    query += " ORDER BY due_date"
-    return fetchall_df(query, tuple(params))
+    query += " ORDER BY due_date, created_at"
+    df = fetchall_df(query, tuple(params))
+    if "target_payload" in df.columns:
+        df["target_payload"] = df["target_payload"].apply(_parse_notification_payload)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -2609,14 +2677,35 @@ def schedule_follow_up_notifications(quotation_id: int) -> None:
     label = row["company"] or "quotation"
     message = f"Follow-up reminder for quotation #{quotation_id} ({label})"
     if salesperson_id:
-        create_notification(int(salesperson_id), message, due.date())
+        create_notification(
+            int(salesperson_id),
+            message,
+            due.date(),
+            target_page="quotations",
+            target_entity_type="quotation",
+            target_entity_id=int(quotation_id),
+            target_anchor="follow_up",
+            target_payload={"status": ["pending", "inform_later"]},
+            event_key=f"follow_up:{quotation_id}:{due.date().isoformat()}",
+        )
 
 
 def generate_system_notifications() -> None:
     NOTIFICATION_SCHEDULER.generate_system_notifications()
 
 
-def notify_admin_activity(message: str, actor: Dict, due_date: Optional[date] = None) -> None:
+def notify_admin_activity(
+    message: str,
+    actor: Dict,
+    due_date: Optional[date] = None,
+    *,
+    target_page: Optional[str] = None,
+    target_entity_type: Optional[str] = None,
+    target_entity_id: Optional[int] = None,
+    target_payload: Optional[Dict[str, Any]] = None,
+    target_anchor: Optional[str] = None,
+    event_key: Optional[str] = None,
+) -> None:
     """Send an activity notification to all admins for staff actions."""
 
     if actor.get("role") != "staff":
@@ -2628,23 +2717,48 @@ def notify_admin_activity(message: str, actor: Dict, due_date: Optional[date] = 
     final_message = f"{actor_label}: {message}"
     due = due_date or date.today()
     for admin in admins:
-        create_notification(admin["user_id"], final_message, due)
+        create_notification(
+            admin["user_id"],
+            final_message,
+            due,
+            target_page=target_page,
+            target_entity_type=target_entity_type,
+            target_entity_id=target_entity_id,
+            target_payload=target_payload,
+            target_anchor=target_anchor,
+            event_key=event_key,
+        )
 
 
 def notify_payment_recorded(quotation_id: int, actor: Dict) -> None:
     """Send a notification to all admins when a quotation payment is recorded."""
 
     notify_admin_activity(
-        f"Payment received for quotation #{quotation_id}", actor, due_date=date.today()
+        f"Payment received for quotation #{quotation_id}",
+        actor,
+        due_date=date.today(),
+        target_page="quotations",
+        target_entity_type="quotation",
+        target_entity_id=quotation_id,
+        target_anchor="payment",
+        event_key=f"payment_received:{quotation_id}",
     )
 
 
 def notify_new_quotation(letter_id: int, data: Dict[str, Any], actor: Dict) -> None:
-    """Alert all admins when a new quotation letter is created."""
+    """Alert all admins when a quotation letter is created."""
 
     customer = data.get("customer_company") or data.get("customer_name") or "Customer"
     message = f"New quotation letter #{letter_id} for {customer}"
-    notify_admin_activity(message, actor, due_date=date.today())
+    notify_admin_activity(
+        message,
+        actor,
+        due_date=date.today(),
+        target_page="quotation_letters",
+        target_entity_type="quotation_letter",
+        target_entity_id=letter_id,
+        event_key=f"quotation_letter_created:{letter_id}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2991,9 +3105,65 @@ def apply_theme_styles() -> None:
             z-index: 2200;
             display: flex;
             justify-content: flex-end;
+            gap: 0.5rem;
+            align-items: center;
+            flex-wrap: nowrap;
+            overflow: hidden;
             padding: 0.25rem 0;
+            margin-bottom: 0.35rem;
             width: 100%;
             background-color: var(--secondary-background-color);
+        }}
+        .ps-quick-nav .ps-you-are-here {{
+            font-size: 0.78rem;
+            opacity: 0.85;
+            margin-right: auto;
+            padding: 0.25rem 0.4rem;
+            border-radius: 999px;
+            border: 1px solid rgba(120, 120, 120, 0.25);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 48%;
+        }}
+        .ps-quick-nav .ps-identity-pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            border-radius: 999px;
+            border: 1px solid rgba(120, 120, 120, 0.28);
+            padding: 0.28rem 0.75rem;
+            font-size: 0.82rem;
+            font-weight: 600;
+            white-space: nowrap;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+        .ps-quick-nav .ps-notif-pill {{
+            border-radius: 999px;
+            border: 1px solid rgba(120, 120, 120, 0.28);
+            padding: 0.28rem 0.62rem;
+            font-size: 0.82rem;
+            white-space: nowrap;
+        }}
+        @media (max-width: 768px) {{
+            .ps-quick-nav {{
+                justify-content: space-between;
+                gap: 0.35rem;
+                flex-wrap: wrap;
+                overflow: visible;
+            }}
+            .ps-quick-nav .ps-you-are-here {{
+                order: 3;
+                max-width: 100%;
+                width: 100%;
+            }}
+            .ps-quick-nav .ps-identity-pill,
+            .ps-quick-nav .ps-notif-pill {{
+                font-size: 0.74rem;
+                padding: 0.24rem 0.55rem;
+            }}
         }}
         </style>
         """,
@@ -3265,13 +3435,137 @@ def _navigation_pages(user: Dict) -> dict[str, str]:
     return pages
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_target_page(target_page: Optional[str], pages: dict[str, str]) -> str:
+    fallback = pages[next(iter(pages))]
+    if target_page == "quotation_letters":
+        return target_page
+    if target_page in pages.values():
+        return str(target_page)
+    return fallback
+
+
+def set_active_page_safe(target_page: Optional[str], pages: dict[str, str]) -> str:
+    page = _normalize_target_page(target_page, pages)
+    st.session_state["active_page"] = page
+    if page == "quotation_letters":
+        st.session_state["navigation_choice"] = "Create quotation"
+        return page
+    for label, slug in pages.items():
+        if slug == page:
+            st.session_state["navigation_choice"] = label
+            break
+    return page
+
+
 def _sync_sales_nav(key: str, pages: dict[str, str]) -> None:
     labels = list(pages.keys())
     choice = st.session_state.get(key, labels[0])
     if choice not in pages:
         choice = labels[0]
-    st.session_state["active_page"] = pages[choice]
-    st.session_state["navigation_choice"] = choice
+    set_active_page_safe(pages[choice], pages)
+
+
+def _user_identity_label(user: Dict) -> str:
+    display_name = str((user.get("display_name") or "")).strip() or str(user.get("username", "")).strip()
+    role_label = str(user.get("role") or "staff").replace("_", " ").title().strip()
+    designation = str(user.get("designation") or "").strip()
+    phone = str(user.get("phone") or "").strip()
+    parts = [part for part in [display_name, role_label, designation, phone] if part]
+    return " • ".join(parts) if parts else "Unknown account"
+
+
+def _page_label_for_slug(pages: dict[str, str], slug: Optional[str]) -> str:
+    for label, value in pages.items():
+        if value == slug:
+            return label
+    if slug == "quotation_letters":
+        return "Create quotation"
+    return next(iter(pages.keys()))
+
+
+def clear_focus() -> None:
+    st.session_state.pop("focus_entity", None)
+
+
+def set_focus_entity(
+    *,
+    target_page: Optional[str],
+    entity_type: Optional[str],
+    entity_id: Optional[int],
+    payload: Optional[Dict[str, Any]],
+    anchor: Optional[str],
+    source: str = "notification",
+    summary: Optional[str] = None,
+) -> None:
+    st.session_state["focus_entity"] = {
+        "target_page": target_page,
+        "entity_type": entity_type,
+        "entity_id": _safe_int(entity_id),
+        "payload": payload if isinstance(payload, dict) else {},
+        "anchor": str(anchor or "").strip() or None,
+        "source": source,
+        "summary": str(summary or "").strip() or None,
+        "consumed": False,
+        "consumed_page": None,
+    }
+
+
+def _focus_for_page(page_slug: str) -> Optional[Dict[str, Any]]:
+    focus = st.session_state.get("focus_entity")
+    if not isinstance(focus, dict):
+        return None
+    target_page = str(focus.get("target_page") or "").strip()
+    if target_page and target_page != page_slug:
+        return None
+    return focus
+
+
+def apply_focus_once(page_slug: str) -> Optional[Dict[str, Any]]:
+    focus = _focus_for_page(page_slug)
+    if not focus:
+        return None
+    if focus.get("consumed"):
+        return None
+    focus["consumed"] = True
+    focus["consumed_page"] = page_slug
+    st.session_state["focus_entity"] = focus
+    return focus
+
+
+def _focus_summary(focus: Dict[str, Any]) -> str:
+    if focus.get("summary"):
+        return str(focus["summary"])
+    label = str(focus.get("entity_type") or "item").replace("_", " ")
+    entity_id = _safe_int(focus.get("entity_id"))
+    if entity_id is not None:
+        return f"{label.title()} #{entity_id}"
+    return label.title()
+
+
+def render_focus_banner(page_slug: str) -> None:
+    focus = _focus_for_page(page_slug)
+    if not focus:
+        return
+    left, right = st.columns([5, 1])
+    left.info(f"Opened from notification: {_focus_summary(focus)}")
+    if right.button("Clear focus", key=f"clear_focus_{page_slug}", use_container_width=True):
+        clear_focus()
+        rerun()
+
+
+def _render_page_context_banner(pages: dict[str, str]) -> None:
+    page_slug = st.session_state.get("active_page")
+    page_label = _page_label_for_slug(pages, page_slug)
+    st.caption(f"You are here: Home › {page_label}")
 
 
 def sidebar(user: Dict, pages: dict[str, str]) -> None:
@@ -3280,7 +3574,7 @@ def sidebar(user: Dict, pages: dict[str, str]) -> None:
     if _debug_diag_enabled():
         st.sidebar.warning("DEBUG_DIAG enabled: login bypassed.")
     if st.sidebar.button("Create quotation", use_container_width=True):
-        st.session_state["active_page"] = "quotation_letters"
+        set_active_page_safe("quotation_letters", pages)
 
     current_label = st.session_state.get("navigation_choice", labels[0])
     if st.session_state.get("active_page") != "quotation_letters":
@@ -3307,8 +3601,8 @@ def sidebar(user: Dict, pages: dict[str, str]) -> None:
 
 def ribbon_navigation(user: Dict, pages: dict[str, str]) -> None:
     labels = list(pages.keys())
-    if st.button("Create quotation", use_container_width=True, key="ribbon_create_quote"):
-        st.session_state["active_page"] = "quotation_letters"
+    if st.button("➕ Create quotation", use_container_width=True, key="ribbon_create_quote"):
+        set_active_page_safe("quotation_letters", pages)
 
     current_label = st.session_state.get("navigation_choice", labels[0])
     if st.session_state.get("active_page") != "quotation_letters":
@@ -3319,25 +3613,72 @@ def ribbon_navigation(user: Dict, pages: dict[str, str]) -> None:
     st.session_state["navigation_choice_ribbon"] = current_label
 
     st.radio(
-        "Go to",
+        "Go to page",
         labels,
         key="navigation_choice_ribbon",
+        help="Switch work area quickly.",
         on_change=lambda: _sync_sales_nav("navigation_choice_ribbon", pages),
     )
     st.write("---")
     st.write(f"Logged in as **{user['username']}** ({user['role']})")
+    with st.expander("Quick guide", expanded=False):
+        st.markdown(
+            """
+            - **New quotation:** Menu → Create quotation
+            - **Follow-ups:** Notifications → open due item
+            - **Collect payment:** Delivery orders → mark payment received
+            - **Update company:** Companies → Select company
+            """
+        )
     if st.button("Logout", key="ribbon_logout"):
         st.session_state["logout_requested"] = True
         rerun()
 
 
 def quick_nav_menu(user: Dict, pages: dict[str, str]) -> None:
+    unread_count = len(get_user_notifications(user["user_id"], include_read=False).index)
+    identity_label = _user_identity_label(user)
+    active_page = st.session_state.get("active_page")
+    breadcrumb_label = _page_label_for_slug(pages, active_page)
+
     st.markdown('<div class="ps-quick-nav">', unsafe_allow_html=True)
+    st.markdown(
+        f'<span class="ps-you-are-here">📍 You are here: Home › {html.escape(breadcrumb_label)}</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<span class="ps-notif-pill">🔔 {unread_count}</span>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f'<span class="ps-identity-pill">👤 {html.escape(identity_label)}</span>',
+        unsafe_allow_html=True,
+    )
+
     if hasattr(st, "popover"):
+        with st.popover("Account ▾"):
+            st.caption("Account")
+            st.write(identity_label)
+            st.button("Profile", key="identity_profile", disabled=True, help="Phase 2")
+            st.button(
+                "Change password",
+                key="identity_change_password",
+                disabled=True,
+                help="Phase 2",
+            )
+            if st.button("Logout", key="identity_logout"):
+                st.session_state["logout_requested"] = True
+                rerun()
         with st.popover("☰ Menu"):
             st.markdown("### Navigation")
             ribbon_navigation(user, pages)
     else:
+        with st.expander(f"👤 {identity_label}", expanded=False):
+            st.caption("Account")
+            if st.button("Logout", key="identity_logout_fallback"):
+                st.session_state["logout_requested"] = True
+                rerun()
         with st.expander("☰ Menu", expanded=False):
             st.markdown("### Navigation")
             ribbon_navigation(user, pages)
@@ -4150,6 +4491,7 @@ def admin_salesperson_overview() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
 
 
 def render_dashboard(user: Dict) -> None:
+    pages = _navigation_pages(user)
     generate_system_notifications()
     notifications_df = get_user_notifications(user["user_id"], include_read=False)
     header_cols = st.columns([3, 1])
@@ -4161,21 +4503,21 @@ def render_dashboard(user: Dict) -> None:
         )
     with header_cols[1]:
         if st.button("Create quotation", type="primary", use_container_width=True):
-            st.session_state["active_page"] = "quotation_letters"
+            set_active_page_safe("quotation_letters", pages)
             rerun()
     action_cols = st.columns(4)
     if action_cols[0].button("Create quotation", use_container_width=True):
-        st.session_state["active_page"] = "quotation_letters"
+        set_active_page_safe("quotation_letters", pages)
         rerun()
     if action_cols[1].button("Work orders", use_container_width=True):
-        st.session_state["active_page"] = "work_orders"
+        set_active_page_safe("work_orders", pages)
         rerun()
     if action_cols[2].button("Delivery orders", use_container_width=True):
-        st.session_state["active_page"] = "delivery_orders"
+        set_active_page_safe("delivery_orders", pages)
         rerun()
     advanced_label = "Advanced filters" if user["role"] == "admin" else "Advanced filters (admin only)"
     if action_cols[3].button(advanced_label, use_container_width=True, disabled=user["role"] != "admin"):
-        st.session_state["active_page"] = "admin_filters"
+        set_active_page_safe("admin_filters", pages)
         rerun()
     if user["role"] == "admin" and not notifications_df.empty:
         seen_ids = set(st.session_state.get("_seen_notification_ids", []))
@@ -4580,6 +4922,8 @@ def render_quotation_letter_page(user: Dict) -> None:
     """Streamlit page for composing quotation letters."""
 
     st.header("Create quotation")
+    render_focus_banner("quotation_letters")
+    focus = apply_focus_once("quotation_letters")
     st.caption("Compose, save and track quotations from a single workspace.")
 
     flash = st.session_state.pop("_letter_template_flash", None)
@@ -4627,7 +4971,11 @@ def render_quotation_letter_page(user: Dict) -> None:
     )
     selection_map = dict(options)
     selected_id = selection_map.get(selection_label)
+    if focus and focus.get("entity_type") == "quotation_letter" and focus.get("entity_id"):
+        selected_id = int(focus["entity_id"])
     existing = get_quotation_letter(selected_id)
+    if focus and focus.get("entity_type") == "quotation_letter" and focus.get("entity_id") and not existing:
+        st.warning("Item not found. It may have been deleted.")
     ensure_letter_form_state(user, existing)
     ensure_letter_aux_state()
 
@@ -5059,6 +5407,9 @@ def render_quotation_letter_page(user: Dict) -> None:
                     notify_admin_activity(
                         f"Updated quotation letter #{letter_id} for {customer_label}",
                         user,
+                        target_page="quotation_letters",
+                        target_entity_type="quotation_letter",
+                        target_entity_id=letter_id,
                     )
                 if quotation_id:
                     schedule_follow_up_notifications(quotation_id)
@@ -5218,6 +5569,8 @@ def render_quotation_letter_page(user: Dict) -> None:
 
 def render_quotations(user: Dict) -> None:
     st.header("Quotations")
+    render_focus_banner("quotations")
+    focus = apply_focus_once("quotations")
 
     with get_conn() as conn:
         companies = conn.execute(
@@ -5603,6 +5956,9 @@ def render_quotations(user: Dict) -> None:
             notify_admin_activity(
                 f"{verb} quotation #{quotation_id} for {company_label}",
                 user,
+                target_page="quotations",
+                target_entity_type="quotation",
+                target_entity_id=quotation_id,
             )
             if quotation_id:
                 schedule_follow_up_notifications(quotation_id)
@@ -5668,6 +6024,10 @@ def render_quotations(user: Dict) -> None:
             st.error("Start date must be on or before end date.")
             return
 
+    if _focus_for_page("quotations") and st.button("Show all quotations", key="quotation_show_all"):
+        clear_focus()
+        rerun()
+
     filtered_df = df.copy()
     if status_filter:
         filtered_df = filtered_df[filtered_df["status"].isin(status_filter)]
@@ -5677,6 +6037,21 @@ def render_quotations(user: Dict) -> None:
         ]
     if end_date:
         filtered_df = filtered_df[filtered_df["quote_date"].dt.date <= end_date]
+
+    if focus and focus.get("entity_type") == "quotation" and focus.get("entity_id"):
+        target_id = int(focus["entity_id"])
+        if target_id in filtered_df["quotation_id"].astype(int).tolist():
+            filtered_df = filtered_df[filtered_df["quotation_id"] == target_id]
+        else:
+            st.warning("Item not found. It may have been deleted.")
+    if focus and isinstance(focus.get("payload"), dict):
+        payload = focus.get("payload") or {}
+        status_payload = payload.get("status")
+        if isinstance(status_payload, list) and status_payload:
+            filtered_df = filtered_df[filtered_df["status"].isin(status_payload)]
+        qids = payload.get("quotation_ids")
+        if isinstance(qids, list) and qids:
+            filtered_df = filtered_df[filtered_df["quotation_id"].isin([int(v) for v in qids])]
 
     if filtered_df.empty:
         st.info("No quotations match the selected filters.")
@@ -5691,6 +6066,10 @@ def render_quotations(user: Dict) -> None:
     display_df[editable_column] = (
         display_df["status"].astype(str).str.strip().str.lower() == "declined"
     )
+    if focus and focus.get("entity_type") == "quotation" and focus.get("entity_id"):
+        display_df["Focus"] = display_df["quotation_id"].apply(
+            lambda qid: "🎯" if int(qid) == int(focus["entity_id"]) else ""
+        )
 
     disabled_columns = [
         column for column in display_df.columns if column != editable_column
@@ -5755,6 +6134,9 @@ def render_quotations(user: Dict) -> None:
             notify_admin_activity(
                 f"Declined quotation(s) {decline_labels}",
                 user,
+                target_page="quotations",
+                target_entity_type="quotation",
+                target_payload={"quotation_ids": decline_targets, "status": ["declined"]},
             )
             st.success(f"Declined {len(decline_targets)} quotation(s).")
             rerun()
@@ -5764,6 +6146,8 @@ def render_quotations(user: Dict) -> None:
 
 def render_work_orders(user: Dict) -> None:
     st.header("Work orders")
+    render_focus_banner("work_orders")
+    focus = apply_focus_once("work_orders")
     with get_conn() as conn:
         query = textwrap.dedent(
             """
@@ -5792,6 +6176,13 @@ def render_work_orders(user: Dict) -> None:
             wo_query, (user["user_id"],) if user["role"] == "staff" else ()
         ).fetchall()
 
+    if focus and focus.get("entity_type") == "work_order" and focus.get("entity_id"):
+        target_id = int(focus["entity_id"])
+        matched = [row for row in work_orders if int(row["work_order_id"]) == target_id]
+        if matched:
+            work_orders = matched
+        else:
+            st.warning("Item not found. It may have been deleted.")
     options = [("New work order", None)] + [
         (f"#{row['work_order_id']} – quotation #{row['quotation_id']}", row["work_order_id"])
         for row in work_orders
@@ -5893,6 +6284,9 @@ def render_work_orders(user: Dict) -> None:
             notify_admin_activity(
                 f"Saved work order #{work_order_id} for quotation #{quotation_ref} ({company_label})",
                 user,
+                target_page="work_orders",
+                target_entity_type="work_order",
+                target_entity_id=int(work_order_id),
             )
             st.success("Work order saved")
             rerun()
@@ -5913,6 +6307,8 @@ def render_work_orders(user: Dict) -> None:
 
 def render_delivery_orders(user: Dict) -> None:
     st.header("Delivery orders")
+    render_focus_banner("delivery_orders")
+    focus = apply_focus_once("delivery_orders")
     with get_conn() as conn:
         work_order_query = textwrap.dedent(
             """
@@ -5953,6 +6349,14 @@ def render_delivery_orders(user: Dict) -> None:
         delivery_orders = conn.execute(
             delivery_query, (user["user_id"],) if user["role"] == "staff" else ()
         ).fetchall()
+
+    if focus and focus.get("entity_type") == "delivery_order" and focus.get("entity_id"):
+        target_id = int(focus["entity_id"])
+        matched = [row for row in delivery_orders if int(row["do_id"]) == target_id]
+        if matched:
+            delivery_orders = matched
+        else:
+            st.warning("Item not found. It may have been deleted.")
 
     source_labels = {
         "work_order": "Workdone",
@@ -6233,6 +6637,9 @@ def render_delivery_orders(user: Dict) -> None:
         notify_admin_activity(
             f"Saved delivery order #{delivery_id}{company_fragment}{context_fragment}",
             user,
+            target_page="delivery_orders",
+            target_entity_type="delivery_order",
+            target_entity_id=int(delivery_id),
         )
         st.success("Delivery order saved")
         rerun()
@@ -6703,7 +7110,17 @@ def render_admin_filters() -> None:
 
 def render_companies() -> None:
     st.header("Companies")
+    render_focus_banner("companies")
+    focus = apply_focus_once("companies")
     df = list_companies()
+    if focus and focus.get("entity_type") == "company" and focus.get("entity_id"):
+        target_company = int(focus["entity_id"])
+        if "company_id" in df.columns:
+            matched_df = df[df["company_id"] == target_company]
+            if not matched_df.empty:
+                df = matched_df
+            else:
+                st.warning("Item not found. It may have been deleted.")
     st.dataframe(df, use_container_width=True)
 
     with get_conn() as conn:
@@ -6940,14 +7357,44 @@ def render_users() -> None:
         st.info(f"Password reset to {new_password}")
 
 
+def _notification_focus_payload(row: pd.Series) -> Dict[str, Any]:
+    payload = _parse_notification_payload(row.get("target_payload"))
+    return {
+        "target_page": str(row.get("target_page") or "").strip() or None,
+        "entity_type": str(row.get("target_entity_type") or "").strip() or None,
+        "entity_id": _safe_int(row.get("target_entity_id")),
+        "anchor": str(row.get("target_anchor") or "").strip() or None,
+        "payload": payload,
+        "notification_id": _safe_int(row.get("notification_id")),
+        "event_key": str(row.get("event_key") or "").strip() or None,
+    }
+
+
+def _jump_to_notification_target(row: pd.Series, pages: dict[str, str]) -> None:
+    target_page = row.get("target_page") or "notifications"
+    set_active_page_safe(target_page, pages)
+    focus_payload = _notification_focus_payload(row)
+    set_focus_entity(
+        target_page=focus_payload.get("target_page"),
+        entity_type=focus_payload.get("entity_type"),
+        entity_id=focus_payload.get("entity_id"),
+        payload=focus_payload.get("payload"),
+        anchor=focus_payload.get("anchor"),
+        source="notification",
+        summary=str(row.get("message") or "").strip() or None,
+    )
+
+
 def render_notifications(user: Dict) -> None:
+    pages = _navigation_pages(user)
     st.header("Notifications")
+    st.caption("Open any notification to jump to the exact page and related record.")
     if user["role"] == "admin":
         df = fetchall_df(
             "SELECT n.*, COALESCE(u.display_name, u.username) AS salesperson"
             " FROM notifications n"
             " JOIN users u ON u.user_id = n.user_id"
-            " ORDER BY n.due_date"
+            " ORDER BY n.read ASC, n.due_date, n.created_at"
         )
     else:
         df = fetchall_df(
@@ -6955,23 +7402,39 @@ def render_notifications(user: Dict) -> None:
             " FROM notifications n"
             " JOIN users u ON u.user_id = n.user_id"
             " WHERE n.user_id=?"
-            " ORDER BY n.due_date",
+            " ORDER BY n.read ASC, n.due_date, n.created_at",
             (user["user_id"],),
         )
     if df.empty:
         st.info("No notifications")
         return
-    st.dataframe(df, use_container_width=True)
-    unread = df[df["read"] == 0]
-    if not unread.empty:
-        to_mark = st.multiselect(
-            "Mark as read", unread["notification_id"].tolist(), format_func=lambda x: f"#{x}"
-        )
-        if st.button("Update notifications") and to_mark:
-            for notif_id in to_mark:
-                mark_notification_read(int(notif_id))
-            st.success("Notifications updated")
-        rerun()
+
+    for _, row in df.iterrows():
+        notif_id = int(row["notification_id"])
+        due_label = str(row.get("due_date") or "")
+        page_hint = row.get("target_page") or "notifications"
+        status = "Unread" if int(row.get("read", 0)) == 0 else "Read"
+        with st.container(border=True):
+            st.markdown(f"**#{notif_id} · {status}**")
+            st.write(row.get("message", ""))
+            st.caption(f"Due: {due_label} · Owner: {row.get('salesperson', '—')} · Destination: {page_hint}")
+            cols = st.columns([1, 1, 1])
+            if cols[0].button("Open", key=f"notif_open_{notif_id}", use_container_width=True):
+                mark_notification_read(notif_id)
+                _jump_to_notification_target(row, pages)
+                rerun()
+            if cols[1].button("Mark read", key=f"notif_mark_{notif_id}", use_container_width=True):
+                mark_notification_read(notif_id)
+                rerun()
+            if cols[2].button(
+                "Open target",
+                key=f"notif_target_{notif_id}",
+                use_container_width=True,
+                disabled=not bool(row.get("target_page")),
+            ):
+                mark_notification_read(notif_id)
+                _jump_to_notification_target(row, pages)
+                rerun()
 
 
 def render_sidebar_reminders(user: Dict) -> None:
@@ -7062,12 +7525,13 @@ def main() -> None:
     st.session_state.setdefault("active_page", pages[labels[0]])
     active_page = st.session_state.get("active_page", pages[labels[0]])
     if active_page != "quotation_letters" and active_page not in pages.values():
-        st.session_state["active_page"] = pages[labels[0]]
+        set_active_page_safe(pages[labels[0]], pages)
 
     sidebar(user, pages)
 
     page = st.session_state.get("active_page", pages[labels[0]])
     quick_nav_menu(user, pages)
+    _render_page_context_banner(pages)
     if page == "dashboard":
         render_dashboard(user)
     elif page == "quotation_letters":

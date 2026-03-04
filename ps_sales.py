@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import os
 import sqlite3
+import textwrap
 import mimetypes
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -388,19 +389,59 @@ class NotificationScheduler:
     def _ensure_row_factory(self, conn: sqlite3.Connection) -> None:
         conn.row_factory = sqlite3.Row
 
-    def create_notification(self, user_id: int, message: str, due_date: date) -> Optional[int]:
+    def create_notification(
+        self,
+        user_id: int,
+        message: str,
+        due_date: date,
+        *,
+        target_page: Optional[str] = None,
+        target_entity_type: Optional[str] = None,
+        target_entity_id: Optional[int] = None,
+        target_payload: Optional[str] = None,
+        target_anchor: Optional[str] = None,
+        event_key: Optional[str] = None,
+    ) -> Optional[int]:
         due_iso = due_date.isoformat()
         with self.database.begin() as conn:
             self._ensure_row_factory(conn)
             existing = conn.execute(
-                "SELECT notification_id FROM notifications WHERE user_id=? AND message=? AND due_date=?",
-                (user_id, message, due_iso),
+                textwrap.dedent(
+                    """
+                    SELECT notification_id
+                    FROM notifications
+                    WHERE user_id=?
+                      AND message=?
+                      AND due_date=?
+                      AND COALESCE(target_page, '') = COALESCE(?, '')
+                      AND COALESCE(target_entity_type, '') = COALESCE(?, '')
+                      AND COALESCE(target_entity_id, -1) = COALESCE(?, -1)
+                      AND COALESCE(event_key, '') = COALESCE(?, '')
+                    """
+                ),
+                (user_id, message, due_iso, target_page, target_entity_type, target_entity_id, event_key),
             ).fetchone()
             if existing:
                 return existing[0]
             cur = conn.execute(
-                "INSERT INTO notifications(user_id, message, due_date, read) VALUES (?, ?, ?, 0)",
-                (user_id, message, due_iso),
+                """
+                INSERT INTO notifications(
+                    user_id, message, due_date, read,
+                    target_page, target_entity_type, target_entity_id,
+                    target_payload, target_anchor, event_key
+                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    message,
+                    due_iso,
+                    target_page,
+                    target_entity_type,
+                    target_entity_id,
+                    target_payload,
+                    target_anchor,
+                    event_key,
+                ),
             )
             return cur.lastrowid
 
@@ -429,7 +470,16 @@ class NotificationScheduler:
         message = f"Follow-up reminder for quotation #{quotation_id} ({label})"
         salesperson_id = row["salesperson_id"]
         if salesperson_id:
-            self.create_notification(int(salesperson_id), message, due)
+            self.create_notification(
+                int(salesperson_id),
+                message,
+                due,
+                target_page="quotations",
+                target_entity_type="quotation",
+                target_entity_id=int(quotation_id),
+                target_anchor="follow_up",
+                event_key=f"follow_up:{quotation_id}:{due.isoformat()}",
+            )
 
     def generate_system_notifications(self) -> None:
         warning_window = date.today() + timedelta(days=self.config.pre_due_warning_days)
@@ -454,7 +504,16 @@ class NotificationScheduler:
             message = f"Upcoming follow-up for quotation #{row['quotation_id']} ({label})"
             salesperson_id = row["salesperson_id"]
             if salesperson_id:
-                self.create_notification(int(salesperson_id), message, due)
+                self.create_notification(
+                    int(salesperson_id),
+                    message,
+                    due,
+                    target_page="quotations",
+                    target_entity_type="quotation",
+                    target_entity_id=int(row["quotation_id"]),
+                    target_anchor="follow_up",
+                    event_key=f"upcoming_follow_up:{int(row['quotation_id'])}:{due.isoformat()}",
+                )
 
 
 __all__ = [
