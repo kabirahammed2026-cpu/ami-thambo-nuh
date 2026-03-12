@@ -9430,8 +9430,13 @@ def init_ui():
         """
         <style>
         :root {
-            --psNavH: 72px;
+            --psNavH: 74px;
             --ps-top-nav-height: var(--psNavH);
+            --ps-surface: #ffffff;
+            --ps-page-bg: #f6f8fc;
+            --ps-soft-border: #e5eaf2;
+            --ps-soft-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
+            --ps-soft-shadow-hover: 0 14px 32px rgba(15, 23, 42, 0.09);
         }
         html,
         body,
@@ -9445,6 +9450,7 @@ def init_ui():
         [data-testid="stAppViewContainer"] > .main {
             padding: 0;
             padding-top: 0 !important;
+            background: var(--ps-page-bg);
         }
         header[data-testid="stHeader"] {
             display: none;
@@ -9483,9 +9489,138 @@ def init_ui():
             margin-bottom: 0.25rem;
         }
         .main .block-container {
-            padding: 0 !important;
+            padding: 0.75rem 1rem 1.6rem !important;
             margin-top: 0 !important;
-            max-width: 100% !important;
+            max-width: 1440px !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+        }
+        [data-testid="stAppViewContainer"] [data-testid="stVerticalBlock"] {
+            gap: 0.75rem;
+        }
+        div[data-testid="stForm"],
+        [data-testid="stExpander"],
+        [data-testid="stDataFrame"],
+        [data-testid="stTable"],
+        [data-testid="stAlert"] {
+            border-radius: 14px;
+        }
+        div[data-testid="stForm"] {
+            background: var(--ps-surface);
+            border: 1px solid var(--ps-soft-border);
+            padding: 1rem 1.1rem;
+            box-shadow: var(--ps-soft-shadow);
+        }
+        [data-testid="stExpander"] {
+            border: 1px solid var(--ps-soft-border);
+            background: var(--ps-surface);
+        }
+        [data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 0.4rem;
+            background: rgba(255, 255, 255, 0.8);
+            border: 1px solid var(--ps-soft-border);
+            border-radius: 999px;
+            padding: 0.25rem;
+            width: fit-content;
+        }
+        [data-testid="stTabs"] [data-baseweb="tab"] {
+            border-radius: 999px;
+            padding: 0.35rem 0.85rem;
+            height: auto;
+            color: var(--ps-muted);
+            font-weight: 600;
+        }
+        [data-testid="stTabs"] [aria-selected="true"] {
+            background: #ffffff !important;
+            color: var(--ps-accent) !important;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+        }
+        div[data-testid="stButton"] > button,
+        div[data-testid="stFormSubmitButton"] > button {
+            border-radius: 10px;
+            border: 1px solid var(--ps-soft-border);
+            padding: 0.48rem 0.85rem;
+            font-weight: 600;
+            transition: all 0.15s ease;
+        }
+        div[data-testid="stButton"] > button:hover,
+        div[data-testid="stFormSubmitButton"] > button:hover {
+            transform: translateY(-1px);
+            box-shadow: var(--ps-soft-shadow-hover);
+        }
+        [data-testid="stTextInput"] > div,
+        [data-testid="stSelectbox"] > div,
+        [data-testid="stDateInput"] > div,
+        [data-testid="stTextArea"] > div,
+        [data-testid="stNumberInput"] > div {
+            border-radius: 10px;
+        }
+        [data-testid="stMarkdownContainer"] h1,
+        [data-testid="stMarkdownContainer"] h2,
+        [data-testid="stMarkdownContainer"] h3,
+        [data-testid="stMarkdownContainer"] h4,
+        [data-testid="stMarkdownContainer"] h5,
+        [data-testid="stMarkdownContainer"] h6 {
+            letter-spacing: -0.01em;
+            margin-bottom: 0.35rem;
+        }
+        [data-testid="stMarkdownContainer"] p {
+            line-height: 1.45;
+        }
+        .ps-page-intro {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 0.8rem;
+            background: var(--ps-surface);
+            border: 1px solid var(--ps-soft-border);
+            border-radius: 14px;
+            padding: 0.9rem 1rem;
+            box-shadow: 0 2px 12px rgba(15, 23, 42, 0.05);
+            margin-bottom: 0.35rem;
+        }
+        .ps-page-intro h2 {
+            margin: 0;
+            font-size: 1.15rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 0.42rem;
+        }
+        .ps-page-intro p {
+            margin: 0.2rem 0 0;
+            color: var(--ps-muted);
+            font-size: 0.92rem;
+            line-height: 1.45;
+        }
+        .ps-page-intro-helper {
+            color: var(--ps-muted);
+            font-size: 0.72rem;
+            white-space: nowrap;
+            margin-top: 0.12rem;
+        }
+        .ps-section-title {
+            font-weight: 700;
+            font-size: 1rem;
+            margin-top: 0.25rem;
+            margin-bottom: 0.1rem;
+            letter-spacing: -0.01em;
+        }
+        .ps-header-action-slot {
+            display: flex;
+            justify-content: flex-end;
+            align-items: flex-start;
+            padding-top: 0.45rem;
+        }
+        [data-testid="stDataFrame"] {
+            border: 1px solid var(--ps-soft-border);
+            border-radius: 12px;
+            overflow: hidden;
+            background: var(--ps-surface);
+        }
+        hr {
+            margin: 1rem 0 0.75rem;
+            border-color: var(--ps-soft-border);
         }
         [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] #ps_nav_anchor) {
             position: fixed;
@@ -9493,10 +9628,11 @@ def init_ui():
             left: 0;
             right: 0;
             z-index: 9999;
-            background: #fff !important;
-            padding: 12px 16px;
-            border-bottom: 1px solid var(--ps-panel-border);
-            box-shadow: 0 0.25rem 0.5rem rgba(16, 24, 40, 0.08);
+            background: rgba(255, 255, 255, 0.95) !important;
+            backdrop-filter: blur(10px);
+            padding: 12px 18px;
+            border-bottom: 1px solid var(--ps-soft-border);
+            box-shadow: 0 0.25rem 0.7rem rgba(16, 24, 40, 0.07);
             height: auto;
             min-height: calc(var(--psNavH) - 24px);
             display: flex;
@@ -9555,13 +9691,13 @@ def init_ui():
         .ps-nav-links {
             display: flex;
             align-items: center;
-            gap: 0;
+            gap: 0.35rem;
             justify-content: center;
             min-height: 0;
             width: 100%;
             margin: 0 !important;
             padding: 0 !important;
-            background: #fff !important;
+            background: transparent !important;
             position: static;
             z-index: 9999;
             overflow: visible;
@@ -9578,7 +9714,7 @@ def init_ui():
         .ps-nav-links [role="radiogroup"] {
             display: flex;
             flex-wrap: nowrap;
-            gap: 0.35rem 0.65rem;
+            gap: 0.45rem;
             justify-content: center;
             align-items: center;
             width: auto !important;
@@ -9586,7 +9722,7 @@ def init_ui():
             scrollbar-width: thin;
             margin: 0 !important;
             padding: 0 !important;
-            background: #fff !important;
+            background: transparent !important;
             position: static;
             line-height: 1.1;
             z-index: 9999;
@@ -9602,7 +9738,7 @@ def init_ui():
         .ps-nav-links [data-testid="stRadio"] {
             margin: 0 !important;
             padding: 0 !important;
-            background: #fff !important;
+            background: transparent !important;
             position: static;
             z-index: 9999;
             line-height: 1.1;
@@ -9619,15 +9755,28 @@ def init_ui():
             flex-direction: row !important;
             flex-wrap: nowrap;
             align-items: center;
-            gap: 0.35rem 0.65rem;
+            gap: 0.45rem;
             overflow-x: auto;
             scrollbar-width: thin;
             margin: 0 !important;
             padding: 0 !important;
-            background: #fff !important;
+            background: transparent !important;
             position: static;
             line-height: 1.1;
             z-index: 9999;
+        }
+        .ps-top-nav-links [data-testid="stRadio"] label,
+        .ps-nav-links [data-testid="stRadio"] label {
+            background: #fff;
+            border: 1px solid var(--ps-soft-border);
+            border-radius: 999px;
+            padding: 0.22rem 0.66rem !important;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        .ps-top-nav-links [data-testid="stRadio"] label:has(input:checked),
+        .ps-nav-links [data-testid="stRadio"] label:has(input:checked) {
+            border-color: rgba(37, 99, 235, 0.35);
+            box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.16);
         }
         .ps-top-nav-actions,
         .ps-nav-actions {
@@ -10328,15 +10477,44 @@ def _render_admin_kpi_panel(conn) -> None:
 
 
 # ---------- Pages ----------
-def dashboard(conn):
-    st.subheader("📊 Dashboard")
+def render_page_intro(title: str, description: str, *, icon: str = "", helper: Optional[str] = None) -> None:
+    icon_html = f"<span class='ps-page-intro-icon'>{html.escape(icon)}</span>" if icon else ""
+    helper_html = (
+        f"<div class='ps-page-intro-helper'>{html.escape(helper)}</div>" if helper else ""
+    )
     st.markdown(
-        "<div style='text-align: right; font-size: 0.6rem; color: #888;'>by ZAD</div>",
+        f"""
+        <div class="ps-page-intro">
+            <div class="ps-page-intro-main">
+                <h2>{icon_html}<span>{html.escape(title)}</span></h2>
+                <p>{html.escape(description)}</p>
+            </div>
+            {helper_html}
+        </div>
+        """,
         unsafe_allow_html=True,
     )
-    header_cols = st.columns((0.85, 0.15))
+
+
+def render_section_header(title: str, caption: Optional[str] = None) -> None:
+    st.markdown(f"<div class='ps-section-title'>{html.escape(title)}</div>", unsafe_allow_html=True)
+    if caption:
+        st.caption(caption)
+
+
+def dashboard(conn):
+    header_cols = st.columns((0.88, 0.12))
+    with header_cols[0]:
+        render_page_intro(
+            "Dashboard",
+            "Track performance, pending work, report coverage, and team updates in one place.",
+            icon="📊",
+            helper="by ZAD",
+        )
     with header_cols[1]:
+        st.markdown("<div class='ps-header-action-slot'>", unsafe_allow_html=True)
         render_notification_bell(conn)
+        st.markdown("</div>", unsafe_allow_html=True)
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
     current_actor_id = current_user_id()
@@ -18121,7 +18299,11 @@ def operations_page(conn):
 
 
 def customers_page(conn):
-    st.subheader("👥 Customers")
+    render_page_intro(
+        "Customers",
+        "Create records, manage customer information, and review recent activity without losing detail.",
+        icon="👥",
+    )
     deep_link = _consume_deep_link("Customers")
     deep_customer_id = None
     if isinstance(deep_link, dict):
@@ -18141,7 +18323,11 @@ def customers_page(conn):
         else:
             st.write(message)
 
-    with st.expander("Add new customer"):
+    render_section_header(
+        "Add new customer",
+        "Capture customer details and purchased items in a single guided form.",
+    )
+    with st.expander("Add new customer", expanded=False):
         products_state = st.session_state.get(
             "new_customer_products_rows",
             _default_new_customer_products(),
@@ -19510,7 +19696,10 @@ def customers_page(conn):
     st.markdown("---")
     render_customer_document_uploader(conn, key_prefix="customers_docs")
     scope_clause, scope_params = customer_scope_filter("c")
-    st.markdown("**Recently Added Customers**")
+    render_section_header(
+        "Recently added customers",
+        "Latest customer records appear here for quick follow-up and validation.",
+    )
     recent_where = f"WHERE {scope_clause}" if scope_clause else ""
     recent_params = scope_params if scope_clause else ()
     recent_df = df_query(
@@ -19548,7 +19737,11 @@ def customers_page(conn):
     )
     st.dataframe(recent_df.drop(columns=["id"], errors="ignore"))
 def warranties_page(conn):
-    st.subheader("🛡️ Warranties")
+    render_page_intro(
+        "Warranties",
+        "Monitor active coverage, expiries, and follow-ups with clear status visibility.",
+        icon="🛡️",
+    )
     is_admin = current_user_is_admin()
     deep_link = _consume_deep_link("Warranties")
     deep_warranty_id = None
@@ -19598,7 +19791,7 @@ def warranties_page(conn):
     active = format_warranty_table(active)
     if not is_admin and "Staff" in active.columns:
         active = active.drop(columns=["Staff"])
-    st.markdown("**Active Warranties**")
+    render_section_header("Active warranties")
     st.dataframe(active, use_container_width=True)
 
     expired_filters, expired_params = build_filters("date(w.expiry_date) < date('now')")
@@ -19611,11 +19804,11 @@ def warranties_page(conn):
     expired = format_warranty_table(expired)
     if not is_admin and "Staff" in expired.columns:
         expired = expired.drop(columns=["Staff"])
-    st.markdown("**Expired Warranties**")
+    render_section_header("Expired warranties")
     st.dataframe(expired, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("🔔 Upcoming Expiries")
+    render_section_header("Upcoming expiries", "Plan proactive follow-up before warranty deadlines.")
     col1, col2 = st.columns(2)
     soon3 = collapse_warranty_rows(fetch_warranty_window(conn, 0, 3))
     soon60 = collapse_warranty_rows(fetch_warranty_window(conn, 0, 60))
@@ -19627,8 +19820,10 @@ def warranties_page(conn):
         st.dataframe(soon60, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("📝 Warranty follow-ups")
-    st.caption("Add remarks and schedule a reminder before a warranty expires.")
+    render_section_header(
+        "Warranty follow-ups",
+        "Add remarks and schedule reminders before each warranty expires.",
+    )
     scope_clause, scope_params = customer_scope_filter("c")
     scope_filter = f" AND {scope_clause}" if scope_clause else ""
     status_condition = "COALESCE(w.status, 'active') NOT IN ('deleted')"
