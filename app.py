@@ -746,7 +746,7 @@ def _normalize_grid_rows(
             elif config["type"] == "number":
                 entry[key] = _coerce_grid_number(value)
             elif config["type"] == "date":
-                entry[key] = to_iso_date(value)
+                entry[key] = _to_report_iso_date(value)
             else:
                 entry[key] = value
         if (
@@ -918,12 +918,13 @@ def _import_report_grid_from_dataframe(
     column_mapping: Optional[dict[str, str]] = None,
     *,
     template_key: Optional[str] = None,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], list[str]]:
     """Parse a DataFrame into report grid rows with optional custom mapping."""
 
     imported_rows: list[dict[str, object]] = []
+    issues: list[str] = []
     if raw_df is None or raw_df.empty:
-        return imported_rows
+        return imported_rows, issues
 
     fields = _get_report_grid_fields(template_key)
     header_map = _build_report_header_map(template_key=template_key)
@@ -942,9 +943,10 @@ def _import_report_grid_from_dataframe(
                 resolved_mapping[col] = target
 
     if not resolved_mapping:
-        return imported_rows
+        return imported_rows, issues
 
-    for _, row in raw_df.iterrows():
+    invalid_date_cells = 0
+    for row_index, row in raw_df.iterrows():
         entry = _default_report_grid_row(template_key)
         for source, target in resolved_mapping.items():
             value = row.get(source)
@@ -952,13 +954,20 @@ def _import_report_grid_from_dataframe(
             if config.get("type") == "number":
                 entry[target] = _coerce_grid_number(value)
             elif config.get("type") == "date":
-                entry[target] = to_iso_date(value)
+                parsed = _to_report_iso_date(value)
+                if value not in (None, "") and parsed is None:
+                    invalid_date_cells += 1
+                    continue
+                entry[target] = parsed
             else:
                 entry[target] = clean_text(value)
         if any(val not in (None, "") for val in entry.values()):
             imported_rows.append(entry)
-
-    return imported_rows
+    if invalid_date_cells:
+        issues.append(
+            f"{invalid_date_cells} date cell(s) were skipped because they were ambiguous or invalid. Use explicit formats like YYYY-MM-DD."
+        )
+    return imported_rows, issues
 
 
 def _import_report_grid_from_file(
@@ -976,7 +985,8 @@ def _import_report_grid_from_file(
 
     file_bytes = uploaded_file.getvalue()
     dataframe = _load_report_grid_dataframe(file_bytes, uploaded_file.name)
-    return _import_report_grid_from_dataframe(dataframe, column_mapping)
+    imported_rows, _ = _import_report_grid_from_dataframe(dataframe, column_mapping)
+    return imported_rows
 
 
 def format_report_grid_rows_for_display(
@@ -1003,7 +1013,7 @@ def format_report_grid_rows_for_display(
             elif config["type"] == "number":
                 display_row[label] = value if value is not None else None
             elif config["type"] == "date":
-                iso = to_iso_date(value)
+                iso = _to_report_iso_date(value)
                 if iso:
                     try:
                         parsed = datetime.strptime(iso, "%Y-%m-%d")
@@ -1046,7 +1056,7 @@ def _grid_rows_for_editor(
             elif config["type"] == "number":
                 editor_entry[key] = _coerce_grid_number(value)
             elif config["type"] == "date":
-                iso = to_iso_date(value)
+                iso = _to_report_iso_date(value)
                 if iso:
                     try:
                         editor_entry[key] = datetime.strptime(
@@ -3884,6 +3894,62 @@ def _notification_store() -> list[dict[str, object]]:
     return buffer
 
 
+def _notification_read_store() -> set[str]:
+    stored = st.session_state.get("runtime_notifications_read")
+    if isinstance(stored, set):
+        return stored
+    if isinstance(stored, list):
+        return {clean_text(item) for item in stored if clean_text(item)}
+    return set()
+
+
+def _notification_entry_id(entry: Mapping[str, object]) -> str:
+    payload = {
+        "title": clean_text(entry.get("title")) or "",
+        "message": clean_text(entry.get("message")) or "",
+        "severity": clean_text(entry.get("severity")) or "info",
+        "timestamp": clean_text(entry.get("timestamp")) or "",
+        "deep_link": entry.get("deep_link") if isinstance(entry.get("deep_link"), dict) else None,
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    return digest
+
+
+def _is_notification_read(entry: Mapping[str, object]) -> bool:
+    entry_id = clean_text(entry.get("id")) or _notification_entry_id(entry)
+    return entry_id in _notification_read_store()
+
+
+def _set_notification_read(entry: Mapping[str, object], read: bool = True) -> None:
+    entry_id = clean_text(entry.get("id")) or _notification_entry_id(entry)
+    if not entry_id:
+        return
+    current = _notification_read_store()
+    if read:
+        current.add(entry_id)
+    else:
+        current.discard(entry_id)
+    st.session_state["runtime_notifications_read"] = sorted(current)
+
+
+def _activate_notification_deep_link(link: Mapping[str, object]) -> None:
+    page = clean_text(link.get("page"))
+    if not page:
+        return
+    payload = {
+        "page": page,
+        "tab": clean_text(link.get("tab")) or "",
+        "record_id": clean_text(link.get("record_id")) or "",
+        "highlight": "1" if bool(link.get("highlight")) else "",
+    }
+    payload["token"] = "|".join([payload["page"], payload["tab"], payload["record_id"], payload["highlight"]])
+    st.session_state["pending_deep_link"] = payload
+    st.session_state["nav_page"] = page
+    st.session_state["page"] = page
+    st.session_state["nav_selection_top"] = page
+    st.session_state["nav_selection_mobile"] = page
+
+
 def get_runtime_notifications() -> list[dict[str, object]]:
     return list(_notification_store())
 
@@ -3909,7 +3975,12 @@ def push_runtime_notification(
     }
     if deep_link:
         entry["deep_link"] = deep_link
+    entry["id"] = _notification_entry_id(entry)
     buffer = _notification_store()
+    if buffer:
+        latest = buffer[-1]
+        if _notification_entry_id(latest) == entry["id"]:
+            return
     buffer.append(entry)
     if len(buffer) > MAX_RUNTIME_NOTIFICATIONS:
         del buffer[0 : len(buffer) - MAX_RUNTIME_NOTIFICATIONS]
@@ -4107,6 +4178,13 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                             "severity": "warning"
                             if reminder_date <= date.today()
                             else "info",
+                            "deep_link": {
+                                "page": "Reports",
+                                "record_id": str(int(row.get("report_id"))),
+                                "highlight": True,
+                            }
+                            if int_or_none(row.get("report_id")) is not None
+                            else None,
                         },
                     )
                 )
@@ -4277,6 +4355,7 @@ def _deep_link_for_entity(
         "quotation": {"page": "Quotation"},
         "customer": {"page": "Customers"},
         "warranty": {"page": "Warranties"},
+        "report": {"page": "Reports"},
         "delivery_order": {"page": "Operations", "tab": "delivery_orders"},
         "work_done": {"page": "Operations", "tab": "work_done"},
         "service": {"page": "Operations", "tab": "service"},
@@ -6303,35 +6382,7 @@ def normalize_report_window(period_type: str, start_value, end_value) -> tuple[s
         key = "daily"
 
     def _coerce(value) -> Optional[date]:
-        if value is None:
-            return None
-        if isinstance(value, datetime):
-            return value.date()
-        if isinstance(value, date):
-            return value
-        iso = to_iso_date(value)
-        if iso:
-            try:
-                return datetime.strptime(iso, "%Y-%m-%d").date()
-            except ValueError:
-                pass
-        try:
-            parsed = pd.to_datetime(value, errors="coerce")
-        except Exception:
-            parsed = None
-        if parsed is None or pd.isna(parsed):
-            return None
-        if isinstance(parsed, pd.DatetimeIndex):
-            if len(parsed) == 0:
-                return None
-            parsed = parsed[0]
-        if hasattr(parsed, "to_pydatetime"):
-            parsed = parsed.to_pydatetime()
-        if isinstance(parsed, datetime):
-            return parsed.date()
-        if isinstance(parsed, date):
-            return parsed
-        return None
+        return _parse_strict_report_date(value)
 
     start_date = _coerce(start_value)
     end_date = _coerce(end_value)
@@ -12068,62 +12119,93 @@ def dashboard(conn):
         archive_bytes = export_state.get("archive_bytes")
         uploads_archive_bytes = export_state.get("uploads_archive_bytes")
         if downloads_enabled:
-            if not excel_bytes and not archive_bytes and not uploads_archive_bytes:
-                st.info("Click “Prepare downloads” to generate export files.")
-            download_cols = st.columns([0.34, 0.33, 0.33])
-            with download_cols[0]:
-                if excel_bytes:
-                    st.download_button(
-                        "⬇️ Download full database (Excel)",
-                        excel_bytes,
-                        file_name="ps_crm.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                else:
-                    st.info("Excel export not ready yet.")
-            with download_cols[1]:
-                if archive_bytes:
-                    st.download_button(
-                        "⬇️ Download full archive (.zip)",
-                        archive_bytes,
-                        file_name="ps_crm_full.zip",
-                        mime="application/zip",
-                        help="Bundles the database, uploads, and receipts into one portable file.",
-                    )
-                else:
-                    st.info("Archive export not ready yet.")
-            with download_cols[2]:
-                if uploads_archive_bytes:
-                    st.download_button(
-                        "⬇️ Download all uploads (.zip)",
-                        uploads_archive_bytes,
-                        file_name="ps_crm_uploads.zip",
-                        mime="application/zip",
-                        help="Bundles every uploaded document, receipt, and attachment.",
-                    )
-                else:
-                    st.info("Uploads archive not ready yet.")
-        backup_status = get_backup_status(BACKUP_DIR)
-        if backup_status:
-            backup_label = backup_status.get("last_backup_at") or "Unknown time"
-            backup_file = backup_status.get("last_backup_file") or "unknown file"
-            backup_lines = [
-                f"Last automatic backup: {backup_label} • {backup_file} "
-                f"(stored in {backup_status.get('backup_dir')})"
+            download_specs = [
+                {
+                    "key": "excel",
+                    "title": "Full database (Excel)",
+                    "label": "⬇️ Download full database (.xlsx)",
+                    "file_name": "ps_crm.xlsx",
+                    "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "bytes": excel_bytes,
+                    "description": "All CRM tables in spreadsheet format for analysis, audit, and migration.",
+                    "format": "XLSX",
+                },
+                {
+                    "key": "archive",
+                    "title": "Full system archive",
+                    "label": "⬇️ Download full archive (.zip)",
+                    "file_name": "ps_crm_full.zip",
+                    "mime": "application/zip",
+                    "bytes": archive_bytes,
+                    "description": "Database + uploads + receipts in one portable recovery package.",
+                    "format": "ZIP",
+                },
+                {
+                    "key": "uploads",
+                    "title": "Uploads archive",
+                    "label": "⬇️ Download all uploads (.zip)",
+                    "file_name": "ps_crm_uploads.zip",
+                    "mime": "application/zip",
+                    "bytes": uploads_archive_bytes,
+                    "description": "Only attachments, receipts, and document files without database tables.",
+                    "format": "ZIP",
+                },
             ]
-            mirror_dir = backup_status.get("mirror_dir")
-            if mirror_dir:
-                backup_lines.append(f"Backup mirror: {mirror_dir}")
-            mirror_error = backup_status.get("mirror_error")
-            if mirror_error:
-                backup_lines.append(f"Backup mirror error: {mirror_error}")
-            st.caption(" • ".join(backup_lines))
-            if not mirror_dir:
-                st.info(
-                    "Tip: set PS_CRM_BACKUP_MIRROR_DIR to store automatic backups on a separate Linode volume "
-                    "so older archives (including staff/users database data and uploads) stay available after redeploys.",
-                    icon="💾",
-                )
+            if not any(spec["bytes"] for spec in download_specs):
+                st.info("Click ‘Prepare downloads’ to generate export files.")
+
+            st.markdown("#### Backup & download center")
+            st.caption("Generate once, then download each package below. Sizes and status update automatically.")
+
+            backup_status = get_backup_status(BACKUP_DIR)
+            backup_cols = st.columns([0.28, 0.22, 0.50])
+            with backup_cols[0]:
+                st.metric("Automatic backup", "Available" if backup_status else "Not available")
+            with backup_cols[1]:
+                last_backup_at = backup_status.get("last_backup_at") if backup_status else ""
+                st.metric("Last backup", last_backup_at or "—")
+            with backup_cols[2]:
+                backup_file = backup_status.get("last_backup_file") if backup_status else ""
+                st.metric("Last backup file", backup_file or "—")
+
+            if backup_status:
+                details_cols = st.columns(2)
+                details_cols[0].caption(f"Storage directory: `{backup_status.get('backup_dir')}`")
+                mirror_dir = backup_status.get("mirror_dir")
+                mirror_error = backup_status.get("mirror_error")
+                if mirror_dir:
+                    details_cols[1].caption(f"Mirror directory: `{mirror_dir}`")
+                else:
+                    details_cols[1].caption("Mirror directory: not configured")
+                if mirror_error:
+                    st.warning(f"Backup mirror warning: {mirror_error}")
+                if not mirror_dir:
+                    st.info(
+                        "Tip: set PS_CRM_BACKUP_MIRROR_DIR to keep a second copy on another volume for safer recovery.",
+                        icon="💾",
+                    )
+
+            download_cols = st.columns(3)
+            for col, spec in zip(download_cols, download_specs):
+                with col:
+                    st.markdown(f"##### {spec['title']}")
+                    st.caption(spec["description"])
+                    payload = spec["bytes"]
+                    if payload:
+                        st.caption(f"Format: {spec['format']} • Size: {_format_bytes(len(payload))}")
+                        st.download_button(
+                            spec["label"],
+                            payload,
+                            file_name=spec["file_name"],
+                            mime=spec["mime"],
+                            key=f"backup_download_{spec['key']}",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.caption(f"Format: {spec['format']} • Size: —")
+                        st.info("Not ready yet. Click ‘Prepare downloads’.")
+        else:
+            backup_status = get_backup_status(BACKUP_DIR)
         if st.session_state.get("auto_backup_error"):
             st.warning(
                 f"Automatic backup failed: {st.session_state['auto_backup_error']}"
@@ -14491,8 +14573,11 @@ def _render_notification_entry(entry: dict[str, object], *, include_actor: bool 
     if message:
         st.caption(message)
     details = entry.get("details") or []
-    for detail in list(details)[:5]:
+    detail_preview = list(details)[:2]
+    for detail in detail_preview:
         st.caption(f"• {detail}")
+    if len(details) > len(detail_preview):
+        st.caption(f"+ {len(details) - len(detail_preview)} more detail(s)")
     footer_bits: list[str] = []
     if include_actor:
         actor = clean_text(entry.get("actor"))
@@ -14536,27 +14621,39 @@ def _render_notification_section(
     for entry in entries:
         if not first:
             st.divider()
-        if allow_resolve and conn is not None and not bool(entry.get("resolved")):
-            row_cols = st.columns([0.82, 0.18])
-            with row_cols[0]:
-                _render_notification_entry(entry, include_actor=include_actor)
-            with row_cols[1]:
-                reminder_id = int_or_none(entry.get("reminder_id"))
-                if reminder_id is not None:
-                    resolved_clicked = st.button(
-                        "✅",
-                        key=f"notification_resolve_{reminder_id}",
-                        help="Mark reminder as resolved",
-                    )
-                    if _guard_double_submit(
-                        f"notification_resolve_{reminder_id}",
-                        resolved_clicked,
-                    ):
-                        if _resolve_notification_reminder(conn, reminder_id):
-                            st.success("Reminder resolved.")
-                            _safe_rerun()
-        else:
+        row_cols = st.columns([0.68, 0.16, 0.16])
+        with row_cols[0]:
             _render_notification_entry(entry, include_actor=include_actor)
+        with row_cols[1]:
+            deep_link = entry.get("deep_link") if isinstance(entry.get("deep_link"), dict) else None
+            if deep_link:
+                if st.button("Open", key=f"notification_open_{_notification_entry_id(entry)}", use_container_width=True):
+                    _set_notification_read(entry, True)
+                    _activate_notification_deep_link(deep_link)
+                    _safe_rerun()
+        with row_cols[2]:
+            reminder_id = int_or_none(entry.get("reminder_id"))
+            if allow_resolve and conn is not None and not bool(entry.get("resolved")) and reminder_id is not None:
+                resolved_clicked = st.button(
+                    "✅",
+                    key=f"notification_resolve_{reminder_id}",
+                    help="Mark reminder as resolved",
+                    use_container_width=True,
+                )
+                if _guard_double_submit(
+                    f"notification_resolve_{reminder_id}",
+                    resolved_clicked,
+                ):
+                    if _resolve_notification_reminder(conn, reminder_id):
+                        _set_notification_read(entry, True)
+                        st.success("Reminder resolved.")
+                        _safe_rerun()
+            else:
+                read_now = _is_notification_read(entry)
+                label = "Read" if read_now else "Unread"
+                if st.button(label, key=f"notification_read_{_notification_entry_id(entry)}", use_container_width=True):
+                    _set_notification_read(entry, not read_now)
+                    _safe_rerun()
         first = False
 
 
@@ -14576,24 +14673,23 @@ def _render_notification_body(
         heading="Reminders",
         allow_resolve=True,
     )
-    if reminders and resolved_reminders:
-        st.divider()
-    _render_notification_section(
-        resolved_reminders,
-        conn=conn,
-        heading="Resolved notifications",
-    )
-    if (reminders or resolved_reminders) and (alerts or activity):
-        st.divider()
-    _render_notification_section(alerts, conn=conn, heading="Alerts")
-    if alerts and activity:
-        st.divider()
-    _render_notification_section(
-        activity,
-        conn=conn,
-        include_actor=True,
-        heading="Recent activity",
-    )
+    if resolved_reminders:
+        with st.expander(f"Resolved notifications ({len(resolved_reminders)})", expanded=False):
+            _render_notification_section(
+                resolved_reminders,
+                conn=conn,
+                heading=None,
+            )
+    if alerts:
+        _render_notification_section(alerts, conn=conn, heading="Alerts")
+    if activity:
+        with st.expander(f"Recent activity ({len(activity)})", expanded=False):
+            _render_notification_section(
+                activity,
+                conn=conn,
+                include_actor=True,
+                heading=None,
+            )
 
 
 def render_notification_bell(conn) -> None:
@@ -14609,8 +14705,10 @@ def render_notification_bell(conn) -> None:
     reminders = _build_reminder_alerts(conn)
     resolved_reminders = _build_reminder_alerts(conn, include_resolved=True)
 
-    total = len(alerts) + len(activity) + len(reminders)
-    label = "🔔" if total == 0 else f"🔔 {total}"
+    all_entries = [*alerts, *activity, *reminders]
+    unread_total = sum(1 for entry in all_entries if not _is_notification_read(entry))
+    total = len(all_entries)
+    label = "🔔" if total == 0 else f"🔔 {unread_total}/{total}"
     container = st.container()
     with container:
         for alert in alerts:
@@ -15600,7 +15698,7 @@ def _render_doc_detail_inputs(
             "Quotation date",
             value=default_purchase_date or date.today(),
             key=f"{key_prefix}_quotation_date",
-            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
         )
         details["payment_status"] = st.selectbox(
             "Payment status",
@@ -15758,7 +15856,7 @@ def _render_doc_detail_inputs(
             "Service date",
             value=date.today(),
             key=f"{key_prefix}_service_date",
-            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
         )
         details["description"] = st.text_area(
             "Service description",
@@ -15832,7 +15930,7 @@ def _render_doc_detail_inputs(
             "Maintenance date",
             value=date.today(),
             key=f"{key_prefix}_maintenance_date",
-            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+            help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
         )
         details["description"] = st.text_area(
             "Maintenance description",
@@ -18569,7 +18667,7 @@ def customers_page(conn):
                             "Service date",
                             value=service_date_default,
                             key="new_customer_service_date",
-                            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                            help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
                         )
                     service_description = service_cols[1].text_area(
                         "Service description",
@@ -18608,7 +18706,7 @@ def customers_page(conn):
                             "Maintenance date",
                             value=maintenance_date_default,
                             key="new_customer_maintenance_date",
-                            help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                            help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
                         )
                     maintenance_description = maintenance_cols[1].text_area(
                         "Maintenance description",
@@ -22411,7 +22509,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 "Quotation date",
                 value=st.session_state.get("quotation_date") or default_date,
                 key="quotation_date",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
             )
             customer_company = st.text_input(
                 "Customer name",
@@ -26508,6 +26606,47 @@ def refine_multiline(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(normalized_rows, columns=df.columns)
 
 
+def _read_import_dataframe(uploaded_file) -> tuple[Optional[pd.DataFrame], list[str]]:
+    """Load an uploaded import file with defensive parsing fallbacks."""
+    parse_notes: list[str] = []
+    filename = clean_text(getattr(uploaded_file, "name", "")) or ""
+    lower_name = filename.lower()
+    if not lower_name:
+        return None, ["Missing upload filename."]
+
+    uploaded_file.seek(0)
+    try:
+        if lower_name.endswith(".csv"):
+            csv_attempts = [
+                {"encoding": "utf-8-sig", "sep": None, "engine": "python"},
+                {"encoding": "utf-8", "sep": None, "engine": "python"},
+                {"encoding": "latin-1", "sep": None, "engine": "python"},
+            ]
+            last_exc: Optional[Exception] = None
+            for attempt in csv_attempts:
+                uploaded_file.seek(0)
+                try:
+                    dataframe = pd.read_csv(uploaded_file, **attempt)
+                    parse_notes.append(
+                        f"CSV parsed using {attempt.get('encoding', 'default')} encoding."
+                    )
+                    return dataframe, parse_notes
+                except Exception as exc:  # noqa: PERF203 - explicit parser fallback
+                    last_exc = exc
+            message = str(last_exc) if last_exc else "Unknown CSV parsing error."
+            return None, [f"Could not parse CSV file: {message}"]
+
+        if lower_name.endswith((".xlsx", ".xls", ".xlsm")):
+            uploaded_file.seek(0)
+            return pd.read_excel(uploaded_file), parse_notes
+
+        return None, [
+            "Unsupported file type. Please upload .csv, .xlsx, .xls, or .xlsm files."
+        ]
+    except Exception as exc:
+        return None, [f"Failed to read import file: {exc}"]
+
+
 _TRAILING_ZERO_NUMBER = re.compile(r"^-?\d+\.0+$")
 
 
@@ -26668,6 +26807,54 @@ def parse_date_value(value) -> Optional[pd.Timestamp]:
     if parsed_dt is None:
         return None
     return pd.Timestamp(parsed_dt).normalize()
+
+
+STRICT_REPORT_DATE_FORMATS: tuple[str, ...] = ("%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y")
+
+
+def _parse_strict_report_date(value: object, *, allow_excel_serial: bool = True) -> Optional[date]:
+    """Parse report dates with strict, explicit formats to prevent ambiguity."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        for fmt in STRICT_REPORT_DATE_FORMATS:
+            with contextlib.suppress(ValueError):
+                return datetime.strptime(cleaned, fmt).date()
+        if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", cleaned):
+            return None
+        return None
+    if allow_excel_serial:
+        with contextlib.suppress(Exception):
+            number = float(value)
+            if number > 20000:
+                return pd.to_datetime(number, unit="d", origin="1899-12-30", errors="coerce").date()
+    with contextlib.suppress(Exception):
+        converted = pd.to_datetime(value, errors="coerce")
+        if pd.notna(converted):
+            if isinstance(converted, pd.DatetimeIndex):
+                converted = converted[0] if len(converted) else None
+            if converted is not None:
+                return pd.Timestamp(converted).date()
+    return None
+
+
+def _to_report_iso_date(value: object) -> Optional[str]:
+    parsed = _parse_strict_report_date(value)
+    if parsed is None:
+        return None
+    return parsed.strftime("%Y-%m-%d")
 
 
 def _format_reminder_datetime(value: object) -> str:
@@ -26915,16 +27102,19 @@ def import_page(conn):
         manage_import_history(conn)
         return
     # Streamlit reruns the script whenever widgets change state. This means the
-    # uploaded file object is reused across runs and its pointer sits at the end
-    # after the first read. Attempting to read again (e.g. after a selectbox
-    # change) would therefore raise an "Excel file format cannot be determined"
-    # error or return empty data, effectively restarting the app view. Reset the
-    # pointer before every read so interactive mapping works reliably.
-    f.seek(0)
-    if f.name.endswith(".csv"):
-        df = pd.read_csv(f)
-    else:
-        df = pd.read_excel(f)
+    # uploaded file object is reused across runs and its pointer can sit at the
+    # end after the first read. Parse with defensive fallbacks and reset before
+    # every parser attempt so mapping widgets stay stable across reruns.
+    df, parse_notes = _read_import_dataframe(f)
+    if df is None:
+        st.error("Unable to read this import file.")
+        for note in parse_notes:
+            st.caption(note)
+        st.markdown("---")
+        manage_import_history(conn)
+        return
+    for note in parse_notes:
+        st.caption(note)
     serial_headers = {
         "sl",
         "sl.",
@@ -27106,17 +27296,17 @@ def import_page(conn):
         column_config={
             "date": st.column_config.DateColumn(
                 "Date",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
                 format="YYYY-MM-DD",
             ),
             "purchase_date": st.column_config.DateColumn(
                 "Purchase date",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
                 format="YYYY-MM-DD",
             ),
             "follow_up_date": st.column_config.DateColumn(
                 "Follow-up date",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
                 format="YYYY-MM-DD",
             ),
             "work_done_code": st.column_config.TextColumn(
@@ -27141,8 +27331,17 @@ def import_page(conn):
 
     if st.button("Append into database"):
         editor = editor if isinstance(editor, pd.DataFrame) else pd.DataFrame(editor)
-        ready = editor[editor["Action"].fillna("Import").str.lower() == "import"].copy()
+        if editor.empty:
+            st.warning("There are no rows to import.")
+            return
+        if "Action" not in editor.columns:
+            editor["Action"] = "Import"
+        action_series = editor["Action"].fillna("Import").astype(str).str.strip().str.lower()
+        ready = editor[action_series == "import"].copy()
         ready.drop(columns=["Action"], inplace=True, errors="ignore")
+        if ready.empty:
+            st.warning("No rows are marked for import. Set Action to ‘Import’ for at least one row.")
+            return
         if "phone" in ready.columns:
             phone_series = ready["phone"].fillna("").astype(str).str.strip()
             missing_phone = phone_series.eq("")
@@ -29301,6 +29500,12 @@ def reports_page(conn):
     st.caption(
         "Staff can see only their own entries. Admins can review every team member's submissions."
     )
+    deep_link = _consume_deep_link("Reports")
+    if isinstance(deep_link, dict):
+        deep_report_id = int_or_none(deep_link.get("record_id"))
+        if deep_report_id is not None:
+            st.session_state["report_edit_select_pending"] = deep_report_id
+            st.info(f"Jumped to report #{deep_report_id}.")
 
     directory = df_query(
         conn,
@@ -29587,7 +29792,6 @@ def reports_page(conn):
         editing_record.get("import_file_path") if editing_record else None
     )
 
-    st.markdown("##### Import report data")
     import_payload = st.session_state.get("report_grid_import_payload")
     import_payload_is_new = False
 
@@ -29613,12 +29817,15 @@ def reports_page(conn):
     if st.session_state.pop("report_grid_importer_reset", False):
         _reset_report_import_state(clear_uploader=True)
 
-    import_file = st.file_uploader(
-        "Upload report grid (Excel or CSV)",
-        type=["xlsx", "xls", "csv"],
-        help="Populate the grid below by importing a spreadsheet with columns matching the report table.",
-        key="report_grid_importer",
-    )
+    import_expanded = bool(import_payload) or bool(st.session_state.get("report_grid_import_rows"))
+    with st.expander("Import report data", expanded=import_expanded):
+        st.caption("Use this only when you want to seed the grid from Excel/CSV. Manual entry is still fully supported below.")
+        import_file = st.file_uploader(
+            "Upload report grid (Excel or CSV)",
+            type=["xlsx", "xls", "csv"],
+            help="Populate the grid below by importing a spreadsheet with columns matching the report table.",
+            key="report_grid_importer",
+        )
     if st.session_state.get("reports_import_df") is not None:
         if st.button("Clear imported rows", key="report_import_clear"):
             st.session_state.pop("reports_import_df", None)
@@ -29698,9 +29905,11 @@ def reports_page(conn):
                     )
                     for key in _get_report_grid_fields(template_key).keys()
                 }
-                imported_rows = _import_report_grid_from_dataframe(
+                imported_rows, import_issues = _import_report_grid_from_dataframe(
                     uploaded_df, selected_mapping, template_key=template_key
                 )
+                for issue in import_issues:
+                    st.warning(issue, icon="⚠️")
                 if imported_rows:
                     st.session_state["reports_import_loaded"] = True
                     st.session_state["reports_import_df"] = pd.DataFrame(imported_rows)
@@ -29820,7 +30029,7 @@ def reports_page(conn):
                 "Report date",
                 value=default_start,
                 key="report_period_daily",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
             )
             if (
                 STRICT_REPORT_WINDOWS
@@ -29842,7 +30051,7 @@ def reports_page(conn):
                 start_value=base_start,
                 end_value=base_end,
                 key_prefix="report_period_weekly",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
             )
             if isinstance(week_value, (list, tuple)) and len(week_value) == 2:
                 start_date, end_date = week_value
@@ -29860,7 +30069,7 @@ def reports_page(conn):
                 start_value=base_start,
                 end_value=base_end,
                 key_prefix="report_period_monthly",
-                help="Choose the start and end dates for this monthly report window.",
+                help="Choose explicit start and end dates (YYYY-MM-DD preferred) for this monthly report window.",
             )
             if isinstance(month_value, (list, tuple)) and len(month_value) == 2:
                 start_date, end_date = month_value
@@ -30132,34 +30341,35 @@ def reports_page(conn):
         )
 
     period_keys = list(REPORT_PERIOD_OPTIONS.keys())
-    history_periods = st.multiselect(
-        "Cadence",
-        period_keys,
-        default=period_keys,
-        format_func=lambda key: REPORT_PERIOD_OPTIONS.get(key, key.title()),
-        key="report_history_periods",
-    )
+    with st.expander("History filters", expanded=False):
+        history_periods = st.multiselect(
+            "Cadence",
+            period_keys,
+            default=period_keys,
+            format_func=lambda key: REPORT_PERIOD_OPTIONS.get(key, key.title()),
+            key="report_history_periods",
+        )
 
-    default_history_start = today - timedelta(days=30)
-    history_range = render_flexible_date_range(
-        "Period range",
-        start_value=default_history_start,
-        end_value=today,
-        key_prefix="report_history_range",
-        help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
-    )
-    range_start = range_end = None
-    if isinstance(history_range, (list, tuple)) and len(history_range) == 2:
-        range_start, range_end = history_range
-    elif history_range:
-        range_start = history_range
-        range_end = history_range
+        default_history_start = today - timedelta(days=30)
+        history_range = render_flexible_date_range(
+            "Period range",
+            start_value=default_history_start,
+            end_value=today,
+            key_prefix="report_history_range",
+            help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
+        )
+        range_start = range_end = None
+        if isinstance(history_range, (list, tuple)) and len(history_range) == 2:
+            range_start, range_end = history_range
+        elif history_range:
+            range_start = history_range
+            range_end = history_range
 
-    search_term = st.text_input(
-        "Search notes",
-        key="report_history_search",
-        placeholder="Keyword in tasks, remarks, or research",
-    )
+        search_term = st.text_input(
+            "Search notes",
+            key="report_history_search",
+            placeholder="Keyword in tasks, remarks, or research",
+        )
 
     filters: list[str] = []
     params: list[object] = []
@@ -30186,6 +30396,16 @@ def reports_page(conn):
             params.extend([keyword, keyword, keyword])
 
     where_clause = " AND ".join(filters) if filters else "1=1"
+    active_filter_count = 0
+    if is_admin and history_user is not None:
+        active_filter_count += 1
+    if history_periods and len(history_periods) != len(period_keys):
+        active_filter_count += 1
+    if range_start or range_end:
+        active_filter_count += 1
+    if clean_text(search_term):
+        active_filter_count += 1
+    st.caption(f"History filters active: {active_filter_count}")
     history_df = df_query(
         conn,
         dedent(
@@ -30354,7 +30574,7 @@ def reports_page(conn):
                 "Date",
                 value=today,
                 key="daily_report_single_date",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
             )
             range_start = range_end = single_date
         else:
@@ -30363,7 +30583,7 @@ def reports_page(conn):
                 start_value=today - timedelta(days=7),
                 end_value=today,
                 key_prefix="daily_report_range",
-                help="Enter a date like YYYY-MM-DD, 'tomorrow', or 'next friday'.",
+                help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
             )
         if range_start and range_end:
             if range_end < range_start:
