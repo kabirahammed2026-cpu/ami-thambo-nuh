@@ -4018,9 +4018,9 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
     if not follow_ups.empty:
         for _, row in follow_ups.iterrows():
             follow_date_val = clean_text(row.get("follow_up_date"))
-            follow_dt = pd.to_datetime(follow_date_val, errors="coerce")
+            follow_dt = _parse_display_date(follow_date_val)
             severity = "info"
-            if pd.notna(follow_dt) and follow_dt.date() <= date.today():
+            if follow_dt is not None and follow_dt.date() <= date.today():
                 severity = "warning"
             follow_label = format_follow_up_date(follow_date_val) or (
                 follow_date_val or "(date pending)"
@@ -4077,9 +4077,9 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
     if not warranty_followups.empty:
         for _, row in warranty_followups.iterrows():
             follow_date_val = clean_text(row.get("follow_up_date"))
-            follow_dt = pd.to_datetime(follow_date_val, errors="coerce")
+            follow_dt = _parse_display_date(follow_date_val)
             severity = "info"
-            if pd.notna(follow_dt) and follow_dt.date() <= date.today():
+            if follow_dt is not None and follow_dt.date() <= date.today():
                 severity = "warning"
             follow_label = format_follow_up_date(follow_date_val) or (follow_date_val or "(date pending)")
             customer_label = clean_text(row.get("customer")) or "(unknown)"
@@ -4163,8 +4163,8 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                 reminder_iso = to_iso_date(entry.get("reminder_date"))
                 if not reminder_iso:
                     continue
-                reminder_dt = pd.to_datetime(reminder_iso, errors="coerce")
-                if pd.isna(reminder_dt):
+                reminder_dt = _parse_display_date(reminder_iso)
+                if reminder_dt is None:
                     continue
                 reminder_date = reminder_dt.date()
                 title = _report_reminder_label(entry, template_key)
@@ -4216,8 +4216,8 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
     if not note_alerts.empty:
         for _, row in note_alerts.iterrows():
             remind_on = clean_text(row.get("remind_on"))
-            reminder_dt = pd.to_datetime(remind_on, errors="coerce")
-            reminder_date = reminder_dt.date() if pd.notna(reminder_dt) else None
+            reminder_dt = _parse_display_date(remind_on)
+            reminder_date = reminder_dt.date() if reminder_dt is not None else None
             customer_label = clean_text(row.get("customer")) or "(unknown)"
             note_text = clean_text(row.get("note")) or "Reminder"
             date_label = format_follow_up_date(remind_on) or "(date pending)"
@@ -5081,18 +5081,62 @@ def format_period_label(period_type: str) -> str:
     return REPORT_PERIOD_OPTIONS.get(key, key.title())
 
 
+def _parse_display_date(value: object) -> Optional[pd.Timestamp]:
+    """Parse app dates with explicit format priority to avoid DD/MM ambiguity."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, pd.Timestamp):
+        return value
+    if isinstance(value, datetime):
+        return pd.Timestamp(value)
+    if isinstance(value, date):
+        return pd.Timestamp(datetime.combine(value, dt_time.min))
+
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+
+    explicit_formats = (
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%d-%m-%Y",
+        "%d.%m.%Y",
+        "%d/%m/%Y",
+        "%d/%m/%y",
+    )
+    for fmt in explicit_formats:
+        with contextlib.suppress(ValueError):
+            return pd.Timestamp(datetime.strptime(cleaned, fmt))
+
+    # Final fallback for uncommon formats while keeping day-first preference.
+    with contextlib.suppress(Exception):
+        parsed = pd.to_datetime(cleaned, errors="coerce", dayfirst=True)
+        if pd.notna(parsed):
+            if isinstance(parsed, pd.DatetimeIndex):
+                if len(parsed) == 0:
+                    return None
+                parsed = parsed[0]
+            return pd.Timestamp(parsed)
+    return None
+
+
 def format_period_range(start: Optional[str], end: Optional[str]) -> str:
     def _label(value: Optional[str]) -> Optional[str]:
         if not value:
             return None
-        parsed = pd.to_datetime(value, errors="coerce")
-        if pd.isna(parsed):
+        parsed = _parse_display_date(value)
+        if parsed is None:
             return None
-        if isinstance(parsed, pd.DatetimeIndex):
-            if len(parsed) == 0:
-                return None
-            parsed = parsed[0]
-        return pd.Timestamp(parsed).strftime(DATE_FMT)
+        return parsed.strftime(DATE_FMT)
 
     start_label = _label(start)
     end_label = _label(end)
@@ -5106,17 +5150,10 @@ def format_period_range(start: Optional[str], end: Optional[str]) -> str:
 def format_follow_up_date(value: object) -> str:
     if value is None:
         return ""
-    try:
-        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
-    except Exception:
+    parsed = _parse_display_date(value)
+    if parsed is None:
         return clean_text(value) or ""
-    if pd.isna(parsed):
-        return clean_text(value) or ""
-    if isinstance(parsed, pd.DatetimeIndex):
-        if len(parsed) == 0:
-            return ""
-        parsed = parsed[0]
-    return pd.Timestamp(parsed).strftime(FOLLOW_UP_DATE_FMT)
+    return parsed.strftime(FOLLOW_UP_DATE_FMT)
 
 
 def _clamp_percentage(value: float) -> float:
@@ -9488,6 +9525,8 @@ def init_ui():
             --ps-soft-border: #e5eaf2;
             --ps-soft-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
             --ps-soft-shadow-hover: 0 14px 32px rgba(15, 23, 42, 0.09);
+            --ps-content-max-width: 1320px;
+            --ps-content-gap: 0.85rem;
         }
         html,
         body,
@@ -9540,14 +9579,14 @@ def init_ui():
             margin-bottom: 0.25rem;
         }
         .main .block-container {
-            padding: 0.75rem 1rem 1.6rem !important;
+            padding: 0.95rem 1.15rem 1.9rem !important;
             margin-top: 0 !important;
-            max-width: 1440px !important;
+            max-width: var(--ps-content-max-width) !important;
             margin-left: auto !important;
             margin-right: auto !important;
         }
         [data-testid="stAppViewContainer"] [data-testid="stVerticalBlock"] {
-            gap: 0.75rem;
+            gap: var(--ps-content-gap);
         }
         div[data-testid="stForm"],
         [data-testid="stExpander"],
@@ -9565,6 +9604,10 @@ def init_ui():
         [data-testid="stExpander"] {
             border: 1px solid var(--ps-soft-border);
             background: var(--ps-surface);
+            box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
+        }
+        [data-testid="stExpander"] summary {
+            font-weight: 600;
         }
         [data-testid="stTabs"] [data-baseweb="tab-list"] {
             gap: 0.4rem;
@@ -9590,9 +9633,14 @@ def init_ui():
         div[data-testid="stFormSubmitButton"] > button {
             border-radius: 10px;
             border: 1px solid var(--ps-soft-border);
-            padding: 0.48rem 0.85rem;
+            padding: 0.44rem 0.85rem;
             font-weight: 600;
             transition: all 0.15s ease;
+        }
+        div[data-testid="stButton"] > button[kind="primary"],
+        div[data-testid="stFormSubmitButton"] > button[kind="primary"] {
+            border-color: rgba(37, 99, 235, 0.36);
+            box-shadow: 0 6px 16px rgba(37, 99, 235, 0.18);
         }
         div[data-testid="stButton"] > button:hover,
         div[data-testid="stFormSubmitButton"] > button:hover {
@@ -9622,13 +9670,13 @@ def init_ui():
             display: flex;
             justify-content: space-between;
             align-items: flex-start;
-            gap: 0.8rem;
+            gap: 1rem;
             background: var(--ps-surface);
             border: 1px solid var(--ps-soft-border);
             border-radius: 14px;
-            padding: 0.9rem 1rem;
-            box-shadow: 0 2px 12px rgba(15, 23, 42, 0.05);
-            margin-bottom: 0.35rem;
+            padding: 1rem 1.05rem;
+            box-shadow: 0 4px 16px rgba(15, 23, 42, 0.05);
+            margin-bottom: 0.2rem;
         }
         .ps-page-intro h2 {
             margin: 0;
@@ -9639,22 +9687,28 @@ def init_ui():
             gap: 0.42rem;
         }
         .ps-page-intro p {
-            margin: 0.2rem 0 0;
+            margin: 0.26rem 0 0;
             color: var(--ps-muted);
             font-size: 0.92rem;
-            line-height: 1.45;
+            line-height: 1.5;
+            max-width: 76ch;
         }
         .ps-page-intro-helper {
-            color: var(--ps-muted);
+            color: #1e40af;
             font-size: 0.72rem;
+            font-weight: 600;
+            background: rgba(59, 130, 246, 0.12);
+            border: 1px solid rgba(59, 130, 246, 0.22);
+            border-radius: 999px;
+            padding: 0.2rem 0.5rem;
             white-space: nowrap;
             margin-top: 0.12rem;
         }
         .ps-section-title {
             font-weight: 700;
-            font-size: 1rem;
-            margin-top: 0.25rem;
-            margin-bottom: 0.1rem;
+            font-size: 0.98rem;
+            margin-top: 0.35rem;
+            margin-bottom: 0.22rem;
             letter-spacing: -0.01em;
         }
         .ps-header-action-slot {
@@ -9669,8 +9723,16 @@ def init_ui():
             overflow: hidden;
             background: var(--ps-surface);
         }
+        [data-testid="stDataFrame"] [role="columnheader"] {
+            background: #f8fafc;
+            color: #334155;
+            font-weight: 600;
+        }
+        [data-testid="stCaptionContainer"] p {
+            color: #64748b;
+        }
         hr {
-            margin: 1rem 0 0.75rem;
+            margin: 1.05rem 0 0.8rem;
             border-color: var(--ps-soft-border);
         }
         [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] #ps_nav_anchor) {
@@ -18123,9 +18185,11 @@ def _render_operations_other_manager(conn, *, key_prefix: str) -> None:
 
 
 def operations_page(conn):
-    st.subheader("🛠️ Operations")
-    st.caption(
-        "Review delivery orders, work done, service, maintenance, and other operational records in one place."
+    render_page_intro(
+        "Operations",
+        "Review delivery orders, work done, service, maintenance, and uploads in one focused workflow.",
+        icon="🛠️",
+        helper="Execution hub",
     )
     deep_link = _consume_deep_link("Operations")
     deep_tab = clean_text(deep_link.get("tab")) if isinstance(deep_link, dict) else ""
@@ -18139,9 +18203,9 @@ def operations_page(conn):
     if deep_tab == "documents" and deep_record:
         st.session_state["operations_page_doc_search"] = deep_record
         st.info(f"Filtered documents to record #{deep_record}.")
-    st.markdown("### Customers")
-    st.caption(
-        "Select a customer from the table below to filter the operations documents."
+    render_section_header(
+        "Customers",
+        "Select one customer to scope uploads and operational records without losing full table access.",
     )
     search_query = st.text_input(
         "Search customers",
@@ -19848,9 +19912,10 @@ def warranties_page(conn):
         if deep_warranty_id is not None:
             st.session_state["warranty_followup_select"] = deep_warranty_id
             st.info(f"Jumped to warranty #{deep_warranty_id}.")
-    sort_dir = st.radio("Sort by expiry date", ["Soonest first", "Latest first"], horizontal=True)
+    with st.expander("Warranty filters", expanded=False):
+        sort_dir = st.radio("Sort by expiry date", ["Soonest first", "Latest first"], horizontal=True)
+        q = st.text_input("Search (customer/product/model/serial)")
     order = "ASC" if sort_dir == "Soonest first" else "DESC"
-    q = st.text_input("Search (customer/product/model/serial)")
 
     base = dedent(
         """
@@ -19902,20 +19967,21 @@ def warranties_page(conn):
     expired = format_warranty_table(expired)
     if not is_admin and "Staff" in expired.columns:
         expired = expired.drop(columns=["Staff"])
-    render_section_header("Expired warranties")
-    st.dataframe(expired, use_container_width=True)
+    with st.expander("Expired warranties", expanded=False):
+        st.dataframe(expired, use_container_width=True)
 
     st.markdown("---")
-    render_section_header("Upcoming expiries", "Plan proactive follow-up before warranty deadlines.")
-    col1, col2 = st.columns(2)
-    soon3 = collapse_warranty_rows(fetch_warranty_window(conn, 0, 3))
-    soon60 = collapse_warranty_rows(fetch_warranty_window(conn, 0, 60))
-    with col1:
-        st.caption("Next **3** days")
-        st.dataframe(soon3, use_container_width=True)
-    with col2:
-        st.caption("Next **60** days")
-        st.dataframe(soon60, use_container_width=True)
+    with st.expander("Upcoming expiries", expanded=True):
+        st.caption("Plan proactive follow-up before warranty deadlines.")
+        col1, col2 = st.columns(2)
+        soon3 = collapse_warranty_rows(fetch_warranty_window(conn, 0, 3))
+        soon60 = collapse_warranty_rows(fetch_warranty_window(conn, 0, 60))
+        with col1:
+            st.caption("Next **3** days")
+            st.dataframe(soon3, use_container_width=True)
+        with col2:
+            st.caption("Next **60** days")
+            st.dataframe(soon60, use_container_width=True)
 
     st.markdown("---")
     render_section_header(
@@ -25353,7 +25419,12 @@ def delivery_orders_page(
 
 
 def quotation_page(conn, *, render_id: Optional[int] = None):
-    st.subheader("🧾 Quotation")
+    render_page_intro(
+        "Quotation",
+        "Create quotations, review totals, and manage follow-up from a cleaner single flow.",
+        icon="🧾",
+        helper="Sales workspace",
+    )
     deep_link = _consume_deep_link("Quotation")
     if isinstance(deep_link, dict):
         deep_quote_id = int_or_none(deep_link.get("record_id"))
@@ -29478,7 +29549,12 @@ def manage_import_history(conn):
 
 # ---------- Reports ----------
 def reports_page(conn):
-    st.subheader("📈 Work reports")
+    render_page_intro(
+        "Work reports",
+        "Capture daily, weekly, and monthly updates with less clutter while preserving all reporting depth.",
+        icon="📈",
+        helper="Team cadence",
+    )
     user = get_current_user()
     if not user:
         st.info("Log in to capture and review team reports.")
