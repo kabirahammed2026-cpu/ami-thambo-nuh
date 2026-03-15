@@ -31,7 +31,7 @@ from textwrap import dedent
 import pandas as pd
 import dateparser
 from PIL import Image, ImageOps, ImageEnhance
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 import pytesseract
 
 from openpyxl import load_workbook
@@ -106,6 +106,10 @@ BACKUP_MIRROR_PATH = (
 LOG_PATH = BASE_DIR / "ps_crm.log"
 DEBUG_DIAG = os.getenv("DEBUG_DIAG", "").strip().lower() in {"1", "true", "yes", "on"}
 MAX_UPLOAD_BYTES = _max_upload_bytes_env("PS_MAX_UPLOAD_MB", 25.0)
+UPLOAD_IMAGE_MAX_DIMENSION = 2560
+UPLOAD_IMAGE_JPEG_QUALITY = 82
+UPLOAD_IMAGE_WEBP_QUALITY = 80
+COMPRESSIBLE_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 STRICT_REPORT_WINDOWS = os.getenv("PS_REPORT_STRICT_WINDOWS", "").strip().lower() in {
     "1",
     "true",
@@ -5961,7 +5965,8 @@ def _validate_upload(
     if max_bytes:
         size = getattr(uploaded_file, "size", None)
         if isinstance(size, (int, float)) and size > max_bytes:
-            return f"File exceeds {_format_bytes(max_bytes)} size limit."
+            if ext not in COMPRESSIBLE_UPLOAD_EXTENSIONS:
+                return f"File exceeds {_format_bytes(max_bytes)} size limit."
     return None
 
 
@@ -6009,6 +6014,80 @@ def _safe_read_bytes(path: Optional[Path]) -> Optional[bytes]:
         return None
 
 
+def _compress_pdf_bytes(data: bytes) -> bytes:
+    if not data:
+        return data
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        writer = PdfWriter()
+        for page in reader.pages:
+            try:
+                page.compress_content_streams()
+            except Exception:
+                pass
+            writer.add_page(page)
+        output = io.BytesIO()
+        writer.write(output)
+        compressed = output.getvalue()
+        if compressed and len(compressed) < len(data):
+            return compressed
+    except Exception as exc:
+        _get_logger().info("Skipping PDF compression due to parse/write issue: %s", exc)
+    return data
+
+
+def _compress_image_bytes(data: bytes, suffix: str) -> bytes:
+    if not data:
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img = ImageOps.exif_transpose(img)
+            if UPLOAD_IMAGE_MAX_DIMENSION > 0:
+                img.thumbnail((UPLOAD_IMAGE_MAX_DIMENSION, UPLOAD_IMAGE_MAX_DIMENSION), Image.Resampling.LANCZOS)
+            output = io.BytesIO()
+            ext = (suffix or "").lower()
+            if ext in {".jpg", ".jpeg"}:
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                img.save(
+                    output,
+                    format="JPEG",
+                    quality=max(30, min(95, UPLOAD_IMAGE_JPEG_QUALITY)),
+                    optimize=True,
+                    progressive=True,
+                )
+            elif ext == ".png":
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                img.save(output, format="PNG", optimize=True, compress_level=9)
+            elif ext == ".webp":
+                img.save(
+                    output,
+                    format="WEBP",
+                    quality=max(30, min(95, UPLOAD_IMAGE_WEBP_QUALITY)),
+                    method=6,
+                )
+            else:
+                return data
+            compressed = output.getvalue()
+            if compressed and len(compressed) < len(data):
+                return compressed
+    except Exception as exc:
+        _get_logger().info("Skipping image compression due to decode/encode issue: %s", exc)
+    return data
+
+
+def _standardize_upload_payload(data: bytes, suffix: str) -> bytes:
+    if not data:
+        return data
+    ext = (suffix or "").lower()
+    if ext == ".pdf":
+        return _compress_pdf_bytes(data)
+    if ext in {".png", ".jpg", ".jpeg", ".webp"}:
+        return _compress_image_bytes(data, ext)
+    return data
+
+
 def save_uploaded_file(
     uploaded_file,
     target_dir: Path,
@@ -6022,7 +6101,6 @@ def save_uploaded_file(
     validation_error = _validate_upload(
         uploaded_file,
         allowed_extensions=allowed_extensions,
-        max_bytes=MAX_UPLOAD_BYTES,
     )
     if validation_error:
         _get_logger().warning("Upload rejected: %s", validation_error)
@@ -6051,6 +6129,10 @@ def save_uploaded_file(
         counter += 1
     data = _read_uploaded_bytes(uploaded_file)
     if not data:
+        return None
+    data = _standardize_upload_payload(data, ext)
+    if len(data) > MAX_UPLOAD_BYTES:
+        _get_logger().warning("Upload rejected after optimization: file exceeds %s", _format_bytes(MAX_UPLOAD_BYTES))
         return None
     with open(dest, "wb") as fh:
         fh.write(data)
@@ -6139,7 +6221,6 @@ def store_report_attachment(uploaded_file, *, identifier: Optional[str] = None) 
     validation_error = _validate_upload(
         uploaded_file,
         allowed_extensions={".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".xlsx", ".xls"},
-        max_bytes=MAX_UPLOAD_BYTES,
     )
     if validation_error:
         _get_logger().warning("Report attachment rejected: %s", validation_error)
@@ -6165,6 +6246,10 @@ def store_report_attachment(uploaded_file, *, identifier: Optional[str] = None) 
         counter += 1
     data = _read_uploaded_bytes(uploaded_file)
     if not data:
+        return None
+    data = _standardize_upload_payload(data, suffix)
+    if len(data) > MAX_UPLOAD_BYTES:
+        _get_logger().warning("Report attachment rejected after optimization: file exceeds %s", _format_bytes(MAX_UPLOAD_BYTES))
         return None
     with open(dest, "wb") as fh:
         fh.write(data)
