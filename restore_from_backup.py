@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 import sys
@@ -17,6 +18,9 @@ from ps_sales import load_config
 
 CRM_EXPORT_MARKER = "exports/ps_crm.sql"
 SALES_EXPORT_MARKER = "exports/ps_sales.sql"
+CRM_DB_MARKERS = ("database/ps_crm.db", "ps_crm.db")
+SALES_DB_MARKERS = ("database/ps_sales.db", "ps_sales.db")
+STORAGE_PREFIX_CANDIDATES = ("storage", "uploads", "files")
 
 
 def _detect_app(archive: zipfile.ZipFile) -> Optional[str]:
@@ -24,6 +28,10 @@ def _detect_app(archive: zipfile.ZipFile) -> Optional[str]:
     if CRM_EXPORT_MARKER in names:
         return "crm"
     if SALES_EXPORT_MARKER in names:
+        return "sales"
+    if any(marker in names for marker in CRM_DB_MARKERS):
+        return "crm"
+    if any(marker in names for marker in SALES_DB_MARKERS):
         return "sales"
     return None
 
@@ -93,6 +101,67 @@ def _select_db_candidate(db_dir: Path, app: str) -> Optional[Path]:
     return db_candidates[0]
 
 
+def _select_db_candidate_from_archive(temp_root: Path, app: str) -> Optional[Path]:
+    db_dir = temp_root / "database"
+    selected = _select_db_candidate(db_dir, app) if db_dir.exists() else None
+    if selected is not None:
+        return selected
+    expected_name = "ps_crm.db" if app == "crm" else "ps_sales.db"
+    direct_match = next(
+        (
+            candidate
+            for candidate in temp_root.rglob(expected_name)
+            if candidate.is_file()
+        ),
+        None,
+    )
+    if direct_match is not None:
+        return direct_match
+    db_candidates = sorted(
+        (candidate for candidate in temp_root.rglob("*.db") if candidate.is_file()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    return db_candidates[0] if db_candidates else None
+
+
+def _resolve_storage_root(temp_root: Path) -> Optional[Path]:
+    for prefix in STORAGE_PREFIX_CANDIDATES:
+        candidate = temp_root / prefix
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def _verify_archive_checksums(archive: zipfile.ZipFile) -> tuple[int, int]:
+    try:
+        checksum_blob = archive.read("checksums.txt")
+    except KeyError:
+        return 0, 0
+    expected_lines = [
+        line.strip()
+        for line in checksum_blob.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    verified = 0
+    mismatches = 0
+    for line in expected_lines:
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        expected_hash, entry_name = parts
+        try:
+            payload = archive.read(entry_name)
+        except KeyError:
+            mismatches += 1
+            continue
+        actual_hash = hashlib.sha256(payload).hexdigest()
+        verified += 1
+        if actual_hash != expected_hash:
+            mismatches += 1
+    return verified, mismatches
+
+
 def _backup_existing_db(db_path: Path) -> Optional[Path]:
     if not db_path.exists():
         return None
@@ -122,6 +191,11 @@ def main() -> int:
         action="store_true",
         help="Show what would be restored without writing files.",
     )
+    parser.add_argument(
+        "--strict-checksums",
+        action="store_true",
+        help="Abort restore when checksums.txt exists and any mismatch is detected.",
+    )
 
     args = parser.parse_args()
     archive_path = Path(args.backup).expanduser()
@@ -139,12 +213,23 @@ def main() -> int:
             return 2
 
         data_dir, db_path = _crm_paths(args.data_dir) if app == "crm" else _sales_paths(args.data_dir)
-        storage_prefix = Path("storage")
-        db_prefix = Path("database")
+        verified_checksums, checksum_mismatches = _verify_archive_checksums(archive)
+        if verified_checksums:
+            status = f"Checksum verification: {verified_checksums} file(s) checked"
+            if checksum_mismatches:
+                status += f", mismatches={checksum_mismatches}"
+            print(status)
+            if args.strict_checksums and checksum_mismatches:
+                print("Checksum mismatches detected; aborting due to --strict-checksums.", file=sys.stderr)
+                return 2
 
         if args.dry_run:
-            storage_files = [name for name in archive.namelist() if name.startswith("storage/")]
-            db_files = [name for name in archive.namelist() if name.startswith("database/")]
+            storage_files = [
+                name
+                for name in archive.namelist()
+                if any(name.startswith(f"{prefix}/") for prefix in STORAGE_PREFIX_CANDIDATES)
+            ]
+            db_files = [name for name in archive.namelist() if name.endswith(".db")]
             print(f"App: {app}")
             print(f"Data dir: {data_dir}")
             print(f"Database path: {db_path}")
@@ -155,10 +240,8 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_root = Path(tmpdir)
             _safe_extract_archive(archive, temp_root)
-            storage_dir = temp_root / storage_prefix
-            db_dir = temp_root / db_prefix
-
-            selected_db = _select_db_candidate(db_dir, app) if db_dir.exists() else None
+            storage_dir = _resolve_storage_root(temp_root)
+            selected_db = _select_db_candidate_from_archive(temp_root, app)
 
             if selected_db is not None:
                 backup_path = _backup_existing_db(db_path)
@@ -170,7 +253,7 @@ def main() -> int:
             else:
                 print("No database file found in archive; skipping DB restore.")
 
-            if storage_dir.exists():
+            if storage_dir is not None and storage_dir.exists():
                 data_dir.mkdir(parents=True, exist_ok=True)
                 copied = _copy_tree(storage_dir, data_dir)
                 print(f"Restored {len(copied)} storage files into {data_dir}")
