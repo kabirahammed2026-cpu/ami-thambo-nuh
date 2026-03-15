@@ -78,14 +78,34 @@ FOLLOW_UP_INPUT_PLACEHOLDER = "DD.MM.YYYY"
 DEFAULT_REMINDER_TIME = dt_time(9, 0)
 CURRENCY_SYMBOL = os.getenv("APP_CURRENCY_SYMBOL", "৳")
 BACKUP_DIR = BASE_DIR / "backups"
-BACKUP_RETENTION_COUNT = int(os.getenv("PS_CRM_BACKUP_RETENTION", "12"))
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _max_upload_bytes_env(name: str, default_mb: float) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return int(default_mb * 1024 * 1024)
+    try:
+        return int(float(raw) * 1024 * 1024)
+    except ValueError:
+        return int(default_mb * 1024 * 1024)
+
+
+BACKUP_RETENTION_COUNT = _int_env("PS_CRM_BACKUP_RETENTION", 12)
 BACKUP_MIRROR_DIR = os.getenv("PS_CRM_BACKUP_MIRROR_DIR")
 BACKUP_MIRROR_PATH = (
     Path(BACKUP_MIRROR_DIR).expanduser() if BACKUP_MIRROR_DIR else None
 )
 LOG_PATH = BASE_DIR / "ps_crm.log"
 DEBUG_DIAG = os.getenv("DEBUG_DIAG", "").strip().lower() in {"1", "true", "yes", "on"}
-MAX_UPLOAD_BYTES = int(float(os.getenv("PS_MAX_UPLOAD_MB", "25")) * 1024 * 1024)
+MAX_UPLOAD_BYTES = _max_upload_bytes_env("PS_MAX_UPLOAD_MB", 25.0)
 STRICT_REPORT_WINDOWS = os.getenv("PS_REPORT_STRICT_WINDOWS", "").strip().lower() in {
     "1",
     "true",
@@ -106,7 +126,7 @@ QUOTATION_RECEIPT_DIR = UPLOADS_DIR / "quotation_receipts"
 QUOTATION_DOCS_DIR = UPLOADS_DIR / "quotation_documents"
 DELIVERY_RECEIPT_DIR = UPLOADS_DIR / "delivery_receipts"
 DOCUMENT_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"}
-QUOTATION_EDITOR_PORT = int(os.getenv("QUOTATION_EDITOR_PORT", "8502"))
+QUOTATION_EDITOR_PORT = _int_env("QUOTATION_EDITOR_PORT", 8502)
 
 DEFAULT_QUOTATION_VALID_DAYS = 30
 OPERATIONS_CUSTOMER_PREVIEW_LIMIT = 500

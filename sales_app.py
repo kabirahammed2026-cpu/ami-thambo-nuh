@@ -58,14 +58,36 @@ PASSWORD_SERVICE = PasswordService.default()
 LOCKOUT_SERVICE = AccountLockoutService(CONFIG, USER_REPOSITORY)
 UPLOAD_MANAGER = UploadManager(CONFIG)
 BACKUP_DIR = CONFIG.data_dir / "backups"
-BACKUP_RETENTION_COUNT = int(os.getenv("PS_SALES_BACKUP_RETENTION", "12"))
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _max_upload_bytes_env(name: str, default_mb: float) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return int(default_mb * 1024 * 1024)
+    try:
+        return int(float(raw) * 1024 * 1024)
+    except ValueError:
+        return int(default_mb * 1024 * 1024)
+
+
+BACKUP_RETENTION_COUNT = _int_env("PS_SALES_BACKUP_RETENTION", 12)
 BACKUP_MIRROR_DIR = os.getenv("PS_SALES_BACKUP_MIRROR_DIR")
 BACKUP_MIRROR_PATH = (
     Path(BACKUP_MIRROR_DIR).expanduser() if BACKUP_MIRROR_DIR else None
 )
 LOG_PATH = CONFIG.data_dir / "ps_sales.log"
 DEBUG_DIAG = os.getenv("DEBUG_DIAG", "").strip().lower() in {"1", "true", "yes", "on"}
-MAX_UPLOAD_BYTES = int(float(os.getenv("PS_SALES_MAX_UPLOAD_MB", "25")) * 1024 * 1024)
+MAX_UPLOAD_BYTES = _max_upload_bytes_env("PS_SALES_MAX_UPLOAD_MB", 25.0)
 
 
 DEFAULT_QUOTATION_STATUSES: Tuple[str, ...] = (
