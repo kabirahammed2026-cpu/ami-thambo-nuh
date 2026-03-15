@@ -3904,15 +3904,56 @@ def _notification_read_store() -> set[str]:
 
 
 def _notification_entry_id(entry: Mapping[str, object]) -> str:
+    deep_link_value = entry.get("deep_link") if isinstance(entry.get("deep_link"), dict) else None
+    details_value = entry.get("details") if isinstance(entry.get("details"), (list, tuple, set)) else []
+    detail_preview = [clean_text(item) or "" for item in list(details_value)[:4]]
     payload = {
+        "id": clean_text(entry.get("id")) or "",
+        "reminder_id": int_or_none(entry.get("reminder_id")),
+        "entity_type": clean_text(entry.get("entity_type")) or "",
+        "entity_id": clean_text(entry.get("entity_id")) or "",
         "title": clean_text(entry.get("title")) or "",
         "message": clean_text(entry.get("message")) or "",
         "severity": clean_text(entry.get("severity")) or "info",
         "timestamp": clean_text(entry.get("timestamp")) or "",
-        "deep_link": entry.get("deep_link") if isinstance(entry.get("deep_link"), dict) else None,
+        "details": detail_preview,
+        "deep_link": deep_link_value,
     }
     digest = hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     return digest
+
+
+def _notification_widget_uid(
+    entry: Mapping[str, object],
+    *,
+    section_id: str,
+    index: int,
+) -> str:
+    base_id = clean_text(entry.get("id")) or _notification_entry_id(entry)
+    safe_section = clean_text(section_id) or "section"
+    return f"{safe_section}_{base_id}_{max(0, int(index))}"
+
+
+def _normalize_notification_entries(
+    entries: Iterable[Mapping[str, object]],
+    *,
+    section_id: str,
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    seen_widget_ids: set[str] = set()
+    for idx, raw in enumerate(entries):
+        if not isinstance(raw, Mapping):
+            continue
+        entry = dict(raw)
+        entry_id = clean_text(entry.get("id")) or _notification_entry_id(entry)
+        entry["id"] = entry_id
+        widget_uid = _notification_widget_uid(entry, section_id=section_id, index=idx)
+        if widget_uid in seen_widget_ids:
+            widget_uid = _notification_widget_uid(entry, section_id=section_id, index=idx + len(normalized) + 1)
+        seen_widget_ids.add(widget_uid)
+        entry["_widget_uid"] = widget_uid
+        normalized.append(entry)
+    return normalized
 
 
 def _is_notification_read(entry: Mapping[str, object]) -> bool:
@@ -14634,8 +14675,9 @@ def _render_notification_entry(entry: dict[str, object], *, include_actor: bool 
     st.markdown(f"{icon} **{title}**")
     if message:
         st.caption(message)
-    details = entry.get("details") or []
-    detail_preview = list(details)[:2]
+    details_raw = entry.get("details")
+    details = list(details_raw) if isinstance(details_raw, (list, tuple, set)) else []
+    detail_preview = [clean_text(detail) or "" for detail in details[:2] if clean_text(detail)]
     for detail in detail_preview:
         st.caption(f"• {detail}")
     if len(details) > len(detail_preview):
@@ -14671,8 +14713,12 @@ def _render_notification_section(
     include_actor: bool = False,
     heading: Optional[str] = None,
     allow_resolve: bool = False,
+    section_id: str = "notifications",
 ) -> None:
     if not entries:
+        return
+    normalized_entries = _normalize_notification_entries(entries, section_id=section_id)
+    if not normalized_entries:
         return
     if heading:
         st.markdown(
@@ -14680,42 +14726,50 @@ def _render_notification_section(
             unsafe_allow_html=True,
         )
     first = True
-    for entry in entries:
+    for entry in normalized_entries:
         if not first:
             st.divider()
-        row_cols = st.columns([0.68, 0.16, 0.16])
-        with row_cols[0]:
-            _render_notification_entry(entry, include_actor=include_actor)
-        with row_cols[1]:
-            deep_link = entry.get("deep_link") if isinstance(entry.get("deep_link"), dict) else None
-            if deep_link:
-                if st.button("Open", key=f"notification_open_{_notification_entry_id(entry)}", use_container_width=True):
-                    _set_notification_read(entry, True)
-                    _activate_notification_deep_link(deep_link)
-                    _safe_rerun()
-        with row_cols[2]:
-            reminder_id = int_or_none(entry.get("reminder_id"))
-            if allow_resolve and conn is not None and not bool(entry.get("resolved")) and reminder_id is not None:
-                resolved_clicked = st.button(
-                    "✅",
-                    key=f"notification_resolve_{reminder_id}",
-                    help="Mark reminder as resolved",
-                    use_container_width=True,
-                )
-                if _guard_double_submit(
-                    f"notification_resolve_{reminder_id}",
-                    resolved_clicked,
-                ):
-                    if _resolve_notification_reminder(conn, reminder_id):
+        widget_uid = clean_text(entry.get("_widget_uid")) or _notification_widget_uid(
+            entry,
+            section_id=section_id,
+            index=0,
+        )
+        try:
+            row_cols = st.columns([0.68, 0.16, 0.16])
+            with row_cols[0]:
+                _render_notification_entry(entry, include_actor=include_actor)
+            with row_cols[1]:
+                deep_link = entry.get("deep_link") if isinstance(entry.get("deep_link"), dict) else None
+                if deep_link:
+                    if st.button("Open", key=f"notification_open_{widget_uid}", use_container_width=True):
                         _set_notification_read(entry, True)
-                        st.success("Reminder resolved.")
+                        _activate_notification_deep_link(deep_link)
                         _safe_rerun()
-            else:
-                read_now = _is_notification_read(entry)
-                label = "Read" if read_now else "Unread"
-                if st.button(label, key=f"notification_read_{_notification_entry_id(entry)}", use_container_width=True):
-                    _set_notification_read(entry, not read_now)
-                    _safe_rerun()
+            with row_cols[2]:
+                reminder_id = int_or_none(entry.get("reminder_id"))
+                if allow_resolve and conn is not None and not bool(entry.get("resolved")) and reminder_id is not None:
+                    resolved_clicked = st.button(
+                        "✅",
+                        key=f"notification_resolve_{widget_uid}",
+                        help="Mark reminder as resolved",
+                        use_container_width=True,
+                    )
+                    if _guard_double_submit(
+                        f"notification_resolve_{widget_uid}",
+                        resolved_clicked,
+                    ):
+                        if _resolve_notification_reminder(conn, reminder_id):
+                            _set_notification_read(entry, True)
+                            st.success("Reminder resolved.")
+                            _safe_rerun()
+                else:
+                    read_now = _is_notification_read(entry)
+                    label = "Read" if read_now else "Unread"
+                    if st.button(label, key=f"notification_read_{widget_uid}", use_container_width=True):
+                        _set_notification_read(entry, not read_now)
+                        _safe_rerun()
+        except Exception:
+            st.caption("⚠️ This notification could not be rendered.")
         first = False
 
 
@@ -14734,6 +14788,7 @@ def _render_notification_body(
         conn=conn,
         heading="Reminders",
         allow_resolve=True,
+        section_id="reminders",
     )
     if resolved_reminders:
         with st.expander(f"Resolved notifications ({len(resolved_reminders)})", expanded=False):
@@ -14741,9 +14796,10 @@ def _render_notification_body(
                 resolved_reminders,
                 conn=conn,
                 heading=None,
+                section_id="resolved_reminders",
             )
     if alerts:
-        _render_notification_section(alerts, conn=conn, heading="Alerts")
+        _render_notification_section(alerts, conn=conn, heading="Alerts", section_id="alerts")
     if activity:
         with st.expander(f"Recent activity ({len(activity)})", expanded=False):
             _render_notification_section(
@@ -14751,6 +14807,7 @@ def _render_notification_body(
                 conn=conn,
                 include_actor=True,
                 heading=None,
+                section_id="activity",
             )
 
 
