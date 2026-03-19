@@ -20277,89 +20277,87 @@ def warranties_page(conn):
         submit_followup = st.form_submit_button("Save reminder", type="primary")
 
     if submit_followup:
-        note_value = clean_text(note_input)
-        if not note_value:
-            st.error("Remark text is required.")
-        else:
-            tagged_note = f"[Warranty #{selected_warranty}] {note_value}"
-            reminder_iso = to_iso_date(reminder_date)
-            follow_up_status = "completed" if not reminder_iso else "pending"
-            if reminder_iso:
-                reminder_dt = pd.to_datetime(reminder_iso, errors="coerce")
-                if pd.notna(reminder_dt) and reminder_dt.date() < date.today():
-                    follow_up_status = "overdue"
-            follow_up_history = clean_text(selected_record.get("follow_up_history")) or ""
-            note_clean = note_value.strip()
-            if note_clean:
-                history_entry = f"{date.today().isoformat()}: {note_clean}"
-                follow_up_history = (
-                    f"{follow_up_history}\n{history_entry}".strip()
-                    if follow_up_history
-                    else history_entry
+        note_value = clean_text(note_input) or ""
+        note_for_record = note_value or "Warranty follow-up"
+        tagged_note = f"[Warranty #{selected_warranty}] {note_for_record}"
+        reminder_iso = to_iso_date(reminder_date)
+        follow_up_status = "completed" if not reminder_iso else "pending"
+        if reminder_iso:
+            reminder_dt = pd.to_datetime(reminder_iso, errors="coerce")
+            if pd.notna(reminder_dt) and reminder_dt.date() < date.today():
+                follow_up_status = "overdue"
+        follow_up_history = clean_text(selected_record.get("follow_up_history")) or ""
+        note_clean = note_value.strip()
+        if note_clean:
+            history_entry = f"{date.today().isoformat()}: {note_clean}"
+            follow_up_history = (
+                f"{follow_up_history}\n{history_entry}".strip()
+                if follow_up_history
+                else history_entry
+            )
+        existing_note = df_query(
+            conn,
+            """
+            SELECT note_id
+            FROM customer_notes
+            WHERE customer_id = ?
+              AND note LIKE ?
+            ORDER BY datetime(created_at) DESC
+            LIMIT 1
+            """,
+            (int(selected_record["customer_id"]), f"[Warranty #{selected_warranty}]%"),
+        )
+        note_id = None
+        if not existing_note.empty:
+            note_id = int_or_none(existing_note.iloc[0].get("note_id"))
+            if note_id is not None:
+                conn.execute(
+                    "UPDATE customer_notes SET note=?, remind_on=?, is_done=0 WHERE note_id=?",
+                    (tagged_note, reminder_iso, int(note_id)),
                 )
-            existing_note = df_query(
+        if note_id is None:
+            cur = conn.execute(
+                "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
+                (int(selected_record["customer_id"]), tagged_note, reminder_iso),
+            )
+            note_id = cur.lastrowid
+        if note_id:
+            follow_up_source = st.session_state.get(
+                f"warranty_followup_reminder_{selected_warranty}__raw"
+            )
+            message = "Warranty follow-up"
+            if note_value:
+                message = f"{message}: {note_value}"
+            sync_follow_up_reminder(
                 conn,
-                """
-                SELECT note_id
-                FROM customer_notes
-                WHERE customer_id = ?
-                  AND note LIKE ?
-                ORDER BY datetime(created_at) DESC
-                LIMIT 1
-                """,
-                (int(selected_record["customer_id"]), f"[Warranty #{selected_warranty}]%"),
+                entity_type="customer_note",
+                entity_id=int(note_id),
+                follow_up_text=follow_up_source,
+                fallback_date=reminder_iso,
+                message=message,
             )
-            note_id = None
-            if not existing_note.empty:
-                note_id = int_or_none(existing_note.iloc[0].get("note_id"))
-                if note_id is not None:
-                    conn.execute(
-                        "UPDATE customer_notes SET note=?, remind_on=?, is_done=0 WHERE note_id=?",
-                        (tagged_note, reminder_iso, int(note_id)),
-                    )
-            if note_id is None:
-                cur = conn.execute(
-                    "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
-                    (int(selected_record["customer_id"]), tagged_note, reminder_iso),
-                )
-                note_id = cur.lastrowid
-            if note_id:
-                follow_up_source = st.session_state.get(
-                    f"warranty_followup_reminder_{selected_warranty}__raw"
-                )
-                message = "Warranty follow-up"
-                if note_value:
-                    message = f"{message}: {note_value}"
-                sync_follow_up_reminder(
-                    conn,
-                    entity_type="customer_note",
-                    entity_id=int(note_id),
-                    follow_up_text=follow_up_source,
-                    fallback_date=reminder_iso,
-                    message=message,
-                )
-            conn.execute(
-                """
-                UPDATE warranties
-                SET remarks=?,
-                    follow_up_status=?,
-                    follow_up_notes=?,
-                    follow_up_date=?,
-                    follow_up_history=?
-                WHERE warranty_id=?
-                """,
-                (
-                    note_value,
-                    follow_up_status,
-                    note_value,
-                    reminder_iso,
-                    follow_up_history or None,
-                    int(selected_warranty),
-                ),
-            )
-            conn.commit()
-            st.success("Warranty reminder saved.")
-            _safe_rerun()
+        conn.execute(
+            """
+            UPDATE warranties
+            SET remarks=?,
+                follow_up_status=?,
+                follow_up_notes=?,
+                follow_up_date=?,
+                follow_up_history=?
+            WHERE warranty_id=?
+            """,
+            (
+                note_value or None,
+                follow_up_status,
+                note_value or None,
+                reminder_iso,
+                follow_up_history or None,
+                int(selected_warranty),
+            ),
+        )
+        conn.commit()
+        st.success("Warranty reminder saved.")
+        _safe_rerun()
 
     saved_followups = df_query(
         conn,
