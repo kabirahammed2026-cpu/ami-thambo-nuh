@@ -2444,6 +2444,44 @@ def accessible_customer_ids(conn) -> Optional[set[int]]:
     return ids
 
 
+def render_focus_highlight(label: str, detail: Optional[str] = None) -> None:
+    title = clean_text(label) or "Focused record"
+    detail_text = clean_text(detail) or ""
+    detail_html = f"<div style='margin-top:0.2rem'>{html.escape(detail_text)}</div>" if detail_text else ""
+    st.markdown(
+        (
+            "<div style='border-left:6px solid #f97316; background:#fff7ed; color:#7c2d12; "
+            "padding:0.55rem 0.7rem; border-radius:0.4rem; margin:0.35rem 0 0.7rem 0;'>"
+            f"<strong>📌 {html.escape(title)}</strong>{detail_html}</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def maintenance_scope_filter(alias: str = "m") -> tuple[str, tuple[object, ...]]:
+    if current_user_is_admin():
+        return "", ()
+    user_id = current_user_id()
+    if user_id is None:
+        return "1=0", ()
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}created_by = ?", (int(user_id),)
+
+
+def filter_maintenance_records_for_view(
+    maintenance_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if maintenance_df is None or maintenance_df.empty:
+        return maintenance_df
+    if current_user_is_admin():
+        return maintenance_df
+    viewer_id = current_user_id()
+    if viewer_id is None:
+        return maintenance_df.iloc[0:0].copy()
+    creator = pd.to_numeric(maintenance_df.get("created_by"), errors="coerce")
+    return maintenance_df[creator == int(viewer_id)]
+
+
 def filter_delivery_orders_for_view(
     do_df: pd.DataFrame,
     allowed_customers: Optional[set[int]],
@@ -2795,8 +2833,8 @@ def fetch_sales_metrics(conn, scope_clause: str, scope_params: tuple[object, ...
         ]
         params: list[object] = []
         if not is_admin and user_id is not None:
-            filters.append("(m.created_by = ? OR c.created_by = ?)")
-            params.extend([user_id, user_id])
+            filters.append("m.created_by = ?")
+            params.append(user_id)
         query = dedent(
             f"""
             SELECT COALESCE(SUM(m.total_amount), 0) AS total
@@ -4006,9 +4044,19 @@ def _activate_notification_deep_link(link: Mapping[str, object]) -> None:
         "tab": clean_text(link.get("tab")) or "",
         "record_id": clean_text(link.get("record_id")) or "",
         "highlight": "1" if bool(link.get("highlight")) else "",
+        "anchor": clean_text(link.get("anchor")) or "",
     }
-    payload["token"] = "|".join([payload["page"], payload["tab"], payload["record_id"], payload["highlight"]])
+    payload["token"] = "|".join(
+        [
+            payload["page"],
+            payload["tab"],
+            payload["record_id"],
+            payload["highlight"],
+            payload["anchor"],
+        ]
+    )
     st.session_state["pending_deep_link"] = payload
+    _persist_deep_link_query_params(payload)
     st.session_state["nav_page"] = page
     st.session_state["page"] = page
     st.session_state["nav_selection_top"] = page
@@ -4421,10 +4469,10 @@ def _deep_link_for_entity(
         "customer": {"page": "Customers"},
         "warranty": {"page": "Warranties"},
         "report": {"page": "Reports"},
-        "delivery_order": {"page": "Operations", "tab": "delivery_orders"},
-        "work_done": {"page": "Operations", "tab": "work_done"},
-        "service": {"page": "Operations", "tab": "service"},
-        "maintenance": {"page": "Operations", "tab": "maintenance"},
+        "delivery_order": {"page": "Operations", "tab": "delivery_orders", "anchor": "delivery_list"},
+        "work_done": {"page": "Operations", "tab": "work_done", "anchor": "work_done_list"},
+        "service": {"page": "Operations", "tab": "service", "anchor": "service_editor"},
+        "maintenance": {"page": "Operations", "tab": "maintenance", "anchor": "maintenance_editor"},
         "operations_other": {"page": "Operations", "tab": "other_uploads"},
         "customer_document": {"page": "Operations", "tab": "documents"},
     }
@@ -10081,6 +10129,7 @@ DEEP_LINK_PAGE_PARAM = "page"
 DEEP_LINK_TAB_PARAM = "tab"
 DEEP_LINK_ID_PARAM = "id"
 DEEP_LINK_HIGHLIGHT_PARAM = "highlight"
+DEEP_LINK_ANCHOR_PARAM = "anchor"
 
 
 def _session_duration_days() -> float:
@@ -10129,6 +10178,7 @@ def _build_deep_link_url(
     page: str,
     tab: Optional[str] = None,
     record_id: Optional[str] = None,
+    anchor: Optional[str] = None,
     highlight: bool = False,
 ) -> str:
     payload = {
@@ -10141,6 +10191,8 @@ def _build_deep_link_url(
         payload[DEEP_LINK_TAB_PARAM] = tab
     if record_id:
         payload[DEEP_LINK_ID_PARAM] = record_id
+    if anchor:
+        payload[DEEP_LINK_ANCHOR_PARAM] = anchor
     if highlight:
         payload[DEEP_LINK_HIGHLIGHT_PARAM] = "1"
     return f"?{urllib.parse.urlencode(payload)}"
@@ -10160,7 +10212,35 @@ def _extract_deep_link(pages: list[str]) -> Optional[dict[str, str]]:
         "tab": _read_query_param(params, DEEP_LINK_TAB_PARAM) or "",
         "record_id": _read_query_param(params, DEEP_LINK_ID_PARAM) or "",
         "highlight": _read_query_param(params, DEEP_LINK_HIGHLIGHT_PARAM) or "",
+        "anchor": _read_query_param(params, DEEP_LINK_ANCHOR_PARAM) or "",
     }
+
+
+def _persist_deep_link_query_params(payload: Mapping[str, object]) -> None:
+    page = clean_text(payload.get("page"))
+    if not page:
+        return
+    st.query_params[DEEP_LINK_PAGE_PARAM] = page
+    tab = clean_text(payload.get("tab"))
+    record_id = clean_text(payload.get("record_id"))
+    highlight = clean_text(payload.get("highlight"))
+    anchor = clean_text(payload.get("anchor"))
+    if tab:
+        st.query_params[DEEP_LINK_TAB_PARAM] = tab
+    elif DEEP_LINK_TAB_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_TAB_PARAM]
+    if record_id:
+        st.query_params[DEEP_LINK_ID_PARAM] = record_id
+    elif DEEP_LINK_ID_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_ID_PARAM]
+    if highlight:
+        st.query_params[DEEP_LINK_HIGHLIGHT_PARAM] = highlight
+    elif DEEP_LINK_HIGHLIGHT_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_HIGHLIGHT_PARAM]
+    if anchor:
+        st.query_params[DEEP_LINK_ANCHOR_PARAM] = anchor
+    elif DEEP_LINK_ANCHOR_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_ANCHOR_PARAM]
 
 
 def _consume_deep_link(page: str) -> Optional[dict[str, str]]:
@@ -11641,11 +11721,7 @@ def dashboard(conn):
                     lambda value: pd.notna(value) and int(value) in allowed_customers
                 )
             ]
-            staff_maintenance_df = staff_maintenance_df[
-                staff_maintenance_df["customer_id"].apply(
-                    lambda value: pd.notna(value) and int(value) in allowed_customers
-                )
-            ]
+        staff_maintenance_df = filter_maintenance_records_for_view(staff_maintenance_df)
 
         def _format_payment_label(value: Optional[str]) -> str:
             cleaned = (clean_text(value) or "").lower().replace("_", " ").strip()
@@ -13003,24 +13079,7 @@ def dashboard(conn):
             {maintenance_limit}
             """,
         )
-        if allowed_customers is not None:
-            recent_maintenance = recent_maintenance[
-                recent_maintenance.apply(
-                    lambda row: any(
-                        cid in allowed_customers
-                        for cid in [
-                            int(row.get("customer_id"))
-                            if pd.notna(row.get("customer_id"))
-                            else None,
-                            int(row.get("do_customer_id"))
-                            if pd.notna(row.get("do_customer_id"))
-                            else None,
-                        ]
-                        if cid is not None
-                    ),
-                    axis=1,
-                )
-            ]
+        recent_maintenance = filter_maintenance_records_for_view(recent_maintenance)
         recent_maintenance = fmt_dates(recent_maintenance, ["maintenance_date"])
         st.dataframe(
             recent_maintenance.rename(
@@ -18356,6 +18415,7 @@ def operations_page(conn):
     deep_link = _consume_deep_link("Operations")
     deep_tab = clean_text(deep_link.get("tab")) if isinstance(deep_link, dict) else ""
     deep_record = clean_text(deep_link.get("record_id")) if isinstance(deep_link, dict) else ""
+    deep_anchor = clean_text(deep_link.get("anchor")) if isinstance(deep_link, dict) else ""
     if deep_tab == "service" and deep_record:
         st.session_state["service_edit_select"] = int_or_none(deep_record)
     if deep_tab == "maintenance" and deep_record:
@@ -18595,7 +18655,12 @@ def operations_page(conn):
         _render_service_section(conn, show_heading=False)
     elif selected_tab == "Maintenance":
         st.markdown("### Maintenance records")
-        _render_maintenance_section(conn, show_heading=False)
+        _render_maintenance_section(
+            conn,
+            show_heading=False,
+            highlight_record=deep_record if deep_tab == "maintenance" else None,
+            highlight_anchor=deep_anchor if deep_tab == "maintenance" else None,
+        )
     elif selected_tab == "Other uploads":
         _render_operations_other_manager(conn, key_prefix="operations_page")
 
@@ -24183,14 +24248,19 @@ def advanced_search_page(conn):
         )
 
 
-def _render_maintenance_section(conn, *, show_heading: bool = True):
+def _render_maintenance_section(
+    conn,
+    *,
+    show_heading: bool = True,
+    highlight_record: Optional[str] = None,
+    highlight_anchor: Optional[str] = None,
+):
     if show_heading:
         st.subheader("🔧 Maintenance Records")
     _, customer_label_map = build_customer_groups(conn, only_complete=False)
     customer_options, customer_labels, _, label_by_id = fetch_customer_choices(
         conn, only_complete=False
     )
-    viewer_id = current_user_id()
     do_df = df_query(
         conn,
         """
@@ -24203,9 +24273,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         """,
     )
     allowed_customers = accessible_customer_ids(conn)
-    do_df = filter_delivery_orders_for_view(
-        do_df, allowed_customers, record_types={"delivery_order"}
-    )
+    do_df = filter_delivery_orders_for_view(do_df, allowed_customers, record_types={"delivery_order"})
     do_options = [None]
     do_labels = {None: "No delivery order (manual entry)"}
     do_customer_map = {}
@@ -24454,9 +24522,11 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             _mark_data_changed("operations")
             _safe_rerun()
 
+    maintenance_scope_clause, maintenance_scope_params = maintenance_scope_filter("m")
+    maintenance_scope_sql = f" AND {maintenance_scope_clause}" if maintenance_scope_clause else ""
     maintenance_df = df_query(
         conn,
-        """
+        f"""
         SELECT m.maintenance_id,
                m.customer_id,
                d.customer_id AS do_customer_id,
@@ -24481,28 +24551,13 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
         LEFT JOIN maintenance_documents md ON md.maintenance_id = m.maintenance_id
         WHERE m.deleted_at IS NULL
+          {maintenance_scope_sql}
         GROUP BY m.maintenance_id
         ORDER BY datetime(COALESCE(m.maintenance_start_date, m.maintenance_date)) DESC, m.maintenance_id DESC
         """,
+        maintenance_scope_params,
     )
-    if allowed_customers is not None:
-        def _maintenance_row_allowed(row):
-            maint_cust = row.get("customer_id")
-            do_cust = row.get("do_customer_id")
-            creator_id = row.get("created_by")
-            candidates = []
-            if pd.notna(maint_cust):
-                candidates.append(int(maint_cust))
-            if pd.notna(do_cust):
-                candidates.append(int(do_cust))
-            try:
-                if viewer_id is not None and pd.notna(creator_id) and int(creator_id) == int(viewer_id):
-                    return True
-            except Exception:
-                pass
-            return any(cid in allowed_customers for cid in candidates)
-
-        maintenance_df = maintenance_df[maintenance_df.apply(_maintenance_row_allowed, axis=1)]
+    maintenance_df = filter_maintenance_records_for_view(maintenance_df)
     if not maintenance_df.empty:
         maintenance_df = fmt_dates(
             maintenance_df,
@@ -24610,6 +24665,24 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             format_func=lambda rid: labels.get(rid, str(rid)),
             key="maintenance_edit_select",
         )
+        highlight_id = int_or_none(highlight_record)
+        if highlight_id is not None and highlight_id in options:
+            st.session_state["maintenance_edit_select"] = highlight_id
+            selected_maintenance_id = highlight_id
+            render_focus_highlight(
+                "Notification focus: maintenance record",
+                labels.get(highlight_id, f"Maintenance #{highlight_id}"),
+            )
+        elif highlight_record:
+            render_focus_highlight(
+                "Notification focus",
+                f"Maintenance record #{highlight_record} is not visible in your scope.",
+            )
+        if clean_text(highlight_anchor) in {"maintenance_editor", "maintenance_history"} and not highlight_record:
+            render_focus_highlight(
+                "Notification focus",
+                "Maintenance section opened from notification.",
+            )
         selected_record = next(r for r in records if int(r["maintenance_id"]) == int(selected_maintenance_id))
         new_status = st.selectbox(
             "Status",
@@ -26995,6 +27068,9 @@ def parse_human_date(value: object) -> Optional[datetime]:
         cleaned = value.strip()
         if not cleaned:
             return None
+        explicit = _parse_display_date(cleaned)
+        if explicit is not None:
+            return explicit.to_pydatetime()
         parsed = dateparser.parse(
             cleaned,
             settings={
@@ -31592,10 +31668,12 @@ def _run_main_app() -> None:
                 deep_link.get("tab", ""),
                 deep_link.get("record_id", ""),
                 deep_link.get("highlight", ""),
+                deep_link.get("anchor", ""),
             ]
         )
         deep_link["token"] = token
         st.session_state["pending_deep_link"] = deep_link
+        _persist_deep_link_query_params(deep_link)
         st.session_state["nav_page"] = deep_link["page"]
         st.session_state["page"] = deep_link["page"]
         st.session_state["nav_selection_top"] = deep_link["page"]

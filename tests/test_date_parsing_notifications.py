@@ -32,3 +32,13 @@ def test_format_follow_up_date_is_stable_across_supported_inputs():
 def test_format_period_range_uses_consistent_parsing_for_start_and_end():
     label = app.format_period_range("04/03/2026", "06/03/2026")
     assert label == "04-03-2026 → 06-03-2026"
+
+
+def test_parse_human_date_prefers_explicit_day_first_for_ambiguous_numeric_dates():
+    parsed = app.parse_human_date("04/03/2026")
+    assert parsed is not None
+    assert parsed.date() == dt.date(2026, 3, 4)
+
+
+def test_to_iso_date_keeps_report_reminder_dates_aligned_with_display_parser():
+    assert app.to_iso_date("04/03/2026") == "2026-03-04"
