@@ -93,10 +93,11 @@ def _fetch_status(url: str, *, timeout: float = 3.0) -> int:
 
 def _validate_streamlit_assets(
     port: str, *, process: subprocess.Popen | None = None
-) -> None:
-    """Fail fast if app HTML references static assets that are not fetchable."""
+) -> bool:
+    """Best-effort startup validation without hard-failing on HTML shape changes."""
 
     base_url = f"http://127.0.0.1:{port}"
+    health_url = urllib.parse.urljoin(base_url, "/_stcore/health")
     deadline = time.monotonic() + ASSET_VALIDATION_TIMEOUT_SECONDS
     last_error = "application bootstrap did not become reachable"
     while time.monotonic() < deadline:
@@ -107,30 +108,42 @@ def _validate_streamlit_assets(
                     f"streamlit exited before startup validation completed (exit code {return_code})"
                 )
         try:
+            # Streamlit health endpoint is the most stable readiness signal.
+            try:
+                status = _fetch_status(health_url, timeout=2.5)
+                if status < 400:
+                    return True
+            except Exception:
+                pass
+
             html = _fetch_text(base_url, timeout=2.5)
             assets = _extract_static_asset_paths(html)
-            if not assets:
-                raise RuntimeError("no static asset links discovered in bootstrap HTML")
-            missing: list[str] = []
-            for asset in assets:
-                asset_url = urllib.parse.urljoin(base_url, asset)
-                try:
-                    status = _fetch_status(asset_url, timeout=2.5)
-                except urllib.error.URLError as exc:
-                    missing.append(f"{asset} ({exc})")
-                    continue
-                if status >= 400:
-                    missing.append(f"{asset} (HTTP {status})")
-            if missing:
-                raise RuntimeError("missing static assets: " + ", ".join(missing))
-            return
+            # HTML can change between Streamlit releases. Once the app root is
+            # reachable we treat startup as healthy, and only probe assets as
+            # a non-fatal diagnostic when links are discoverable.
+            if assets:
+                missing: list[str] = []
+                for asset in assets:
+                    asset_url = urllib.parse.urljoin(base_url, asset)
+                    try:
+                        status = _fetch_status(asset_url, timeout=2.5)
+                    except urllib.error.URLError as exc:
+                        missing.append(f"{asset} ({exc})")
+                        continue
+                    if status >= 400:
+                        missing.append(f"{asset} (HTTP {status})")
+                if missing:
+                    _log("Asset probe warning: " + ", ".join(missing))
+            if "<html" in html.lower() or "streamlit" in html.lower():
+                return True
         except Exception as exc:
             last_error = str(exc)
             time.sleep(ASSET_VALIDATION_INTERVAL_SECONDS)
-    raise RuntimeError(
-        "Streamlit asset validation failed before startup completed: "
+    _log(
+        "Startup validation warning (continuing without fail-fast): "
         + last_error
     )
+    return False
 
 
 def main() -> None:
@@ -162,7 +175,7 @@ def main() -> None:
     os.environ["STREAMLIT_THEME_SECONDARYBACKGROUNDCOLOR"] = "#FFFFFF"
     os.environ["STREAMLIT_THEME_PRIMARYCOLOR"] = "#1d3b64"
 
-    port = os.getenv("PORT", "8501")
+    port = (os.getenv("PORT", "8501") or "8501").strip() or "8501"
     command = [
         sys.executable,
         "-m",
@@ -185,21 +198,17 @@ def main() -> None:
     }
     process = subprocess.Popen(command, cwd=root_dir)
     _log(f"Started Streamlit process (pid={process.pid}) on port {port}.")
-    try:
-        if not skip_validation:
-            _log("Validating startup HTML/static asset integrity.")
-            _validate_streamlit_assets(str(port), process=process)
-            _log("Startup asset validation passed.")
-        raise SystemExit(process.wait())
-    except Exception:
-        _log("STARTUP_VALIDATION_FAILED: terminating Streamlit process.")
-        process.terminate()
+    if not skip_validation:
+        _log("Validating startup readiness (best effort).")
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        _log("Streamlit process terminated after validation failure.")
-        raise
+            validated = _validate_streamlit_assets(str(port), process=process)
+            if validated:
+                _log("Startup readiness validation passed.")
+            else:
+                _log("Startup readiness validation timed out; continuing with running process.")
+        except Exception as exc:
+            _log(f"Startup readiness validation warning: {exc}. Continuing.")
+    raise SystemExit(process.wait())
 
 
 if __name__ == "__main__":

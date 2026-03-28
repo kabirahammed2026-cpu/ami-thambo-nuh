@@ -117,6 +117,8 @@ STRICT_REPORT_WINDOWS = os.getenv("PS_REPORT_STRICT_WINDOWS", "").strip().lower(
     "on",
 }
 RECEIPTS_ENABLED = False
+HEALTH_CHECK_CACHE_TTL_SECONDS = 120
+UPLOAD_BYTES_CACHE_LIMIT = 24
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 DELIVERY_ORDER_DIR = UPLOADS_DIR / "delivery_orders"
@@ -6054,6 +6056,24 @@ def run_health_checks(conn: sqlite3.Connection) -> list[str]:
     return warnings
 
 
+def get_cached_health_warnings(conn: sqlite3.Connection) -> list[str]:
+    """Run health checks on a short TTL to reduce navigation-time rerun cost."""
+
+    now_ts = time.monotonic()
+    last_ts = st.session_state.get("_health_check_last_ts", 0.0)
+    cached = st.session_state.get("health_warnings")
+    if (
+        isinstance(last_ts, (int, float))
+        and now_ts - float(last_ts) < HEALTH_CHECK_CACHE_TTL_SECONDS
+        and isinstance(cached, list)
+    ):
+        return cached
+    warnings = run_health_checks(conn)
+    st.session_state["_health_check_last_ts"] = now_ts
+    st.session_state["health_warnings"] = warnings
+    return warnings
+
+
 def _guess_upload_mime(filename: str) -> str:
     if not filename:
         return "application/octet-stream"
@@ -6098,6 +6118,13 @@ def _extract_upload_metadata(uploaded_file, saved_path: Optional[Path]) -> dict[
 def _read_uploaded_bytes(uploaded_file) -> bytes:
     if uploaded_file is None:
         return b""
+    cache_key = _upload_signature(uploaded_file)
+    if cache_key:
+        cached = st.session_state.get("_upload_bytes_cache", {})
+        if isinstance(cached, dict) and cache_key in cached:
+            payload = cached.get(cache_key)
+            if isinstance(payload, bytes):
+                return payload
     data = b""
     if hasattr(uploaded_file, "getvalue"):
         try:
@@ -6105,6 +6132,14 @@ def _read_uploaded_bytes(uploaded_file) -> bytes:
         except Exception:
             data = b""
     if data:
+        if cache_key:
+            cache_bucket = st.session_state.setdefault("_upload_bytes_cache", {})
+            if isinstance(cache_bucket, dict):
+                cache_bucket[cache_key] = data
+                if len(cache_bucket) > UPLOAD_BYTES_CACHE_LIMIT:
+                    stale_keys = list(cache_bucket.keys())[:-UPLOAD_BYTES_CACHE_LIMIT]
+                    for key in stale_keys:
+                        cache_bucket.pop(key, None)
         return data
     if hasattr(uploaded_file, "seek"):
         try:
@@ -6112,9 +6147,20 @@ def _read_uploaded_bytes(uploaded_file) -> bytes:
         except Exception:
             pass
     try:
-        return uploaded_file.read()
+        data = uploaded_file.read()
     except Exception:
-        return b""
+        data = b""
+    if cache_key and isinstance(data, bytes):
+        cache_bucket = st.session_state.setdefault("_upload_bytes_cache", {})
+        if not isinstance(cache_bucket, dict):
+            cache_bucket = {}
+            st.session_state["_upload_bytes_cache"] = cache_bucket
+        cache_bucket[cache_key] = data
+        if len(cache_bucket) > UPLOAD_BYTES_CACHE_LIMIT:
+            stale_keys = list(cache_bucket.keys())[:-UPLOAD_BYTES_CACHE_LIMIT]
+            for key in stale_keys:
+                cache_bucket.pop(key, None)
+    return data
 
 
 def _upload_signature(uploaded_file) -> str:
@@ -17513,6 +17559,20 @@ def render_operations_document_uploader(
                                 doc_type="Other",
                             )
                             _safe_rerun()
+
+    st.markdown("#### Document library")
+    load_library_key = f"{key_prefix}_doc_library_loaded"
+    load_document_library = st.checkbox(
+        "Load document library",
+        value=bool(st.session_state.get(load_library_key, False)),
+        key=load_library_key,
+        help="Loads document tables and filters on demand to keep navigation responsive.",
+    )
+    if not load_document_library:
+        st.caption(
+            "Document table loading is deferred. Enable this when you need search, inline edits, or attachment actions."
+        )
+        return
 
     doc_type_options = ["Delivery order", "Work done", "Service", "Maintenance", "Other"]
     if current_user_is_service_staff():
@@ -30816,20 +30876,20 @@ def reports_page(conn):
         return
 
     history_df["report_id"] = history_df["report_id"].apply(lambda val: int(float(val)))
-    history_df["username"] = history_df.apply(
-        lambda row: clean_text(row.get("username")) or "Team member",
-        axis=1,
+    history_df["username"] = history_df["username"].map(
+        lambda value: clean_text(value) or "Team member"
     )
 
     history_df["template_key"] = history_df["report_template"].apply(
         _normalize_report_template
     )
-    history_df["grid_rows"] = history_df.apply(
-        lambda row: parse_report_grid_payload(
-            row.get("grid_payload"), template_key=row.get("template_key")
-        ),
-        axis=1,
-    )
+    history_df["grid_rows"] = [
+        parse_report_grid_payload(payload, template_key=template_key)
+        for payload, template_key in zip(
+            history_df["grid_payload"].tolist(),
+            history_df["template_key"].tolist(),
+        )
+    ]
 
     def _legacy_rows(row: pd.Series) -> list[dict[str, object]]:
         fallback = _default_report_grid_row()
@@ -30850,39 +30910,50 @@ def reports_page(conn):
         axis=1,
     )
 
-    entry_records: list[dict[str, object]] = []
-    download_records: list[dict[str, object]] = []
-    for _, record in history_df.iterrows():
-        owner = record.get("username") or "Team member"
-        cadence_label = format_period_label(record.get("period_type"))
-        period_label = format_period_range(
-            record.get("period_start"), record.get("period_end")
-        )
-        template_key = record.get("template_key")
-        template_label = REPORT_TEMPLATE_LABELS.get(
-            template_key, str(template_key).replace("_", " ").title()
-        )
-        grid_rows = record.get("grid_rows") or []
-        display_df = format_report_grid_rows_for_display(
-            grid_rows, empty_ok=True, template_key=template_key
-        )
-        if display_df.empty:
-            continue
-        for entry in display_df.to_dict("records"):
-            entry_record = {"Template": template_label}
-            entry_record.update(entry)
-            entry_records.append(entry_record)
-            download_entry = {
-                "Team member": owner,
-                "Template": template_label,
-                "Cadence": cadence_label,
-                "Period": period_label,
-            }
-            download_entry.update(entry)
-            download_records.append(download_entry)
+    should_load_structured = st.checkbox(
+        "Load structured history table",
+        value=len(history_df.index) <= 120,
+        key="reports_load_structured_history",
+        help="Disable this on large datasets to keep report navigation fast.",
+    )
+    entry_table = pd.DataFrame()
+    download_df = pd.DataFrame()
+    if should_load_structured:
+        entry_records: list[dict[str, object]] = []
+        download_records: list[dict[str, object]] = []
+        for record in history_df.itertuples(index=False):
+            owner = getattr(record, "username", None) or "Team member"
+            cadence_label = format_period_label(getattr(record, "period_type", None))
+            period_label = format_period_range(
+                getattr(record, "period_start", None),
+                getattr(record, "period_end", None),
+            )
+            template_key = getattr(record, "template_key", None)
+            template_label = REPORT_TEMPLATE_LABELS.get(
+                template_key, str(template_key).replace("_", " ").title()
+            )
+            grid_rows = getattr(record, "grid_rows", None) or []
+            display_df = format_report_grid_rows_for_display(
+                grid_rows, empty_ok=True, template_key=template_key
+            )
+            if display_df.empty:
+                continue
+            for entry in display_df.to_dict("records"):
+                entry_record = {"Template": template_label}
+                entry_record.update(entry)
+                entry_records.append(entry_record)
+                download_entry = {
+                    "Team member": owner,
+                    "Template": template_label,
+                    "Cadence": cadence_label,
+                    "Period": period_label,
+                }
+                download_entry.update(entry)
+                download_records.append(download_entry)
+        entry_table = pd.DataFrame(entry_records)
+        download_df = pd.DataFrame(download_records)
 
-    entry_table = pd.DataFrame(entry_records)
-    if not entry_table.empty:
+    if should_load_structured and not entry_table.empty:
         for fields in REPORT_TEMPLATE_FIELDS.values():
             for key, config in fields.items():
                 label = config["label"]
@@ -30919,12 +30990,12 @@ def reports_page(conn):
             progress_cols[1].metric("Ongoing", ongoing_rows)
             progress_cols[2].metric("Done", done_rows)
             progress_cols[3].metric("Rejected", rejected_rows)
-    else:
+    elif should_load_structured:
         st.info(
             "No structured report entries are available for the selected filters."
         )
-
-    download_df = pd.DataFrame(download_records)
+    else:
+        st.caption("Structured history table skipped for speed. Enable it to inspect flattened report rows.")
     if not download_df.empty:
         desired_columns = [
             "Team member",
@@ -30948,7 +31019,12 @@ def reports_page(conn):
             key="reports_download",
         )
 
-    if is_admin:
+    if is_admin and st.checkbox(
+        "Load admin daily summaries",
+        value=False,
+        key="reports_load_admin_daily_summary",
+        help="Runs additional report and sales aggregation queries only when needed.",
+    ):
         st.markdown("---")
         st.markdown("### Daily Sales & Service Reports")
         filter_mode = st.radio(
@@ -31695,7 +31771,7 @@ def _run_main_app() -> None:
     st.session_state["auto_backup_error"] = backup_error
     if backup_error:
         logger.warning("Automatic backup failed: %s", backup_error)
-    st.session_state["health_warnings"] = run_health_checks(conn)
+    st.session_state["health_warnings"] = get_cached_health_warnings(conn)
     _restore_user_session(conn)
     if _debug_diag_enabled():
         _ensure_debug_user(conn)
