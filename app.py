@@ -6170,8 +6170,11 @@ def _upload_signature(uploaded_file) -> str:
         return "missing"
     name = clean_text(getattr(uploaded_file, "name", "")) or "upload"
     size = getattr(uploaded_file, "size", None)
-    file_id = clean_text(getattr(uploaded_file, "file_id", "")) or ""
-    return f"{name}:{size}:{file_id}"
+    size_part = str(int(size)) if isinstance(size, (int, float)) else ""
+    # ``UploadedFile.file_id`` can change across Streamlit reruns even when the
+    # selected file has not changed. Keeping signatures stable avoids repeated
+    # byte reads / OCR work for the same upload.
+    return f"{name}:{size_part}"
 
 
 def _safe_read_bytes(path: Optional[Path]) -> Optional[bytes]:
