@@ -15,6 +15,8 @@ To launch the PS Business Suites by ZAD sales experience instead of the service 
 
 On hosting platforms that expect a Python entry point (such as Railway or Render), set the start command to `python render_bootstrap.py`. The bootstrapper mirrors the Procfile settings, respects the `PS_APP`/`PS_APP_SCRIPT` toggle, and will default to a persistent volume (for example `/data`) when one is available. The repository `Procfile` already uses the bootstrapper so you can leave the default command in place on Railway/Render deployments.
 
+`render_bootstrap.py` now performs a startup asset-integrity check: it fetches the local app HTML and verifies every `/static/...js` and `/static/...css` reference is immediately retrievable before considering startup healthy. This catches broken deploy states where HTML and JS bundle versions drift. If you need to bypass this temporarily (for diagnostics only), set `PS_SKIP_ASSET_VALIDATION=1`.
+
 ### Any Platform (single command or double-click)
 Run `python run_app.py` from the repository root, or double-click the file in your file explorer. The script prepares the environment and launches the app inside a pywebview dialog titled **PS Business Suites**.
 

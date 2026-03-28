@@ -2636,6 +2636,32 @@ def _load_operations_customers(
     return customers_df
 
 
+@st.cache_data(show_spinner=False)
+def _load_quotation_autofill_customers(
+    db_path: str,
+    where_clause: str,
+    params: tuple,
+    version: int,
+    limit: int,
+) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    try:
+        return pd.read_sql_query(
+            f"""
+            SELECT customer_id, name, company_name, address, delivery_address, phone,
+                   COALESCE(delivery_address, address) AS district
+            FROM customers
+            {where_clause}
+            ORDER BY LOWER(COALESCE(name, company_name, phone, 'customer'))
+            LIMIT ?
+            """,
+            conn,
+            params=params + (int(limit),),
+        )
+    finally:
+        conn.close()
+
+
 def _refresh_customer_caches() -> None:
     try:
         _load_operations_customers.clear()
@@ -2643,6 +2669,10 @@ def _refresh_customer_caches() -> None:
         pass
     try:
         _load_customer_group_rows.clear()
+    except Exception:
+        pass
+    try:
+        _load_quotation_autofill_customers.clear()
     except Exception:
         pass
     st.session_state.pop("operations_customer_table_state", None)
@@ -3188,6 +3218,36 @@ def _extract_text_from_quotation_bytes(
             warnings.append(f"Fast PDF text extraction failed: {exc}")
         return "\n".join(text_pages).strip(), page_count
 
+    if suffix in {".txt", ".md", ".csv"}:
+        for encoding in ("utf-8", "utf-16", "latin-1"):
+            try:
+                return file_bytes.decode(encoding), warnings
+            except UnicodeDecodeError:
+                continue
+        warnings.append("Could not decode uploaded text file.")
+        return "", warnings
+    if suffix == ".docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+                document_xml = archive.read("word/document.xml")
+        except KeyError:
+            warnings.append("Uploaded DOCX is missing word/document.xml.")
+            return "", warnings
+        except Exception as exc:
+            warnings.append(f"Could not read DOCX file: {exc}")
+            return "", warnings
+        raw_xml = document_xml.decode("utf-8", errors="ignore")
+        text_content = re.sub(r"</w:p>", "\n", raw_xml)
+        text_content = re.sub(r"<[^>]+>", " ", text_content)
+        text_content = re.sub(r"\s+", " ", text_content).strip()
+        if not text_content:
+            warnings.append("No readable text found in the uploaded DOCX.")
+        return text_content, warnings
+    if suffix == ".doc":
+        warnings.append(
+            "Legacy .doc parsing is not available in this deployment. Convert to PDF, DOCX, or TXT."
+        )
+        return "", warnings
     if suffix == ".pdf":
         max_pages = 9999 if ocr_all_pages else 1
         text_content, page_count = _fast_pdf_text(max_pages)
@@ -3246,7 +3306,7 @@ def _extract_text_from_quotation_bytes(
         text_content = "\n".join(pages).strip()
         if not text_content:
             warnings.append("No readable text found in the uploaded PDF.")
-    else:
+    elif suffix in OCR_UPLOAD_SUFFIXES:
         if skip_ocr:
             warnings.append("OCR skipped for the uploaded image.")
             return "", warnings
@@ -3260,6 +3320,11 @@ def _extract_text_from_quotation_bytes(
             image, strong_ocr=strong_ocr
         )
         table_hints.extend(table_lines)
+    else:
+        warnings.append(
+            f"Unsupported upload type for extraction: {suffix or '(unknown)'}."
+        )
+        return "", warnings
 
     if table_hints:
         text_content = "\n".join([text_content, *table_hints]).strip()
@@ -6052,6 +6117,17 @@ def _read_uploaded_bytes(uploaded_file) -> bytes:
         return b""
 
 
+def _upload_signature(uploaded_file) -> str:
+    """Return a lightweight signature for a Streamlit UploadedFile."""
+
+    if uploaded_file is None:
+        return "missing"
+    name = clean_text(getattr(uploaded_file, "name", "")) or "upload"
+    size = getattr(uploaded_file, "size", None)
+    file_id = clean_text(getattr(uploaded_file, "file_id", "")) or ""
+    return f"{name}:{size}:{file_id}"
+
+
 def _safe_read_bytes(path: Optional[Path]) -> Optional[bytes]:
     if not path:
         return None
@@ -6287,24 +6363,20 @@ def store_report_attachment(uploaded_file, *, identifier: Optional[str] = None) 
         ident = "".join(ch for ch in identifier if ch.isalnum() or ch in ("_", "-"))
         if ident:
             safe_stem = f"{ident}_{safe_stem}"
-    dest = REPORT_DOCS_DIR / f"{safe_stem}{suffix}"
-    counter = 1
-    while dest.exists():
-        dest = REPORT_DOCS_DIR / f"{safe_stem}_{counter}{suffix}"
-        counter += 1
-    data = _read_uploaded_bytes(uploaded_file)
-    if not data:
+    filename = f"{safe_stem}{suffix}"
+    saved_path = save_uploaded_file(
+        uploaded_file,
+        REPORT_DOCS_DIR,
+        filename=filename,
+        allowed_extensions=allowed_exts,
+        default_extension=".pdf",
+    )
+    if not saved_path:
         return None
-    data = _standardize_upload_payload(data, suffix)
-    if len(data) > MAX_UPLOAD_BYTES:
-        _get_logger().warning("Report attachment rejected after optimization: file exceeds %s", _format_bytes(MAX_UPLOAD_BYTES))
-        return None
-    with open(dest, "wb") as fh:
-        fh.write(data)
     try:
-        return str(dest.relative_to(BASE_DIR))
+        return str(saved_path.relative_to(BASE_DIR))
     except ValueError:
-        return str(dest)
+        return str(saved_path)
 
 
 def store_report_import_file(
@@ -22692,16 +22764,13 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     salesperson_seed = salesperson_profile["name"]
     scope_clause, scope_params = customer_scope_filter()
     where_clause = f"WHERE {scope_clause}" if scope_clause else ""
-    customer_df = df_query(
-        conn,
-        f"""
-        SELECT customer_id, name, company_name, address, delivery_address, phone, COALESCE(delivery_address, address) AS district
-        FROM customers
-        {where_clause}
-        ORDER BY LOWER(COALESCE(name, company_name, phone, 'customer'))
-        LIMIT 200
-        """,
-        scope_params,
+    customers_version = get_data_version(conn, "customers")
+    customer_df = _load_quotation_autofill_customers(
+        DB_PATH,
+        where_clause,
+        tuple(scope_params),
+        customers_version,
+        200,
     )
     autofill_options = [None]
     autofill_labels = {None: "Manual entry"}
@@ -22720,7 +22789,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
             autofill_labels[cid] = " • ".join(part for part in label_parts if part)
             autofill_records[cid] = row.to_dict()
 
-    st.session_state["quotation_autofill_customer"] = None
+    st.session_state.setdefault("quotation_autofill_customer", None)
     st.markdown("### Upload to auto-fill")
     st.caption(
         "Upload a quotation (PDF, DOCX, or TXT) to detect customer info, contact details, and line items automatically."
@@ -22728,22 +22797,30 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     skip_ocr = False
     ocr_all_pages = False
     strong_ocr = False
-    st.session_state["quotation_prefill_skip_ocr"] = False
-    st.session_state["quotation_prefill_ocr_all_pages"] = False
-    st.session_state["quotation_prefill_strong_ocr"] = False
+    st.session_state.setdefault("quotation_prefill_skip_ocr", False)
+    st.session_state.setdefault("quotation_prefill_ocr_all_pages", False)
+    st.session_state.setdefault("quotation_prefill_strong_ocr", False)
     st.caption("OCR runs automatically on page 1 of the uploaded quotation.")
     ocr_dpi = 180
     prefill_upload = st.file_uploader(
         "Quotation file",
-        type=["pdf", "doc", "docx", "txt"],
+        type=["pdf", "docx", "txt"],
         key="quotation_prefill_upload",
     )
 
     if prefill_upload:
-        file_bytes = prefill_upload.getvalue()
+        file_bytes = _read_uploaded_bytes(prefill_upload)
+        if not file_bytes:
+            st.error("Could not read the uploaded quotation file. Please try uploading again.")
+            return
         file_hash = hashlib.sha256(file_bytes).hexdigest()
         suffix = Path(prefill_upload.name).suffix.lower()
         prefill_token = f"{file_hash}:{ocr_all_pages}:{skip_ocr}:{strong_ocr}:{ocr_dpi}"
+        upload_signature = _upload_signature(prefill_upload)
+        signature_key = "quotation_prefill_upload_signature"
+        if st.session_state.get(signature_key) != upload_signature:
+            st.session_state.pop("quotation_prefill_token", None)
+            st.session_state[signature_key] = upload_signature
         if st.session_state.get("quotation_prefill_token") != prefill_token:
             progress = st.progress(0, text="Preparing quotation auto-fill...")
             progress.progress(30, text="Extracting text from the upload...")
@@ -22765,7 +22842,7 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
                 prefill_upload,
                 QUOTATION_DOCS_DIR,
                 filename=prefill_upload.name or "quotation_upload",
-                allowed_extensions={".pdf", ".doc", ".docx", ".txt"},
+                allowed_extensions={".pdf", ".docx", ".txt"},
                 default_extension=".pdf",
             )
             if saved_prefill:
