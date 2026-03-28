@@ -10,12 +10,29 @@ mounts when available.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 DEFAULT_APP_SCRIPT = "main.py"
 SALES_APP_SCRIPT = "sales_app.py"
+ASSET_VALIDATION_TIMEOUT_SECONDS = 25.0
+ASSET_VALIDATION_INTERVAL_SECONDS = 0.4
+ASSET_LINK_PATTERN = re.compile(
+    r"""(?:src|href)=["'](?P<asset>/static/[^"']+\.(?:js|css))["']""",
+    flags=re.IGNORECASE,
+)
+
+
+def _log(message: str) -> None:
+    """Emit an operator-visible bootstrap log line."""
+
+    print(f"[render_bootstrap] {message}", file=sys.stderr, flush=True)
 
 
 def _select_app_script() -> str:
@@ -44,6 +61,76 @@ def _preferred_storage_dir() -> Path | None:
             return Path(candidate)
 
     return None
+
+
+def _extract_static_asset_paths(html: str) -> list[str]:
+    """Extract Streamlit static asset paths from bootstrap HTML."""
+
+    if not html:
+        return []
+    seen: set[str] = set()
+    assets: list[str] = []
+    for match in ASSET_LINK_PATTERN.finditer(html):
+        asset = match.group("asset")
+        if asset in seen:
+            continue
+        seen.add(asset)
+        assets.append(asset)
+    return assets
+
+
+def _fetch_text(url: str, *, timeout: float = 3.0) -> str:
+    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _fetch_status(url: str, *, timeout: float = 3.0) -> int:
+    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return int(getattr(response, "status", 200) or 200)
+
+
+def _validate_streamlit_assets(
+    port: str, *, process: subprocess.Popen | None = None
+) -> None:
+    """Fail fast if app HTML references static assets that are not fetchable."""
+
+    base_url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + ASSET_VALIDATION_TIMEOUT_SECONDS
+    last_error = "application bootstrap did not become reachable"
+    while time.monotonic() < deadline:
+        if process is not None:
+            return_code = process.poll()
+            if return_code is not None:
+                raise RuntimeError(
+                    f"streamlit exited before startup validation completed (exit code {return_code})"
+                )
+        try:
+            html = _fetch_text(base_url, timeout=2.5)
+            assets = _extract_static_asset_paths(html)
+            if not assets:
+                raise RuntimeError("no static asset links discovered in bootstrap HTML")
+            missing: list[str] = []
+            for asset in assets:
+                asset_url = urllib.parse.urljoin(base_url, asset)
+                try:
+                    status = _fetch_status(asset_url, timeout=2.5)
+                except urllib.error.URLError as exc:
+                    missing.append(f"{asset} ({exc})")
+                    continue
+                if status >= 400:
+                    missing.append(f"{asset} (HTTP {status})")
+            if missing:
+                raise RuntimeError("missing static assets: " + ", ".join(missing))
+            return
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(ASSET_VALIDATION_INTERVAL_SECONDS)
+    raise RuntimeError(
+        "Streamlit asset validation failed before startup completed: "
+        + last_error
+    )
 
 
 def main() -> None:
@@ -90,7 +177,29 @@ def main() -> None:
         "true",
     ]
 
-    subprocess.run(command, check=True, cwd=root_dir)
+    skip_validation = os.getenv("PS_SKIP_ASSET_VALIDATION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    process = subprocess.Popen(command, cwd=root_dir)
+    _log(f"Started Streamlit process (pid={process.pid}) on port {port}.")
+    try:
+        if not skip_validation:
+            _log("Validating startup HTML/static asset integrity.")
+            _validate_streamlit_assets(str(port), process=process)
+            _log("Startup asset validation passed.")
+        raise SystemExit(process.wait())
+    except Exception:
+        _log("STARTUP_VALIDATION_FAILED: terminating Streamlit process.")
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        _log("Streamlit process terminated after validation failure.")
+        raise
 
 
 if __name__ == "__main__":
