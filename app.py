@@ -2452,7 +2452,7 @@ def render_focus_highlight(label: str, detail: Optional[str] = None) -> None:
     detail_html = f"<div style='margin-top:0.2rem'>{html.escape(detail_text)}</div>" if detail_text else ""
     st.markdown(
         (
-            "<div style='border-left:6px solid #f97316; background:#fff7ed; color:#7c2d12; "
+            "<div style='border-left:6px solid #f59e0b; background:#fef9c3; color:#713f12; "
             "padding:0.55rem 0.7rem; border-radius:0.4rem; margin:0.35rem 0 0.7rem 0;'>"
             f"<strong>📌 {html.escape(title)}</strong>{detail_html}</div>"
         ),
@@ -2480,8 +2480,14 @@ def filter_maintenance_records_for_view(
     viewer_id = current_user_id()
     if viewer_id is None:
         return maintenance_df.iloc[0:0].copy()
-    creator = pd.to_numeric(maintenance_df.get("created_by"), errors="coerce")
-    return maintenance_df[creator == int(viewer_id)]
+    if "created_by" not in maintenance_df.columns:
+        return maintenance_df.iloc[0:0].copy()
+    creator_series = pd.to_numeric(maintenance_df["created_by"], errors="coerce")
+    mask = creator_series.eq(int(viewer_id))
+    if not isinstance(mask, pd.Series):
+        return maintenance_df.iloc[0:0].copy()
+    mask = mask.reindex(maintenance_df.index, fill_value=False).fillna(False).astype(bool)
+    return maintenance_df.loc[mask]
 
 
 def filter_delivery_orders_for_view(
@@ -4112,6 +4118,10 @@ def _activate_notification_deep_link(link: Mapping[str, object]) -> None:
         "record_id": clean_text(link.get("record_id")) or "",
         "highlight": "1" if bool(link.get("highlight")) else "",
         "anchor": clean_text(link.get("anchor")) or "",
+        "section": clean_text(link.get("section")) or "",
+        "field": clean_text(link.get("field")) or "",
+        "file": clean_text(link.get("file")) or "",
+        "context": clean_text(link.get("context")) or "",
     }
     payload["token"] = "|".join(
         [
@@ -4120,6 +4130,10 @@ def _activate_notification_deep_link(link: Mapping[str, object]) -> None:
             payload["record_id"],
             payload["highlight"],
             payload["anchor"],
+            payload["section"],
+            payload["field"],
+            payload["file"],
+            payload["context"],
         ]
     )
     st.session_state["pending_deep_link"] = payload
@@ -4141,6 +4155,7 @@ def push_runtime_notification(
     severity: str = "info",
     details: Optional[Iterable[str]] = None,
     deep_link: Optional[dict[str, object]] = None,
+    dedupe_key: Optional[str] = None,
 ) -> None:
     if not title and not message:
         return
@@ -4155,9 +4170,20 @@ def push_runtime_notification(
     }
     if deep_link:
         entry["deep_link"] = deep_link
+    if dedupe_key:
+        entry["dedupe_key"] = clean_text(dedupe_key)
     entry["id"] = _notification_entry_id(entry)
     buffer = _notification_store()
-    if buffer:
+    dedupe_value = clean_text(dedupe_key) or clean_text(entry.get("id"))
+    if dedupe_value:
+        seen = {
+            clean_text(item.get("dedupe_key")) or clean_text(item.get("id"))
+            for item in buffer[-50:]
+            if isinstance(item, Mapping)
+        }
+        if dedupe_value in seen:
+            return
+    elif buffer:
         latest = buffer[-1]
         if _notification_entry_id(latest) == entry["id"]:
             return
@@ -4218,13 +4244,20 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
             message = " • ".join(message_bits + detail_bits)
             alerts.append(
                 {
-                    "title": clean_text(row.get("reference")) or "Quotation follow-up",
+                    "title": (
+                        f"Quotation {clean_text(row.get('reference'))}"
+                        if clean_text(row.get("reference"))
+                        else "Quotation follow-up"
+                    ),
                     "message": message,
                     "severity": severity,
                     "deep_link": {
                         "page": "Quotation",
                         "record_id": str(int(row.get("quotation_id"))),
                         "highlight": True,
+                        "section": "quotation_detail",
+                        "field": "follow_up_date",
+                        "context": customer_label,
                     }
                     if int_or_none(row.get("quotation_id")) is not None
                     else None,
@@ -4349,11 +4382,14 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                 reminder_date = reminder_dt.date()
                 title = _report_reminder_label(entry, template_key)
                 message = _report_reminder_message(entry, template_key)
+                reference_bits = [f"Report #{int(row.get('report_id'))}" if int_or_none(row.get("report_id")) is not None else "Report"]
+                if clean_text(title):
+                    reference_bits.append(clean_text(title))
                 report_reminder_entries.append(
                     (
                         reminder_date,
                         {
-                            "title": title,
+                            "title": " • ".join(reference_bits),
                             "message": f"{message} (due {format_follow_up_date(reminder_iso)})",
                             "severity": "warning"
                             if reminder_date <= date.today()
@@ -4362,6 +4398,9 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                                 "page": "Reports",
                                 "record_id": str(int(row.get("report_id"))),
                                 "highlight": True,
+                                "section": "report_grid_editor",
+                                "field": "reminder_date",
+                                "context": clean_text(title) or clean_text(message),
                             }
                             if int_or_none(row.get("report_id")) is not None
                             else None,
@@ -4536,6 +4575,7 @@ def _deep_link_for_entity(
         "customer": {"page": "Customers"},
         "warranty": {"page": "Warranties"},
         "report": {"page": "Reports"},
+        "customer_note": {"page": "Customers", "anchor": "customer_followups"},
         "delivery_order": {"page": "Operations", "tab": "delivery_orders", "anchor": "delivery_list"},
         "work_done": {"page": "Operations", "tab": "work_done", "anchor": "work_done_list"},
         "service": {"page": "Operations", "tab": "service", "anchor": "service_editor"},
@@ -4571,6 +4611,26 @@ def log_activity(
         event_key, (event_key or "Activity").replace("_", " ").title()
     )
     should_notify = event_key not in {"login", "logout"}
+    dedupe_fingerprint = "|".join(
+        [
+            str(actor_id or ""),
+            event_key or "",
+            clean_text(entity_type) or "",
+            str(entity_id or ""),
+            description_text or "",
+        ]
+    )
+    dedupe_state = st.session_state.setdefault("_activity_dedupe_guard", {})
+    now_ts = time.time()
+    last_seen = dedupe_state.get(dedupe_fingerprint)
+    if isinstance(last_seen, (int, float)) and now_ts - float(last_seen) < 4.0:
+        return
+    dedupe_state[dedupe_fingerprint] = now_ts
+    if len(dedupe_state) > 300:
+        stale_keys = list(dedupe_state.keys())[:-300]
+        for key in stale_keys:
+            dedupe_state.pop(key, None)
+    st.session_state["_activity_dedupe_guard"] = dedupe_state
     try:
         conn.execute(
             """
@@ -4602,6 +4662,7 @@ def log_activity(
                 severity="info",
                 details=details,
                 deep_link=deep_link,
+                dedupe_key=dedupe_fingerprint,
             )
 
 
@@ -6170,8 +6231,11 @@ def _upload_signature(uploaded_file) -> str:
         return "missing"
     name = clean_text(getattr(uploaded_file, "name", "")) or "upload"
     size = getattr(uploaded_file, "size", None)
-    file_id = clean_text(getattr(uploaded_file, "file_id", "")) or ""
-    return f"{name}:{size}:{file_id}"
+    size_part = str(int(size)) if isinstance(size, (int, float)) else ""
+    # ``UploadedFile.file_id`` can change across Streamlit reruns even when the
+    # selected file has not changed. Keeping signatures stable avoids repeated
+    # byte reads / OCR work for the same upload.
+    return f"{name}:{size_part}"
 
 
 def _safe_read_bytes(path: Optional[Path]) -> Optional[bytes]:
@@ -10248,6 +10312,10 @@ DEEP_LINK_TAB_PARAM = "tab"
 DEEP_LINK_ID_PARAM = "id"
 DEEP_LINK_HIGHLIGHT_PARAM = "highlight"
 DEEP_LINK_ANCHOR_PARAM = "anchor"
+DEEP_LINK_SECTION_PARAM = "section"
+DEEP_LINK_FIELD_PARAM = "field"
+DEEP_LINK_FILE_PARAM = "file"
+DEEP_LINK_CONTEXT_PARAM = "context"
 
 
 def _session_duration_days() -> float:
@@ -10298,6 +10366,10 @@ def _build_deep_link_url(
     record_id: Optional[str] = None,
     anchor: Optional[str] = None,
     highlight: bool = False,
+    section: Optional[str] = None,
+    field: Optional[str] = None,
+    file: Optional[str] = None,
+    context: Optional[str] = None,
 ) -> str:
     payload = {
         DEEP_LINK_PAGE_PARAM: page,
@@ -10313,6 +10385,14 @@ def _build_deep_link_url(
         payload[DEEP_LINK_ANCHOR_PARAM] = anchor
     if highlight:
         payload[DEEP_LINK_HIGHLIGHT_PARAM] = "1"
+    if section:
+        payload[DEEP_LINK_SECTION_PARAM] = section
+    if field:
+        payload[DEEP_LINK_FIELD_PARAM] = field
+    if file:
+        payload[DEEP_LINK_FILE_PARAM] = file
+    if context:
+        payload[DEEP_LINK_CONTEXT_PARAM] = context
     return f"?{urllib.parse.urlencode(payload)}"
 
 
@@ -10331,6 +10411,10 @@ def _extract_deep_link(pages: list[str]) -> Optional[dict[str, str]]:
         "record_id": _read_query_param(params, DEEP_LINK_ID_PARAM) or "",
         "highlight": _read_query_param(params, DEEP_LINK_HIGHLIGHT_PARAM) or "",
         "anchor": _read_query_param(params, DEEP_LINK_ANCHOR_PARAM) or "",
+        "section": _read_query_param(params, DEEP_LINK_SECTION_PARAM) or "",
+        "field": _read_query_param(params, DEEP_LINK_FIELD_PARAM) or "",
+        "file": _read_query_param(params, DEEP_LINK_FILE_PARAM) or "",
+        "context": _read_query_param(params, DEEP_LINK_CONTEXT_PARAM) or "",
     }
 
 
@@ -10343,6 +10427,10 @@ def _persist_deep_link_query_params(payload: Mapping[str, object]) -> None:
     record_id = clean_text(payload.get("record_id"))
     highlight = clean_text(payload.get("highlight"))
     anchor = clean_text(payload.get("anchor"))
+    section = clean_text(payload.get("section"))
+    field = clean_text(payload.get("field"))
+    file_name = clean_text(payload.get("file"))
+    context = clean_text(payload.get("context"))
     if tab:
         st.query_params[DEEP_LINK_TAB_PARAM] = tab
     elif DEEP_LINK_TAB_PARAM in st.query_params:
@@ -10359,6 +10447,22 @@ def _persist_deep_link_query_params(payload: Mapping[str, object]) -> None:
         st.query_params[DEEP_LINK_ANCHOR_PARAM] = anchor
     elif DEEP_LINK_ANCHOR_PARAM in st.query_params:
         del st.query_params[DEEP_LINK_ANCHOR_PARAM]
+    if section:
+        st.query_params[DEEP_LINK_SECTION_PARAM] = section
+    elif DEEP_LINK_SECTION_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_SECTION_PARAM]
+    if field:
+        st.query_params[DEEP_LINK_FIELD_PARAM] = field
+    elif DEEP_LINK_FIELD_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_FIELD_PARAM]
+    if file_name:
+        st.query_params[DEEP_LINK_FILE_PARAM] = file_name
+    elif DEEP_LINK_FILE_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_FILE_PARAM]
+    if context:
+        st.query_params[DEEP_LINK_CONTEXT_PARAM] = context
+    elif DEEP_LINK_CONTEXT_PARAM in st.query_params:
+        del st.query_params[DEEP_LINK_CONTEXT_PARAM]
 
 
 def _consume_deep_link(page: str) -> Optional[dict[str, str]]:
@@ -15099,12 +15203,41 @@ def render_notification_bell(conn) -> None:
         return
 
     is_admin = user.get("role") == "admin"
-    alerts = list(reversed(get_runtime_notifications()))
     user_id = current_user_id()
-    alerts.extend(_build_staff_alerts(conn, user_id=user_id))
-    activity = fetch_activity_feed(conn, limit=ACTIVITY_FEED_LIMIT) if is_admin else []
-    reminders = _build_reminder_alerts(conn)
-    resolved_reminders = _build_reminder_alerts(conn, include_resolved=True)
+    notification_signature = (
+        int_or_none(user_id),
+        bool(is_admin),
+        get_data_version(conn, "activity_log"),
+        get_data_version(conn, "reminders"),
+        get_data_version(conn, "quotations"),
+        get_data_version(conn, "work_reports"),
+        get_data_version(conn, "customer_notes"),
+        get_data_version(conn, "warranties"),
+        tuple(
+            (clean_text(item.get("id")) or _notification_entry_id(item))
+            for item in get_runtime_notifications()[-5:]
+            if isinstance(item, Mapping)
+        ),
+    )
+    cache_state = st.session_state.get("_notification_snapshot_cache")
+    if isinstance(cache_state, dict) and cache_state.get("signature") == notification_signature:
+        alerts = list(cache_state.get("alerts") or [])
+        activity = list(cache_state.get("activity") or [])
+        reminders = list(cache_state.get("reminders") or [])
+        resolved_reminders = list(cache_state.get("resolved_reminders") or [])
+    else:
+        alerts = list(reversed(get_runtime_notifications()))
+        alerts.extend(_build_staff_alerts(conn, user_id=user_id))
+        activity = fetch_activity_feed(conn, limit=ACTIVITY_FEED_LIMIT) if is_admin else []
+        reminders = _build_reminder_alerts(conn)
+        resolved_reminders = _build_reminder_alerts(conn, include_resolved=True)
+        st.session_state["_notification_snapshot_cache"] = {
+            "signature": notification_signature,
+            "alerts": alerts,
+            "activity": activity,
+            "reminders": reminders,
+            "resolved_reminders": resolved_reminders,
+        }
 
     all_entries = [*alerts, *activity, *reminders]
     unread_total = sum(1 for entry in all_entries if not _is_notification_read(entry))
@@ -16637,14 +16770,15 @@ def _save_customer_document_upload(
     )
     document_id = cur.lastrowid
     size_label = _format_bytes(upload_meta.get("file_size"))
-    log_activity(
-        conn,
-        event_type="document_uploaded",
-        description=f"{doc_type} upload: {safe_original} ({size_label}, {upload_meta.get('mime_type')})",
-        entity_type="customer_document",
-        entity_id=document_id,
-        user_id=uploader_id,
-    )
+    if doc_type != "Quotation":
+        log_activity(
+            conn,
+            event_type="document_uploaded",
+            description=f"{doc_type} upload: {safe_original} ({size_label}, {upload_meta.get('mime_type')})",
+            entity_type="customer_document",
+            entity_id=document_id,
+            user_id=uploader_id,
+        )
 
     new_product_labels: list[str] = []
     if doc_type == "Quotation":
@@ -23746,6 +23880,12 @@ def _render_quotation_management(conn):
     selected_row = quotes_df[
         quotes_df["quotation_id"] == selected_detail_id
     ].iloc[0]
+    quotation_focus = st.session_state.get("quotation_deep_focus")
+    if isinstance(quotation_focus, dict) and clean_text(quotation_focus.get("field")) == "follow_up_date":
+        render_focus_highlight(
+            "Notification focus: quotation follow-up",
+            clean_text(quotation_focus.get("context")) or detail_labels.get(selected_detail_id, "Quotation reminder"),
+        )
     selected_status = clean_text(selected_row.get("status")).lower() or "due"
     existing_receipt = clean_text(selected_row.get("payment_receipt_path"))
     follow_up_status_value = clean_text(selected_row.get("follow_up_status")) or ""
@@ -23896,8 +24036,9 @@ def _render_quotation_management(conn):
             ),
         )
         follow_up_source = st.session_state.get("quotation_detail_follow_up_date__raw")
+        reference_for_message = clean_text(selected_row.get("reference")) or f"Quotation #{selected_detail_id}"
         if follow_up_iso:
-            message = "Quotation follow-up"
+            message = f"{reference_for_message} follow-up"
         else:
             message = None
         sync_follow_up_reminder(
@@ -25800,6 +25941,11 @@ def quotation_page(conn, *, render_id: Optional[int] = None):
         deep_quote_id = int_or_none(deep_link.get("record_id"))
         if deep_quote_id is not None:
             st.session_state["quotation_detail_select"] = deep_quote_id
+            st.session_state["quotation_deep_focus"] = {
+                "section": clean_text(deep_link.get("section")) or "",
+                "field": clean_text(deep_link.get("field")) or "",
+                "context": clean_text(deep_link.get("context")) or "",
+            }
             st.info(f"Jumped to quotation #{deep_quote_id}.")
     _render_quotation_section(conn, render_id=render_id)
     st.markdown("---")
@@ -27457,6 +27603,65 @@ def _build_reminder_alerts(
             return []
 
     now = datetime.now()
+    quote_meta: dict[int, dict[str, object]] = {}
+    report_meta: dict[int, dict[str, object]] = {}
+    note_meta: dict[int, dict[str, object]] = {}
+    quote_ids = [
+        int(row.get("entity_id"))
+        for row in df.to_dict("records")
+        if clean_text(row.get("entity_type")) == "quotation" and int_or_none(row.get("entity_id")) is not None
+    ]
+    report_ids = [
+        int(row.get("entity_id"))
+        for row in df.to_dict("records")
+        if clean_text(row.get("entity_type")) == "report" and int_or_none(row.get("entity_id")) is not None
+    ]
+    note_ids = [
+        int(row.get("entity_id"))
+        for row in df.to_dict("records")
+        if clean_text(row.get("entity_type")) == "customer_note" and int_or_none(row.get("entity_id")) is not None
+    ]
+    if quote_ids:
+        placeholders = ",".join("?" for _ in quote_ids)
+        quote_df = df_query(
+            conn,
+            f"""
+            SELECT quotation_id, reference, customer_company, customer_name
+            FROM quotations
+            WHERE quotation_id IN ({placeholders})
+            """,
+            tuple(sorted(set(quote_ids))),
+        )
+        for _, row in quote_df.iterrows():
+            quote_meta[int(row.get("quotation_id"))] = row.to_dict()
+    if report_ids:
+        placeholders = ",".join("?" for _ in report_ids)
+        report_df = df_query(
+            conn,
+            f"""
+            SELECT report_id, report_template, period_start, period_end
+            FROM work_reports
+            WHERE report_id IN ({placeholders})
+            """,
+            tuple(sorted(set(report_ids))),
+        )
+        for _, row in report_df.iterrows():
+            report_meta[int(row.get("report_id"))] = row.to_dict()
+    if note_ids:
+        placeholders = ",".join("?" for _ in note_ids)
+        note_df = df_query(
+            conn,
+            f"""
+            SELECT n.note_id, n.note, c.name AS customer_name, c.company_name AS company_name, n.customer_id
+            FROM customer_notes n
+            LEFT JOIN customers c ON c.customer_id = n.customer_id
+            WHERE n.note_id IN ({placeholders})
+            """,
+            tuple(sorted(set(note_ids))),
+        )
+        for _, row in note_df.iterrows():
+            note_meta[int(row.get("note_id"))] = row.to_dict()
+
     alerts: list[dict[str, object]] = []
     for record in df.to_dict("records"):
         remind_at = clean_text(record.get("remind_at"))
@@ -27466,7 +27671,50 @@ def _build_reminder_alerts(
             due = remind_dt <= now
         message = clean_text(record.get("message"))
         entity_label = clean_text(record.get("entity_type")) or "Record"
+        entity_type = clean_text(record.get("entity_type"))
+        entity_id = int_or_none(record.get("entity_id"))
+        deep_link = _deep_link_for_entity(entity_type, entity_id)
         title = "Reminder due" if due else "Upcoming reminder"
+        if entity_type == "quotation" and entity_id is not None:
+            meta = quote_meta.get(entity_id, {})
+            ref = clean_text(meta.get("reference"))
+            customer = clean_text(meta.get("customer_company")) or clean_text(meta.get("customer_name"))
+            if ref:
+                title = f"Quotation {ref}"
+            elif customer:
+                title = f"Quotation • {customer}"
+            if customer and (not message or message == entity_label):
+                message = f"Follow-up for {customer}"
+            if isinstance(deep_link, dict):
+                deep_link["section"] = "quotation_detail"
+                deep_link["field"] = "follow_up_date"
+                deep_link["context"] = customer or ref or ""
+        elif entity_type == "report" and entity_id is not None:
+            meta = report_meta.get(entity_id, {})
+            template_label = REPORT_TEMPLATE_LABELS.get(
+                _normalize_report_template(meta.get("report_template")),
+                "Report",
+            )
+            period_label = format_period_range(meta.get("period_start"), meta.get("period_end"))
+            title = f"{template_label} #{entity_id}"
+            if period_label and (not message or message == entity_label):
+                message = f"{template_label} reminder for {period_label}"
+            if isinstance(deep_link, dict):
+                deep_link["section"] = "report_grid_editor"
+                deep_link["field"] = "reminder_date"
+                deep_link["context"] = period_label or template_label
+        elif entity_type == "customer_note" and entity_id is not None:
+            meta = note_meta.get(entity_id, {})
+            customer = clean_text(meta.get("customer_name")) or clean_text(meta.get("company_name"))
+            note_text = clean_text(meta.get("note"))
+            if customer:
+                title = f"Customer reminder • {customer}"
+            if note_text and (not message or message == entity_label):
+                message = note_text
+            if isinstance(deep_link, dict):
+                deep_link["section"] = "customer_followups"
+                deep_link["field"] = "remind_on"
+                deep_link["context"] = customer or note_text
         alerts.append(
             {
                 "reminder_id": int_or_none(record.get("reminder_id")),
@@ -27477,6 +27725,7 @@ def _build_reminder_alerts(
                 "details": [f"Due {_format_reminder_datetime(remind_at)}"]
                 if remind_at
                 else [],
+                "deep_link": deep_link,
             }
         )
     return alerts
@@ -29954,6 +30203,11 @@ def reports_page(conn):
         deep_report_id = int_or_none(deep_link.get("record_id"))
         if deep_report_id is not None:
             st.session_state["report_edit_select_pending"] = deep_report_id
+            st.session_state["report_deep_focus"] = {
+                "section": clean_text(deep_link.get("section")) or "",
+                "field": clean_text(deep_link.get("field")) or "",
+                "context": clean_text(deep_link.get("context")) or "",
+            }
             st.info(f"Jumped to report #{deep_report_id}.")
 
     directory = df_query(
@@ -30107,6 +30361,16 @@ def reports_page(conn):
             key="report_edit_select",
             index=None,
             placeholder="Select a report to edit",
+        )
+    report_focus = st.session_state.get("report_deep_focus")
+    if (
+        isinstance(report_focus, dict)
+        and selected_report_id is not None
+        and clean_text(report_focus.get("field")) == "reminder_date"
+    ):
+        render_focus_highlight(
+            "Notification focus: report reminder",
+            clean_text(report_focus.get("context")) or f"Report #{selected_report_id}",
         )
 
     # Preserve spreadsheet-style edits while working on the same report, but
@@ -30474,9 +30738,10 @@ def reports_page(conn):
             key="report_period_type",
         )
         if period_choice == "daily":
+            persisted_daily = _date_or(st.session_state.get("report_period_daily"), default_start)
             day_value = render_flexible_date_input(
                 "Report date",
-                value=default_start,
+                value=persisted_daily,
                 key="report_period_daily",
                 help="Use an explicit date format (YYYY-MM-DD preferred). Ambiguous date strings are blocked for report integrity.",
             )
@@ -30493,8 +30758,10 @@ def reports_page(conn):
             start_date = day_value
             end_date = day_value
         elif period_choice == "weekly":
-            base_start = default_start if editing_record else today - timedelta(days=today.weekday())
-            base_end = default_end if editing_record else base_start + timedelta(days=6)
+            fallback_week_start = default_start if editing_record else today - timedelta(days=today.weekday())
+            fallback_week_end = default_end if editing_record else fallback_week_start + timedelta(days=6)
+            base_start = _date_or(st.session_state.get("report_period_weekly_start"), fallback_week_start)
+            base_end = _date_or(st.session_state.get("report_period_weekly_end"), fallback_week_end)
             week_value = render_flexible_date_range(
                 "Week range",
                 start_value=base_start,
@@ -30511,8 +30778,10 @@ def reports_page(conn):
                 f"Selected window: {format_period_range(to_iso_date(start_date), to_iso_date(end_date))}"
             )
         else:
-            base_start = default_start if editing_record else date(today.year, today.month, 1)
-            base_end = default_end if editing_record else today
+            fallback_month_start = default_start if editing_record else date(today.year, today.month, 1)
+            fallback_month_end = default_end if editing_record else today
+            base_start = _date_or(st.session_state.get("report_period_monthly_start"), fallback_month_start)
+            base_end = _date_or(st.session_state.get("report_period_monthly_end"), fallback_month_end)
             month_value = render_flexible_date_range(
                 "Monthly range",
                 start_value=base_start,
@@ -30584,6 +30853,13 @@ def reports_page(conn):
         st.session_state["report_grid_editor_state"] = _grid_rows_from_editor(
             report_grid_df, template_key=template_key
         )
+        if (
+            isinstance(report_focus, dict)
+            and clean_text(report_focus.get("field")) == "reminder_date"
+        ):
+            st.caption(
+                "Update reminder date and feedback directly in this grid, then click Save report."
+            )
         remove_attachment = False
         attachment_upload = None
         if existing_attachment_value:
