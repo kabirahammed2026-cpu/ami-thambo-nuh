@@ -118,6 +118,7 @@ STRICT_REPORT_WINDOWS = os.getenv("PS_REPORT_STRICT_WINDOWS", "").strip().lower(
 }
 RECEIPTS_ENABLED = False
 HEALTH_CHECK_CACHE_TTL_SECONDS = 120
+DASHBOARD_DETAIL_DEFAULT = "Fast"
 UPLOAD_BYTES_CACHE_LIMIT = 24
 
 UPLOADS_DIR = BASE_DIR / "uploads"
@@ -10465,6 +10466,42 @@ def _persist_deep_link_query_params(payload: Mapping[str, object]) -> None:
         del st.query_params[DEEP_LINK_CONTEXT_PARAM]
 
 
+def _deep_link_token(payload: Mapping[str, object]) -> str:
+    def _value(key: str) -> str:
+        return clean_text(payload.get(key)) or ""
+
+    return "|".join(
+        [
+            _value("page"),
+            _value("tab"),
+            _value("record_id"),
+            _value("highlight"),
+            _value("anchor"),
+            _value("section"),
+            _value("field"),
+            _value("file"),
+            _value("context"),
+        ]
+    )
+
+
+def _apply_extracted_deep_link(deep_link: Optional[dict[str, str]]) -> None:
+    if not deep_link:
+        st.session_state.pop("_active_deep_link_token", None)
+        return
+    token = _deep_link_token(deep_link)
+    deep_link["token"] = token
+    st.session_state["pending_deep_link"] = deep_link
+    if st.session_state.get("_active_deep_link_token") == token:
+        return
+    _persist_deep_link_query_params(deep_link)
+    st.session_state["nav_page"] = deep_link["page"]
+    st.session_state["page"] = deep_link["page"]
+    st.session_state["nav_selection_top"] = deep_link["page"]
+    st.session_state["nav_selection_mobile"] = deep_link["page"]
+    st.session_state["_active_deep_link_token"] = token
+
+
 def _consume_deep_link(page: str) -> Optional[dict[str, str]]:
     pending = st.session_state.get("pending_deep_link")
     if not isinstance(pending, dict) or pending.get("page") != page:
@@ -11078,6 +11115,15 @@ def dashboard(conn):
         st.markdown("</div>", unsafe_allow_html=True)
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
+    detail_mode = st.radio(
+        "Dashboard rendering",
+        ["Fast", "Full"],
+        index=0 if st.session_state.get("dashboard_detail_mode", DASHBOARD_DETAIL_DEFAULT) != "Full" else 1,
+        horizontal=True,
+        key="dashboard_detail_mode",
+        help="Fast mode renders core metrics first and defers heavier analytics until needed.",
+    )
+    load_full_detail = detail_mode == "Full"
     current_actor_id = current_user_id()
     allowed_customers = accessible_customer_ids(conn)
     scope_clause, scope_params = customer_scope_filter("c")
@@ -11300,79 +11346,83 @@ def dashboard(conn):
             hide_index=True,
         )
 
-    uploads_scope = report_scope.replace("WHERE", "AND", 1) if report_scope else ""
-    uploads_params = tuple(report_params)
-    uploads_df = df_query(
-        conn,
-        dedent(
-            f"""
-            SELECT wr.report_id,
-                   wr.attachment_path,
-                   wr.import_file_path,
-                   wr.period_start,
-                   wr.period_end,
-                   wr.report_template,
-                   COALESCE(u.username, 'Team member') AS owner,
-                   wr.created_at
-            FROM work_reports wr
-            LEFT JOIN users u ON u.user_id = wr.user_id
-            WHERE wr.attachment_path IS NOT NULL AND wr.attachment_path != ''
-            {uploads_scope}
-            ORDER BY datetime(wr.created_at) DESC
-            LIMIT 5
-            """
-        ),
-        uploads_params,
-    )
+    if load_full_detail:
+        uploads_scope = report_scope.replace("WHERE", "AND", 1) if report_scope else ""
+        uploads_params = tuple(report_params)
+        uploads_df = df_query(
+            conn,
+            dedent(
+                f"""
+                SELECT wr.report_id,
+                       wr.attachment_path,
+                       wr.import_file_path,
+                       wr.period_start,
+                       wr.period_end,
+                       wr.report_template,
+                       COALESCE(u.username, 'Team member') AS owner,
+                       wr.created_at
+                FROM work_reports wr
+                LEFT JOIN users u ON u.user_id = wr.user_id
+                WHERE wr.attachment_path IS NOT NULL AND wr.attachment_path != ''
+                {uploads_scope}
+                ORDER BY datetime(wr.created_at) DESC
+                LIMIT 5
+                """
+            ),
+            uploads_params,
+        )
 
-    if not uploads_df.empty:
-        st.markdown("#### Latest report uploads")
-        uploads_df["Template"] = uploads_df["report_template"].apply(
-            lambda value: REPORT_TEMPLATE_LABELS.get(
-                _normalize_report_template(value), "Service report"
-            )
-        )
-        uploads_df["Period"] = uploads_df.apply(
-            lambda row: format_period_range(row.get("period_start"), row.get("period_end")),
-            axis=1,
-        )
-        uploads_df["When"] = uploads_df["created_at"].apply(
-            lambda value: format_time_ago(value) or format_period_range(value, value)
-        )
-        for _, row in uploads_df.iterrows():
-            file_entries = []
-            attachment_value = clean_text(row.get("attachment_path"))
-            if attachment_value:
-                file_entries.append(("Attachment", attachment_value))
-            import_value = clean_text(row.get("import_file_path"))
-            if import_value:
-                file_entries.append(("Import", import_value))
-            if not file_entries:
-                continue
-            label_prefix = (
-                f"{row.get('owner')} • {row.get('Template')} • {row.get('Period')}"
-            )
-            for idx, (kind, file_value) in enumerate(file_entries, start=1):
-                path = resolve_upload_path(file_value)
-                if not path or not path.exists():
-                    continue
-                payload = _safe_read_bytes(path)
-                if not payload:
-                    continue
-                label = f"{label_prefix} • {kind}"
-                st.download_button(
-                    label,
-                    data=payload,
-                    file_name=path.name,
-                    key=f"recent_attachment_{row.get('report_id')}_{idx}",
+        if not uploads_df.empty:
+            st.markdown("#### Latest report uploads")
+            uploads_df["Template"] = uploads_df["report_template"].apply(
+                lambda value: REPORT_TEMPLATE_LABELS.get(
+                    _normalize_report_template(value), "Service report"
                 )
+            )
+            uploads_df["Period"] = uploads_df.apply(
+                lambda row: format_period_range(row.get("period_start"), row.get("period_end")),
+                axis=1,
+            )
+            uploads_df["When"] = uploads_df["created_at"].apply(
+                lambda value: format_time_ago(value) or format_period_range(value, value)
+            )
+            for _, row in uploads_df.iterrows():
+                file_entries = []
+                attachment_value = clean_text(row.get("attachment_path"))
+                if attachment_value:
+                    file_entries.append(("Attachment", attachment_value))
+                import_value = clean_text(row.get("import_file_path"))
+                if import_value:
+                    file_entries.append(("Import", import_value))
+                if not file_entries:
+                    continue
+                label_prefix = (
+                    f"{row.get('owner')} • {row.get('Template')} • {row.get('Period')}"
+                )
+                for idx, (kind, file_value) in enumerate(file_entries, start=1):
+                    path = resolve_upload_path(file_value)
+                    if not path or not path.exists():
+                        continue
+                    payload = _safe_read_bytes(path)
+                    if not payload:
+                        continue
+                    label = f"{label_prefix} • {kind}"
+                    st.download_button(
+                        label,
+                        data=payload,
+                        file_name=path.name,
+                        key=f"recent_attachment_{row.get('report_id')}_{idx}",
+                    )
+    else:
+        st.caption("Fast mode skips report upload previews. Switch to Full for attachment access.")
 
-    quote_scope, quote_params = _quotation_scope_filter("q")
-    quote_clause = quote_scope.replace("WHERE", "WHERE", 1)
-    quote_metrics = df_query(
-        conn,
-        dedent(
-            f"""
+    if load_full_detail:
+        quote_scope, quote_params = _quotation_scope_filter("q")
+        quote_clause = quote_scope.replace("WHERE", "WHERE", 1)
+        quote_metrics = df_query(
+            conn,
+            dedent(
+                f"""
             WITH scoped_quotes AS (
                 SELECT q.quotation_id,
                        q.quote_date,
@@ -11457,14 +11507,14 @@ def dashboard(conn):
                        END
                    ) AS converted_quotes
             FROM scoped_quotes
-            """
-        ),
-        quote_params,
-    )
-    quotes_df = df_query(
-        conn,
-        dedent(
-            f"""
+                """
+            ),
+            quote_params,
+        )
+        quotes_df = df_query(
+            conn,
+            dedent(
+                f"""
             SELECT q.quotation_id,
                    q.reference,
                    q.quote_date,
@@ -11482,75 +11532,78 @@ def dashboard(conn):
             {quote_clause}
             ORDER BY datetime(q.quote_date) DESC, q.quotation_id DESC
             LIMIT 20
-            """
-        ),
-        quote_params,
-    )
-    st.markdown("#### Quotation insights")
-    if quote_metrics.empty:
-        total_quotes = 0
-        weekly_quotes = 0
-        monthly_quotes = 0
-        paid_quotes = 0
-        converted_quotes = 0
-    else:
-        total_quotes = int(quote_metrics.iloc[0].get("total_quotes") or 0)
-        weekly_quotes = int(quote_metrics.iloc[0].get("weekly_quotes") or 0)
-        monthly_quotes = int(quote_metrics.iloc[0].get("monthly_quotes") or 0)
-        paid_quotes = int(quote_metrics.iloc[0].get("paid_quotes") or 0)
-        converted_quotes = int(quote_metrics.iloc[0].get("converted_quotes") or 0)
-    conversion = (converted_quotes / total_quotes) * 100 if total_quotes else 0.0
-    metrics_cols = st.columns(5)
-    metrics_cols[0].metric("Quotations created", total_quotes)
-    metrics_cols[1].metric("Weekly quotations", weekly_quotes)
-    metrics_cols[2].metric("Monthly quotations", monthly_quotes)
-    metrics_cols[3].metric("Paid / converted", f"{paid_quotes} / {converted_quotes}")
-    metrics_cols[4].metric("Conversion rate", f"{conversion:.1f}%")
+                """
+            ),
+            quote_params,
+        )
+        st.markdown("#### Quotation insights")
+        if quote_metrics.empty:
+            total_quotes = 0
+            weekly_quotes = 0
+            monthly_quotes = 0
+            paid_quotes = 0
+            converted_quotes = 0
+        else:
+            total_quotes = int(quote_metrics.iloc[0].get("total_quotes") or 0)
+            weekly_quotes = int(quote_metrics.iloc[0].get("weekly_quotes") or 0)
+            monthly_quotes = int(quote_metrics.iloc[0].get("monthly_quotes") or 0)
+            paid_quotes = int(quote_metrics.iloc[0].get("paid_quotes") or 0)
+            converted_quotes = int(quote_metrics.iloc[0].get("converted_quotes") or 0)
+        conversion = (converted_quotes / total_quotes) * 100 if total_quotes else 0.0
+        metrics_cols = st.columns(5)
+        metrics_cols[0].metric("Quotations created", total_quotes)
+        metrics_cols[1].metric("Weekly quotations", weekly_quotes)
+        metrics_cols[2].metric("Monthly quotations", monthly_quotes)
+        metrics_cols[3].metric("Paid / converted", f"{paid_quotes} / {converted_quotes}")
+        metrics_cols[4].metric("Conversion rate", f"{conversion:.1f}%")
 
-    if quotes_df.empty:
-        st.info("No quotations available for the selected scope yet.")
+        if quotes_df.empty:
+            st.info("No quotations available for the selected scope yet.")
+        else:
+            quotes_df = fmt_dates(quotes_df, ["quote_date"])
+            quotes_df["customer_name"] = quotes_df["customer_name"].apply(
+                lambda value: clean_text(value) or "—"
+            )
+            quotes_df["company"] = quotes_df["company"].apply(
+                lambda value: clean_text(value) or "—"
+            )
+            quotes_df["product_details"] = quotes_df["product_details"].apply(
+                lambda value: clean_text(value) or "—"
+            )
+            quotes_df["total_amount"] = quotes_df["total_amount"].apply(
+                lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
+            )
+            display_quotes = quotes_df.rename(
+                columns={
+                    "reference": "Reference",
+                    "quote_date": "Date",
+                    "total_amount": "Total (BDT)",
+                    "status": "Status",
+                    "customer_name": "Customer",
+                    "company": "Company",
+                    "product_details": "Product details",
+                    "pic": "PIC",
+                }
+            ).drop(columns=["quotation_id"], errors="ignore")
+            st.dataframe(
+                display_quotes[
+                    [
+                        "PIC",
+                        "Reference",
+                        "Date",
+                        "Total (BDT)",
+                        "Status",
+                        "Customer",
+                        "Company",
+                        "Product details",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
     else:
-        quotes_df = fmt_dates(quotes_df, ["quote_date"])
-        quotes_df["customer_name"] = quotes_df["customer_name"].apply(
-            lambda value: clean_text(value) or "—"
-        )
-        quotes_df["company"] = quotes_df["company"].apply(
-            lambda value: clean_text(value) or "—"
-        )
-        quotes_df["product_details"] = quotes_df["product_details"].apply(
-            lambda value: clean_text(value) or "—"
-        )
-        quotes_df["total_amount"] = quotes_df["total_amount"].apply(
-            lambda value: format_money(value) or format_number(_coerce_float(value, 0.0))
-        )
-        display_quotes = quotes_df.rename(
-            columns={
-                "reference": "Reference",
-                "quote_date": "Date",
-                "total_amount": "Total (BDT)",
-                "status": "Status",
-                "customer_name": "Customer",
-                "company": "Company",
-                "product_details": "Product details",
-                "pic": "PIC",
-            }
-        ).drop(columns=["quotation_id"], errors="ignore")
-        st.dataframe(
-            display_quotes[
-                [
-                    "PIC",
-                    "Reference",
-                    "Date",
-                    "Total (BDT)",
-                    "Status",
-                    "Customer",
-                    "Company",
-                    "Product details",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.markdown("#### Quotation insights")
+        st.caption("Fast mode defers quotation conversion analytics. Switch to Full to load.")
 
     if not is_admin:
         _render_dashboard_announcement(allow_edit=False)
@@ -32090,23 +32143,7 @@ def _run_main_app() -> None:
         pages.append("System Diagnostics")
 
     deep_link = _extract_deep_link(pages)
-    if deep_link:
-        token = "|".join(
-            [
-                deep_link.get("page", ""),
-                deep_link.get("tab", ""),
-                deep_link.get("record_id", ""),
-                deep_link.get("highlight", ""),
-                deep_link.get("anchor", ""),
-            ]
-        )
-        deep_link["token"] = token
-        st.session_state["pending_deep_link"] = deep_link
-        _persist_deep_link_query_params(deep_link)
-        st.session_state["nav_page"] = deep_link["page"]
-        st.session_state["page"] = deep_link["page"]
-        st.session_state["nav_selection_top"] = deep_link["page"]
-        st.session_state["nav_selection_mobile"] = deep_link["page"]
+    _apply_extracted_deep_link(deep_link)
 
     if "nav_page" not in st.session_state:
         st.session_state["nav_page"] = st.session_state.get("page", pages[0])
