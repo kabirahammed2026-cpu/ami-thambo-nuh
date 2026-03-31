@@ -108,19 +108,28 @@ def _validate_streamlit_assets(
                     f"streamlit exited before startup validation completed (exit code {return_code})"
                 )
         try:
-            # Streamlit health endpoint is the most stable readiness signal.
+            # Streamlit health endpoint is a useful readiness hint, but we still
+            # require the root HTML to load so blank/partial responses do not
+            # pass validation.
+            health_ready = False
             try:
                 status = _fetch_status(health_url, timeout=2.5)
                 if status < 400:
-                    return True
+                    health_ready = True
             except Exception:
                 pass
 
             html = _fetch_text(base_url, timeout=2.5)
+            root_ready = "<html" in html.lower() or "streamlit" in html.lower()
+            if not root_ready:
+                last_error = "root HTML response did not contain expected Streamlit markup"
+                time.sleep(ASSET_VALIDATION_INTERVAL_SECONDS)
+                continue
+
             assets = _extract_static_asset_paths(html)
             # HTML can change between Streamlit releases. Once the app root is
-            # reachable we treat startup as healthy, and only probe assets as
-            # a non-fatal diagnostic when links are discoverable.
+            # reachable, we still verify discovered static assets to reduce
+            # cold-start white-screen incidents from stale bundle links.
             if assets:
                 missing: list[str] = []
                 for asset in assets:
@@ -133,8 +142,12 @@ def _validate_streamlit_assets(
                     if status >= 400:
                         missing.append(f"{asset} (HTTP {status})")
                 if missing:
-                    _log("Asset probe warning: " + ", ".join(missing))
-            if "<html" in html.lower() or "streamlit" in html.lower():
+                    last_error = "asset probe did not pass: " + ", ".join(missing)
+                    time.sleep(ASSET_VALIDATION_INTERVAL_SECONDS)
+                    continue
+            # If HTML and discovered assets are healthy, startup is good even
+            # if the health endpoint lags behind briefly.
+            if assets or health_ready:
                 return True
         except Exception as exc:
             last_error = str(exc)
