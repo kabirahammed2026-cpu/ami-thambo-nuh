@@ -42,6 +42,28 @@ def test_validate_streamlit_assets_checks_all_assets(monkeypatch):
     assert any(url.endswith("/static/css/main.abc.css") for url in asset_urls)
 
 
+def test_validate_streamlit_assets_waits_for_asset_recovery(monkeypatch):
+    monkeypatch.setattr(
+        rb,
+        "_fetch_text",
+        lambda *_args, **_kwargs: (
+            "<html><head>"
+            "<script type='module' src='/static/js/index.abc.js'></script>"
+            "</head><body>Streamlit</body></html>"
+        ),
+    )
+    monkeypatch.setattr(rb, "_fetch_status", lambda *_args, **_kwargs: 503)
+    monkeypatch.setattr(rb.time, "sleep", lambda *_args, **_kwargs: None)
+    now = {"value": 0.0}
+
+    def fake_monotonic() -> float:
+        now["value"] += 30.0
+        return now["value"]
+
+    monkeypatch.setattr(rb.time, "monotonic", fake_monotonic)
+    assert rb._validate_streamlit_assets("8501") is False
+
+
 def test_validate_streamlit_assets_fails_if_process_exits_early(monkeypatch):
     class DeadProcess:
         def poll(self):
