@@ -2224,13 +2224,16 @@ def list_quotation_letters(user: Dict) -> pd.DataFrame:
     )
 
 
-def get_quotation_letter(letter_id: Optional[int]) -> Optional[sqlite3.Row]:
+def get_quotation_letter(user: Dict, letter_id: Optional[int]) -> Optional[sqlite3.Row]:
     if letter_id is None:
         return None
+    params: List[Any] = [letter_id]
+    query = "SELECT * FROM quotation_letters WHERE letter_id = ?"
+    if user.get("role") == "staff":
+        query += " AND salesperson_id = ?"
+        params.append(user.get("user_id"))
     with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT * FROM quotation_letters WHERE letter_id = ?", (letter_id,)
-        )
+        cur = conn.execute(query, tuple(params))
         row = cur.fetchone()
     return row
 
@@ -2755,14 +2758,18 @@ def notify_admin_activity(
 def notify_payment_recorded(quotation_id: int, actor: Dict) -> None:
     """Send a notification to all admins when a quotation payment is recorded."""
 
+    detail = get_quotation_notification_context(quotation_id)
+    customer = detail.get("customer") or "Customer"
+    phone = detail.get("phone") or "No phone"
     notify_admin_activity(
-        f"Payment received for quotation #{quotation_id}",
+        f"Payment received for quotation #{quotation_id} · {customer} · {phone}",
         actor,
         due_date=date.today(),
         target_page="quotations",
         target_entity_type="quotation",
         target_entity_id=quotation_id,
-        target_anchor="payment",
+        target_anchor="reports",
+        target_payload={"quotation_ids": [quotation_id], "open_section": "reports"},
         event_key=f"payment_received:{quotation_id}",
     )
 
@@ -2781,6 +2788,27 @@ def notify_new_quotation(letter_id: int, data: Dict[str, Any], actor: Dict) -> N
         target_entity_id=letter_id,
         event_key=f"quotation_letter_created:{letter_id}",
     )
+
+
+def get_quotation_notification_context(quotation_id: int) -> Dict[str, str]:
+    with get_conn() as conn:
+        row = conn.execute(
+            textwrap.dedent(
+                """
+                SELECT c.name AS customer, c.phone AS phone
+                FROM quotations q
+                JOIN companies c ON c.company_id = q.company_id
+                WHERE q.quotation_id = ?
+                """
+            ),
+            (int(quotation_id),),
+        ).fetchone()
+    if not row:
+        return {}
+    return {
+        "customer": str(row["customer"] or "").strip(),
+        "phone": str(row["phone"] or "").strip(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3977,13 +4005,16 @@ def list_quotations(user: Dict) -> pd.DataFrame:
     return fetchall_df(query, tuple(params))
 
 
-def get_quotation(quotation_id: Optional[int]) -> Optional[sqlite3.Row]:
+def get_quotation(user: Dict, quotation_id: Optional[int]) -> Optional[sqlite3.Row]:
     if quotation_id is None:
         return None
+    params: List[Any] = [quotation_id]
+    query = "SELECT * FROM quotations WHERE quotation_id=?"
+    if user.get("role") == "staff":
+        query += " AND salesperson_id=?"
+        params.append(user.get("user_id"))
     with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM quotations WHERE quotation_id=?", (quotation_id,)
-        ).fetchone()
+        return conn.execute(query, tuple(params)).fetchone()
 
 
 def upsert_quotation(data: Dict) -> int:
@@ -4995,7 +5026,7 @@ def render_quotation_letter_page(user: Dict) -> None:
     selected_id = selection_map.get(selection_label)
     if focus and focus.get("entity_type") == "quotation_letter" and focus.get("entity_id"):
         selected_id = int(focus["entity_id"])
-    existing = get_quotation_letter(selected_id)
+    existing = get_quotation_letter(user, selected_id)
     if focus and focus.get("entity_type") == "quotation_letter" and focus.get("entity_id") and not existing:
         st.warning("Item not found. It may have been deleted.")
     ensure_letter_form_state(user, existing)
@@ -5613,7 +5644,7 @@ def render_quotations(user: Dict) -> None:
     ]
     selection = st.selectbox("Select quotation", [label for label, _ in options])
     selected_id = dict(options)[selection]
-    existing = get_quotation(selected_id)
+    existing = get_quotation(user, selected_id)
 
     district_map = {row["name"]: row["district_id"] for row in districts}
     district_by_id = {row["district_id"]: row["name"] for row in districts}
@@ -5974,13 +6005,18 @@ def render_quotations(user: Dict) -> None:
             company_label = (
                 detail["company"].strip() if detail and detail["company"] else "quotation"
             )
+            contact_detail = get_quotation_notification_context(quotation_id)
+            customer_label = contact_detail.get("customer") or company_label
+            phone_label = contact_detail.get("phone") or "No phone"
             verb = "Created" if created_new else "Updated"
             notify_admin_activity(
-                f"{verb} quotation #{quotation_id} for {company_label}",
+                f"{verb} quotation #{quotation_id} for {customer_label} · {phone_label}",
                 user,
                 target_page="quotations",
                 target_entity_type="quotation",
                 target_entity_id=quotation_id,
+                target_anchor="reports",
+                target_payload={"quotation_ids": [quotation_id], "open_section": "reports"},
             )
             if quotation_id:
                 schedule_follow_up_notifications(quotation_id)
