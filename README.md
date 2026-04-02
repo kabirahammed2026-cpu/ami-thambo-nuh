@@ -65,6 +65,29 @@ Automatic monthly backups are written under `<data dir>/backups`. To keep a seco
 
    Add `--dry-run` to see what will be restored before writing. The script overwrites the target database after saving a timestamped `.bak_*` copy alongside it.
 
+
+### Fixing `TypeError: Failed to fetch dynamically imported module`
+This error usually means the browser received HTML that points to an old hashed JS filename (for example `index.DhO30g6h.js`) that is no longer present on disk after deployment.
+
+Recommended hard-pass deploy sequence on Linode/WinSCP:
+1. Upload the new zip to a temporary folder (do not overwrite live files in-place while the app is serving traffic).
+2. Stop the app service.
+3. Replace the app code atomically (move/symlink swap), then start the service.
+4. Clear any reverse-proxy/CDN cache and do a hard refresh (`Ctrl+Shift+R`) in the browser.
+5. Run deployment verification from the server:
+
+   ```bash
+   python deployment_doctor.py --url https://crm.psengltd.com
+   ```
+
+6. If you uploaded/rotated backups during the release, verify restore safety before go-live:
+
+   ```bash
+   python deployment_doctor.py --url https://crm.psengltd.com --backup /data/ps-business-suites/backups/ps_crm_backup_YYYYMMDD_HHMMSS.zip --app crm
+   ```
+
+The doctor script checks that every JS/CSS asset referenced by the served HTML is fetchable and (optionally) runs `restore_from_backup.py --dry-run --strict-checksums`.
+
 ## Troubleshooting
 - If Python is not installed or not on your `PATH`, install it from [python.org](https://www.python.org/downloads/) (Windows) or via your package manager (macOS/Linux).
 - To reset everything, delete the `.venv` folder and rerun the launcher to recreate a clean environment.
