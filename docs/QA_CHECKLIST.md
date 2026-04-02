@@ -36,6 +36,13 @@ This checklist is meant to be run in DEBUG_DIAG mode so that diagnostics can be 
 - [ ] Compare dashboard counts vs. raw table totals in **System Diagnostics**.
 - [ ] Confirm no double counting or date range mismatch.
 
+
+### F) Notification/date/privacy regressions
+- [ ] Edit an existing reminder date and confirm the notification due date updates to the new date (not the old one).
+- [ ] Log in as staff A and confirm staff B private reminders/reports are not visible.
+- [ ] Log in as admin and confirm admin oversight still includes required team reminders.
+- [ ] Open a reminder from notification deep-link and confirm it jumps to the correct record/page.
+
 ## Phase 2 — Diagnostics checks
 - [ ] **System Diagnostics** shows valid storage paths (exists + writable).
 - [ ] **Data version counters** increment after add/edit/delete actions.
