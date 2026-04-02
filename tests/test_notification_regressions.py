@@ -147,3 +147,96 @@ def test_build_reminder_alerts_allows_admin_to_see_report_reminders(conn, monkey
     alerts = app._build_reminder_alerts(conn, limit=10)
     report_links = [item.get("deep_link", {}).get("record_id") for item in alerts]
     assert "301" in report_links
+
+
+def test_upsert_work_report_refreshes_report_reminder_date(conn):
+    conn.execute(
+        "INSERT INTO users (username, pass_hash, role) VALUES ('staff_reminder_case', 'x', 'staff')"
+    )
+    user_id = conn.execute(
+        "SELECT user_id FROM users WHERE username='staff_reminder_case'"
+    ).fetchone()[0]
+
+    report_id = app.upsert_work_report(
+        conn,
+        report_id=None,
+        user_id=int(user_id),
+        period_type="daily",
+        period_start="2026-04-01",
+        period_end="2026-04-01",
+        tasks="",
+        remarks="",
+        research="",
+        report_template="service",
+        grid_rows=[{"customer_name": "A", "reminder_date": "2026-04-05"}],
+    )
+    app.upsert_work_report(
+        conn,
+        report_id=int(report_id),
+        user_id=int(user_id),
+        period_type="daily",
+        period_start="2026-04-01",
+        period_end="2026-04-01",
+        tasks="",
+        remarks="",
+        research="",
+        report_template="service",
+        grid_rows=[{"customer_name": "A", "reminder_date": "2026-04-12"}],
+    )
+    row = conn.execute(
+        "SELECT remind_at, source_text FROM reminders WHERE entity_type='report' AND entity_id=?",
+        (int(report_id),),
+    ).fetchone()
+    assert row is not None
+    assert "2026-04-12" in str(row[0])
+    assert row[1] == "2026-04-12"
+
+
+def test_build_staff_alerts_keeps_staff_report_reminders_private(conn, monkeypatch):
+    conn.execute(
+        "INSERT INTO users (username, pass_hash, role) VALUES ('staff_private_a', 'x', 'staff')"
+    )
+    conn.execute(
+        "INSERT INTO users (username, pass_hash, role) VALUES ('staff_private_b', 'x', 'staff')"
+    )
+    staff_a = conn.execute(
+        "SELECT user_id FROM users WHERE username='staff_private_a'"
+    ).fetchone()[0]
+    staff_b = conn.execute(
+        "SELECT user_id FROM users WHERE username='staff_private_b'"
+    ).fetchone()[0]
+    report_a = app.upsert_work_report(
+        conn,
+        report_id=None,
+        user_id=int(staff_a),
+        period_type="daily",
+        period_start="2026-04-01",
+        period_end="2026-04-01",
+        tasks="",
+        remarks="",
+        research="",
+        report_template="service",
+        grid_rows=[{"customer_name": "A", "reminder_date": "2026-04-09"}],
+    )
+    report_b = app.upsert_work_report(
+        conn,
+        report_id=None,
+        user_id=int(staff_b),
+        period_type="daily",
+        period_start="2026-04-02",
+        period_end="2026-04-02",
+        tasks="",
+        remarks="",
+        research="",
+        report_template="service",
+        grid_rows=[{"customer_name": "B", "reminder_date": "2026-04-10"}],
+    )
+    monkeypatch.setattr(app, "current_user_is_admin", lambda: False)
+    alerts = app._build_staff_alerts(conn, user_id=int(staff_a))
+    deep_records = {
+        (entry.get("deep_link") or {}).get("record_id")
+        for entry in alerts
+        if isinstance(entry.get("deep_link"), dict)
+    }
+    assert str(report_a) in deep_records
+    assert str(report_b) not in deep_records

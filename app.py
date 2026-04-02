@@ -4198,12 +4198,18 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
     alerts: list[dict[str, object]] = []
     if user_id is None:
         return alerts
+    is_admin = current_user_is_admin()
 
     today_iso = date.today().isoformat()
+    follow_up_where = "follow_up_date IS NOT NULL AND deleted_at IS NULL AND LOWER(IFNULL(status, 'pending')) <> 'paid'"
+    follow_up_params: tuple[object, ...] = ()
+    if not is_admin:
+        follow_up_where = "created_by = ? AND " + follow_up_where
+        follow_up_params = (user_id,)
     follow_ups = df_query(
         conn,
         dedent(
-            """
+            f"""
             SELECT quotation_id,
                    reference,
                    customer_company,
@@ -4212,15 +4218,12 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                    follow_up_date,
                    reminder_label
             FROM quotations
-            WHERE created_by = ?
-              AND follow_up_date IS NOT NULL
-              AND deleted_at IS NULL
-              AND LOWER(IFNULL(status, 'pending')) <> 'paid'
+            WHERE {follow_up_where}
             ORDER BY date(follow_up_date) ASC
             LIMIT 12
             """
         ),
-        (user_id,),
+        follow_up_params,
     )
     if not follow_ups.empty:
         for _, row in follow_ups.iterrows():
@@ -4324,21 +4327,26 @@ def _build_staff_alerts(conn, *, user_id: Optional[int]) -> list[dict[str, objec
                 }
             )
 
+    report_where = (
+        "LOWER(COALESCE(report_template, '')) IN ('follow_up', 'service', 'sales') "
+        "AND grid_payload IS NOT NULL AND grid_payload != ''"
+    )
+    report_params: tuple[object, ...] = ()
+    if not is_admin:
+        report_where = "user_id=? AND " + report_where
+        report_params = (user_id,)
     report_reminders = df_query(
         conn,
         dedent(
-            """
-            SELECT report_id, grid_payload, report_template
+            f"""
+            SELECT report_id, user_id, grid_payload, report_template
             FROM work_reports
-            WHERE user_id=?
-              AND LOWER(COALESCE(report_template, '')) IN ('follow_up', 'service', 'sales')
-              AND grid_payload IS NOT NULL
-              AND grid_payload != ''
+            WHERE {report_where}
             ORDER BY datetime(updated_at) DESC
-            LIMIT 50
+            LIMIT 80
             """
         ),
-        (user_id,),
+        report_params,
     )
 
     def _report_reminder_label(entry: dict[str, object], template_key: str) -> str:
@@ -27507,6 +27515,30 @@ def _format_reminder_datetime(value: object) -> str:
     return parsed.strftime("%d.%m.%Y %I:%M %p").lstrip("0")
 
 
+def _derive_report_level_reminder(
+    grid_rows: Iterable[dict],
+    *,
+    template_key: str,
+) -> tuple[Optional[datetime], Optional[str]]:
+    """Return the earliest reminder date from report grid rows for notification sync."""
+
+    normalized_rows = _normalize_grid_rows(grid_rows or [], template_key=template_key)
+    earliest: Optional[datetime] = None
+    earliest_source: Optional[str] = None
+    for row in normalized_rows:
+        raw_value = row.get("reminder_date")
+        reminder_iso = to_iso_date(raw_value)
+        if not reminder_iso:
+            continue
+        reminder_dt = parse_human_reminder(reminder_iso)
+        if reminder_dt is None:
+            continue
+        if earliest is None or reminder_dt < earliest:
+            earliest = reminder_dt
+            earliest_source = reminder_iso
+    return earliest, earliest_source
+
+
 def upsert_reminder(
     conn: sqlite3.Connection,
     *,
@@ -29512,6 +29544,12 @@ def delete_work_report(
     report_template: Optional[str],
 ) -> None:
     conn.execute("DELETE FROM work_reports WHERE report_id=?", (int(report_id),))
+    upsert_reminder(
+        conn,
+        entity_type="report",
+        entity_id=int(report_id),
+        remind_at=None,
+    )
     conn.commit()
     template_key = _normalize_report_template(report_template)
     template_label = REPORT_TEMPLATE_LABELS.get(template_key, "Service report")
@@ -30039,6 +30077,20 @@ def upsert_work_report(
         grid_rows=grid_rows or [],
         period_end=end_iso,
     )
+    report_remind_at, report_source = _derive_report_level_reminder(
+        grid_rows or [],
+        template_key=template_key,
+    )
+    upsert_reminder(
+        conn,
+        entity_type="report",
+        entity_id=int(effective_id),
+        remind_at=report_remind_at,
+        message="Report reminder",
+        source_text=report_source,
+        status="pending",
+    )
+    conn.commit()
     owner_label = None
     try:
         owner_row = conn.execute(
@@ -30284,6 +30336,7 @@ def reports_page(conn):
                 "section": clean_text(deep_link.get("section")) or "",
                 "field": clean_text(deep_link.get("field")) or "",
                 "context": clean_text(deep_link.get("context")) or "",
+                "record_id": deep_report_id,
             }
             st.info(f"Jumped to report #{deep_report_id}.")
 
@@ -30314,6 +30367,7 @@ def reports_page(conn):
         label_map[viewer_id] = clean_text(user.get("username")) or "Team member"
 
     report_owner_id = viewer_id
+    report_owner_filter: Optional[int] = viewer_id
     if not is_admin:
         st.info(
             f"Recording progress for **{label_map.get(viewer_id, 'you')}**.",
@@ -30321,6 +30375,24 @@ def reports_page(conn):
         )
         st.caption(
             "Daily, weekly, and monthly reports can be logged for any selected window."
+        )
+    else:
+        report_owner_filter = st.selectbox(
+            "Browse reports for",
+            [None, *user_ids],
+            index=0,
+            format_func=lambda uid: "All team members"
+            if uid is None
+            else label_map.get(uid, "Team member"),
+            key="report_owner_filter",
+            help="Admins can review all staff reports or filter by one team member.",
+        )
+        report_owner_id = st.selectbox(
+            "Save new report for",
+            user_ids,
+            index=user_ids.index(viewer_id) if viewer_id in user_ids else 0,
+            format_func=lambda uid: label_map.get(uid, "Team member"),
+            key="report_owner_create",
         )
 
     def _date_or(value, fallback: date) -> date:
@@ -30356,19 +30428,32 @@ def reports_page(conn):
         return True
 
 
-    owner_reports = df_query(
-        conn,
-        dedent(
-            """
-            SELECT report_id, user_id, period_type, period_start, period_end, tasks, remarks, research, grid_payload, attachment_path, import_file_path, report_template, created_at, updated_at
-            FROM work_reports
-            WHERE user_id=?
-            ORDER BY date(period_start) DESC, report_id DESC
-            LIMIT 50
-            """
-        ),
-        (report_owner_id,),
-    )
+    if is_admin and report_owner_filter is None:
+        owner_reports = df_query(
+            conn,
+            dedent(
+                """
+                SELECT report_id, user_id, period_type, period_start, period_end, tasks, remarks, research, grid_payload, attachment_path, import_file_path, report_template, created_at, updated_at
+                FROM work_reports
+                ORDER BY date(period_start) DESC, report_id DESC
+                LIMIT 200
+                """
+            ),
+        )
+    else:
+        owner_reports = df_query(
+            conn,
+            dedent(
+                """
+                SELECT report_id, user_id, period_type, period_start, period_end, tasks, remarks, research, grid_payload, attachment_path, import_file_path, report_template, created_at, updated_at
+                FROM work_reports
+                WHERE user_id=?
+                ORDER BY date(period_start) DESC, report_id DESC
+                LIMIT 50
+                """
+            ),
+            (report_owner_filter,),
+        )
     record_labels: dict[int, str] = {}
     selectable_reports = owner_reports.copy()
     if not owner_reports.empty:
@@ -30443,12 +30528,17 @@ def reports_page(conn):
     if (
         isinstance(report_focus, dict)
         and selected_report_id is not None
+        and int_or_none(report_focus.get("record_id")) == int_or_none(selected_report_id)
         and clean_text(report_focus.get("field")) == "reminder_date"
     ):
         render_focus_highlight(
             "Notification focus: report reminder",
             clean_text(report_focus.get("context")) or f"Report #{selected_report_id}",
         )
+    elif selected_report_id is not None and isinstance(report_focus, dict):
+        focus_id = int_or_none(report_focus.get("record_id"))
+        if focus_id is not None and focus_id != int_or_none(selected_report_id):
+            st.session_state.pop("report_deep_focus", None)
 
     # Preserve spreadsheet-style edits while working on the same report, but
     # reset when switching to another record.
@@ -30479,6 +30569,8 @@ def reports_page(conn):
             owner_id = int(_coerce_float(owner_seed, -1))
             if owner_id < 0:
                 owner_id = None
+        if owner_id is not None:
+            report_owner_id = owner_id
         owner_label = label_map.get(owner_id, "Team member") if owner_id else None
         can_delete = is_admin or (owner_id is not None and owner_id == viewer_id)
         if can_delete:

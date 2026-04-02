@@ -63,6 +63,21 @@ def _preferred_storage_dir() -> Path | None:
     return None
 
 
+def _is_container_runtime() -> bool:
+    if Path("/.dockerenv").exists():
+        return True
+    marker = os.getenv("KUBERNETES_SERVICE_HOST")
+    return bool(marker)
+
+
+def _persistent_storage_required() -> bool:
+    if os.getenv("PS_ALLOW_EPHEMERAL_STORAGE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    if os.getenv("APP_STORAGE_DIR"):
+        return False
+    return _is_container_runtime()
+
+
 def _extract_static_asset_paths(html: str) -> list[str]:
     """Extract Streamlit static asset paths from bootstrap HTML."""
 
@@ -170,6 +185,11 @@ def main() -> None:
         )
 
     storage_dir = _preferred_storage_dir()
+    if storage_dir is None and _persistent_storage_required():
+        raise SystemExit(
+            "No persistent storage path detected. Mount a durable volume (for example /data) "
+            "or set APP_STORAGE_DIR explicitly. Set PS_ALLOW_EPHEMERAL_STORAGE=1 only for temporary diagnostics."
+        )
     if storage_dir is not None:
         storage_dir.mkdir(parents=True, exist_ok=True)
         if app_script_name == SALES_APP_SCRIPT:
