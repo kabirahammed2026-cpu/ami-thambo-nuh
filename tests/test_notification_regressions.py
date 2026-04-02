@@ -70,3 +70,80 @@ def test_normalize_report_window_preserves_selected_month_range():
     assert key == "monthly"
     assert start_date.isoformat() == "2026-04-01"
     assert end_date.isoformat() == "2026-04-30"
+
+
+def test_build_reminder_alerts_keeps_staff_isolated_to_their_own_reports(conn, monkeypatch):
+    conn.execute(
+        "INSERT INTO users (username, pass_hash, role) VALUES ('staff1_case', 'x', 'staff')"
+    )
+    conn.execute(
+        "INSERT INTO users (username, pass_hash, role) VALUES ('staff2_case', 'x', 'staff')"
+    )
+    staff1_id = conn.execute("SELECT user_id FROM users WHERE username='staff1_case'").fetchone()[0]
+    staff2_id = conn.execute("SELECT user_id FROM users WHERE username='staff2_case'").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO work_reports (report_id, user_id, period_type, period_start, period_end, tasks, remarks, research)
+        VALUES (101, ?, 'daily', '2026-04-01', '2026-04-01', '', '', '')
+        """,
+        (staff1_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_reports (report_id, user_id, period_type, period_start, period_end, tasks, remarks, research)
+        VALUES (102, ?, 'daily', '2026-04-01', '2026-04-01', '', '', '')
+        """,
+        (staff2_id,),
+    )
+    app.upsert_reminder(
+        conn,
+        entity_type="report",
+        entity_id=101,
+        remind_at=datetime(2026, 4, 2, 9, 0),
+        message="r1",
+    )
+    app.upsert_reminder(
+        conn,
+        entity_type="report",
+        entity_id=102,
+        remind_at=datetime(2026, 4, 2, 10, 0),
+        message="r2",
+    )
+    conn.commit()
+
+    monkeypatch.setattr(app, "get_current_user", lambda: {"user_id": staff1_id, "role": "staff"})
+    monkeypatch.setattr(app, "current_user_id", lambda: staff1_id)
+    monkeypatch.setattr(app, "accessible_customer_ids", lambda _conn: set())
+
+    alerts = app._build_reminder_alerts(conn, limit=10)
+    report_links = [item.get("deep_link", {}).get("record_id") for item in alerts]
+    assert report_links == ["101"]
+
+
+def test_build_reminder_alerts_allows_admin_to_see_report_reminders(conn, monkeypatch):
+    conn.execute(
+        "INSERT INTO users (username, pass_hash, role) VALUES ('staff_a_case', 'x', 'staff')"
+    )
+    staff_id = conn.execute("SELECT user_id FROM users WHERE username='staff_a_case'").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO work_reports (report_id, user_id, period_type, period_start, period_end, tasks, remarks, research)
+        VALUES (301, ?, 'daily', '2026-04-01', '2026-04-01', '', '', '')
+        """,
+        (staff_id,),
+    )
+    app.upsert_reminder(
+        conn,
+        entity_type="report",
+        entity_id=301,
+        remind_at=datetime(2026, 4, 2, 9, 0),
+        message="admin-visible",
+    )
+    conn.commit()
+
+    monkeypatch.setattr(app, "get_current_user", lambda: {"user_id": 999, "role": "admin"})
+    monkeypatch.setattr(app, "current_user_id", lambda: 999)
+
+    alerts = app._build_reminder_alerts(conn, limit=10)
+    report_links = [item.get("deep_link", {}).get("record_id") for item in alerts]
+    assert "301" in report_links

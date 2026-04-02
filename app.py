@@ -20,7 +20,7 @@ import zipfile
 import subprocess
 import tempfile
 from calendar import monthrange
-from datetime import datetime, timedelta, date, time as dt_time
+from datetime import datetime, timedelta, date, time as dt_time, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -4164,7 +4164,7 @@ def push_runtime_notification(
         "title": clean_text(title) or "Notification",
         "message": clean_text(message) or "",
         "severity": (clean_text(severity) or "info").lower(),
-        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "details": [
             clean_text(item) for item in (details or []) if clean_text(item)
         ],
@@ -27603,6 +27603,7 @@ def _build_reminder_alerts(
             and int_or_none(row.get("entity_id")) is not None
         }
         quote_owner_map: dict[int, tuple[Optional[int], Optional[int]]] = {}
+        report_owner_map: dict[int, Optional[int]] = {}
         note_customer_map: dict[int, Optional[int]] = {}
         if quote_ids:
             placeholders = ",".join("?" for _ in quote_ids)
@@ -27620,6 +27621,25 @@ def _build_reminder_alerts(
                     int_or_none(row.get("created_by")),
                     int_or_none(row.get("customer_id")),
                 )
+        report_ids = {
+            int(row.get("entity_id"))
+            for row in df.to_dict("records")
+            if clean_text(row.get("entity_type")) == "report"
+            and int_or_none(row.get("entity_id")) is not None
+        }
+        if report_ids:
+            placeholders = ",".join("?" for _ in report_ids)
+            report_df = df_query(
+                conn,
+                f"""
+                SELECT report_id, user_id
+                FROM work_reports
+                WHERE report_id IN ({placeholders})
+                """,
+                tuple(sorted(report_ids)),
+            )
+            for _, row in report_df.iterrows():
+                report_owner_map[int(row.get("report_id"))] = int_or_none(row.get("user_id"))
         if note_ids:
             placeholders = ",".join("?" for _ in note_ids)
             note_df = df_query(
@@ -27648,6 +27668,10 @@ def _build_reminder_alerts(
             elif entity_type == "customer_note" and entity_id is not None:
                 customer_id = note_customer_map.get(entity_id)
                 if allowed_customers is not None and customer_id in allowed_customers:
+                    is_visible = True
+            elif entity_type == "report" and entity_id is not None:
+                report_owner = report_owner_map.get(entity_id)
+                if viewer_id is not None and report_owner is not None and int(report_owner) == int(viewer_id):
                     is_visible = True
             if is_visible:
                 visible_rows.append(record)
