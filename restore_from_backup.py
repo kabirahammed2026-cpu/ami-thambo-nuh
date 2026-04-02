@@ -24,14 +24,14 @@ STORAGE_PREFIX_CANDIDATES = ("storage", "uploads", "files")
 
 
 def _detect_app(archive: zipfile.ZipFile) -> Optional[str]:
-    names = set(archive.namelist())
-    if CRM_EXPORT_MARKER in names:
+    names = archive.namelist()
+    if any(name.endswith(CRM_EXPORT_MARKER) for name in names):
         return "crm"
-    if SALES_EXPORT_MARKER in names:
+    if any(name.endswith(SALES_EXPORT_MARKER) for name in names):
         return "sales"
-    if any(marker in names for marker in CRM_DB_MARKERS):
+    if any(name.endswith(marker) for name in names for marker in CRM_DB_MARKERS):
         return "crm"
-    if any(marker in names for marker in SALES_DB_MARKERS):
+    if any(name.endswith(marker) for name in names for marker in SALES_DB_MARKERS):
         return "sales"
     return None
 
@@ -102,27 +102,22 @@ def _select_db_candidate(db_dir: Path, app: str) -> Optional[Path]:
 
 
 def _select_db_candidate_from_archive(temp_root: Path, app: str) -> Optional[Path]:
-    db_dir = temp_root / "database"
-    selected = _select_db_candidate(db_dir, app) if db_dir.exists() else None
-    if selected is not None:
-        return selected
     expected_name = "ps_crm.db" if app == "crm" else "ps_sales.db"
-    direct_match = next(
-        (
-            candidate
-            for candidate in temp_root.rglob(expected_name)
-            if candidate.is_file()
-        ),
-        None,
-    )
+    known_markers = CRM_DB_MARKERS if app == "crm" else SALES_DB_MARKERS
+    for marker in known_markers:
+        candidate = temp_root / marker
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    # Support WinSCP/Linode zip archives that wrap files under one top-level folder.
+    for marker in known_markers:
+        wrapped = list(temp_root.glob(f"*/{marker}"))
+        for candidate in wrapped:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+    direct_match = next((path for path in temp_root.rglob(expected_name) if path.is_file()), None)
     if direct_match is not None:
         return direct_match
-    db_candidates = sorted(
-        (candidate for candidate in temp_root.rglob("*.db") if candidate.is_file()),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
-    return db_candidates[0] if db_candidates else None
+    return None
 
 
 def _resolve_storage_root(temp_root: Path) -> Optional[Path]:
@@ -130,7 +125,43 @@ def _resolve_storage_root(temp_root: Path) -> Optional[Path]:
         candidate = temp_root / prefix
         if candidate.exists() and candidate.is_dir():
             return candidate
+    for prefix in STORAGE_PREFIX_CANDIDATES:
+        wrapped = list(temp_root.glob(f"*/{prefix}"))
+        for candidate in wrapped:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
     return None
+
+
+def _validate_supported_format(
+    archive: zipfile.ZipFile, *, app: str
+) -> tuple[bool, list[str], list[str]]:
+    names = archive.namelist()
+    errors: list[str] = []
+    notes: list[str] = []
+    db_markers = CRM_DB_MARKERS if app == "crm" else SALES_DB_MARKERS
+    export_marker = CRM_EXPORT_MARKER if app == "crm" else SALES_EXPORT_MARKER
+    has_db_marker = any(name.endswith(marker) for name in names for marker in db_markers)
+    has_sql_export = any(name.endswith(export_marker) for name in names)
+    has_storage = any(
+        f"/{prefix}/" in f"/{name}" or name.startswith(f"{prefix}/")
+        for name in names
+        for prefix in STORAGE_PREFIX_CANDIDATES
+    )
+    if not has_db_marker:
+        if has_sql_export:
+            errors.append(
+                "Archive has SQL export but no supported SQLite DB file marker; SQL-only restore is not supported."
+            )
+        else:
+            errors.append("Archive does not contain a supported database file path for this app.")
+    if has_storage:
+        notes.append("Storage payload detected.")
+    else:
+        notes.append("No storage payload detected (DB-only restore).")
+    if has_sql_export:
+        notes.append("SQL export detected (kept for audit; DB file is used for restore).")
+    return (len(errors) == 0), errors, notes
 
 
 def _verify_archive_checksums(archive: zipfile.ZipFile) -> tuple[int, int]:
@@ -196,6 +227,11 @@ def main() -> int:
         action="store_true",
         help="Abort restore when checksums.txt exists and any mismatch is detected.",
     )
+    parser.add_argument(
+        "--verify-format",
+        action="store_true",
+        help="Validate archive compatibility with supported restore formats and exit.",
+    )
 
     args = parser.parse_args()
     archive_path = Path(args.backup).expanduser()
@@ -213,6 +249,16 @@ def main() -> int:
             return 2
 
         data_dir, db_path = _crm_paths(args.data_dir) if app == "crm" else _sales_paths(args.data_dir)
+        format_ok, format_errors, format_notes = _validate_supported_format(archive, app=app)
+        for note in format_notes:
+            print(f"Format check: {note}")
+        if not format_ok:
+            for err in format_errors:
+                print(f"Format check failed: {err}", file=sys.stderr)
+            return 2
+        if args.verify_format:
+            print("Format check passed.")
+            return 0
         verified_checksums, checksum_mismatches = _verify_archive_checksums(archive)
         if verified_checksums:
             status = f"Checksum verification: {verified_checksums} file(s) checked"
@@ -251,7 +297,11 @@ def main() -> int:
                 shutil.copy2(selected_db, db_path)
                 print(f"Restored database to {db_path}")
             else:
-                print("No database file found in archive; skipping DB restore.")
+                print(
+                    "No supported database file found in archive; aborting restore.",
+                    file=sys.stderr,
+                )
+                return 2
 
             if storage_dir is not None and storage_dir.exists():
                 data_dir.mkdir(parents=True, exist_ok=True)

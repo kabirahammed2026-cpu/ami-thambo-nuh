@@ -36,3 +36,17 @@ def test_verify_archive_checksums_returns_zero_when_file_missing():
     with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
         verified, mismatches = rfb._verify_archive_checksums(archive)
     assert (verified, mismatches) == (0, 0)
+
+
+def test_detect_app_supports_wrapped_winscp_paths():
+    payload = _archive_bytes({"release/database/ps_crm.db": b"sqlite"})
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        assert rfb._detect_app(archive) == "crm"
+
+
+def test_validate_supported_format_rejects_sql_only_archive():
+    payload = _archive_bytes({"exports/ps_crm.sql": b"CREATE TABLE x;"})
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        ok, errors, _notes = rfb._validate_supported_format(archive, app="crm")
+    assert ok is False
+    assert any("SQL export" in item for item in errors)

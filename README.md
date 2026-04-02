@@ -52,6 +52,8 @@ For cloud deployments, point the data directory at your Linode volume so backups
 - **CRM app:** set `APP_STORAGE_DIR=/data/ps-business-suites`.
 - **Sales app:** set `PS_SALES_DATA_DIR=/data/ps-sales`.
 
+> Release safety guard: when running inside Docker/container without `APP_STORAGE_DIR` and without a detected mounted volume (for example `/data`), `render_bootstrap.py` now exits early instead of silently starting on ephemeral storage. This prevents “blank CRM after code replace” incidents.
+
 Automatic monthly backups are written under `<data dir>/backups`. To keep a second copy, set `PS_CRM_BACKUP_MIRROR_DIR` or `PS_SALES_BACKUP_MIRROR_DIR` to another mounted volume or backup path. Each backup archive includes the SQLite database (staff accounts included), an SQL dump, Excel exports, and all stored files, plus a `checksums.txt` file for integrity verification—store these archives securely to preserve privacy.
 
 ### Deep troubleshooting & restore (Linode-friendly)
@@ -59,11 +61,12 @@ Automatic monthly backups are written under `<data dir>/backups`. To keep a seco
 2. **Restore from a backup archive:** use the CLI helper and point it at your Linode data volume (or set the same env vars as your deployment):
 
    ```bash
+   python restore_from_backup.py --app crm --backup /path/to/ps_crm_backup.zip --data-dir /data/ps-business-suites --verify-format
    python restore_from_backup.py --app crm --backup /path/to/ps_crm_backup.zip --data-dir /data/ps-business-suites
    python restore_from_backup.py --app sales --backup /path/to/ps_sales_backup.zip --data-dir /data/ps-sales
    ```
 
-   Add `--dry-run` to see what will be restored before writing. The script overwrites the target database after saving a timestamped `.bak_*` copy alongside it.
+   Add `--dry-run` to see what will be restored before writing. The script now fails loudly for SQL-only or unsupported archive formats (instead of pretending restore support), then overwrites the target database after saving a timestamped `.bak_*` copy alongside it.
 
 
 ### Fixing `TypeError: Failed to fetch dynamically imported module`
@@ -74,19 +77,26 @@ Recommended hard-pass deploy sequence on Linode/WinSCP:
 2. Stop the app service.
 3. Replace the app code atomically (move/symlink swap), then start the service.
 4. Clear any reverse-proxy/CDN cache and do a hard refresh (`Ctrl+Shift+R`) in the browser.
-5. Run deployment verification from the server:
+5. Verify the service is still pointed at the persistent data volume:
 
    ```bash
-   python deployment_doctor.py --url https://crm.psengltd.com
+   echo "$APP_STORAGE_DIR"
+   test -f /data/ps-business-suites/ps_crm.db
    ```
 
-6. If you uploaded/rotated backups during the release, verify restore safety before go-live:
+6. Run deployment verification from the server:
 
    ```bash
-   python deployment_doctor.py --url https://crm.psengltd.com --backup /data/ps-business-suites/backups/ps_crm_backup_YYYYMMDD_HHMMSS.zip --app crm
+   python deployment_doctor.py --url https://crm.psengltd.com --app crm --data-dir /data/ps-business-suites --check-linode-flow
    ```
 
-The doctor script checks that every JS/CSS asset referenced by the served HTML is fetchable and (optionally) runs `restore_from_backup.py --dry-run --strict-checksums`.
+7. If you uploaded/rotated backups during the release, verify restore safety before go-live:
+
+   ```bash
+   python deployment_doctor.py --url https://crm.psengltd.com --backup /data/ps-business-suites/backups/ps_crm_backup_YYYYMMDD_HHMMSS.zip --app crm --data-dir /data/ps-business-suites --check-linode-flow
+   ```
+
+The doctor script checks that every JS/CSS asset referenced by the served HTML is fetchable, validates persistent data layout for Linode-style volumes, and runs `restore_from_backup.py --dry-run --strict-checksums`.
 
 ## Troubleshooting
 - If Python is not installed or not on your `PATH`, install it from [python.org](https://www.python.org/downloads/) (Windows) or via your package manager (macOS/Linux).

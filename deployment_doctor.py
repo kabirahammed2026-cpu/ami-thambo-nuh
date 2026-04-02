@@ -10,6 +10,7 @@ This is especially useful when troubleshooting browser errors like:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -84,11 +85,49 @@ def _run_backup_dry_run(backup: Path, app: str | None) -> int:
     return int(completed.returncode)
 
 
+def _latest_backup_from_data_dir(data_dir: Path, app: str) -> Path | None:
+    backup_dir = data_dir / "backups"
+    pattern = "ps_crm_backup_*.zip" if app == "crm" else "ps_sales_backup_*.zip"
+    candidates = sorted(
+        backup_dir.glob(pattern),
+        key=lambda item: (item.stat().st_mtime, item.name),
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _verify_storage_layout(data_dir: Path, app: str) -> list[str]:
+    problems: list[str] = []
+    if not data_dir.exists():
+        problems.append(f"Data dir does not exist: {data_dir}")
+        return problems
+    if not data_dir.is_dir():
+        problems.append(f"Data dir is not a directory: {data_dir}")
+        return problems
+    db_name = "ps_crm.db" if app == "crm" else "ps_sales.db"
+    db_path = data_dir / db_name
+    if not db_path.exists():
+        problems.append(f"Database file missing: {db_path}")
+    uploads_dir = data_dir / "uploads"
+    if app == "crm" and not uploads_dir.exists():
+        problems.append(f"Uploads directory missing: {uploads_dir}")
+    backup_dir = data_dir / "backups"
+    if not backup_dir.exists():
+        problems.append(f"Backup directory missing: {backup_dir}")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Post-upload deployment verification helper.")
     parser.add_argument("--url", required=True, help="Public app URL, e.g. https://crm.example.com")
     parser.add_argument("--backup", help="Optional backup zip to dry-run verify with restore_from_backup.py")
-    parser.add_argument("--app", choices=("crm", "sales"), help="Optional app hint for backup dry-run")
+    parser.add_argument("--app", choices=("crm", "sales"), default="crm", help="App type for backup/data checks")
+    parser.add_argument("--data-dir", help="Persistent app data dir (for Linode volume checks)")
+    parser.add_argument(
+        "--check-linode-flow",
+        action="store_true",
+        help="Validate Linode-style persistent data layout and auto-check latest backup in <data-dir>/backups.",
+    )
     parser.add_argument("--timeout", type=float, default=8.0, help="HTTP timeout in seconds")
     args = parser.parse_args()
 
@@ -121,8 +160,33 @@ def main() -> int:
             missing_assets.append(f"{asset_url} (HTTP {asset_status})")
 
     backup_result = 0
-    if args.backup:
-        backup_path = Path(args.backup).expanduser()
+    backup_path: Path | None = Path(args.backup).expanduser() if args.backup else None
+    data_dir = Path(args.data_dir).expanduser() if args.data_dir else None
+
+    if args.check_linode_flow:
+        if data_dir is None:
+            print("[doctor] FAIL: --check-linode-flow requires --data-dir")
+            return 2
+        problems = _verify_storage_layout(data_dir, args.app)
+        if problems:
+            print("[doctor] FAIL: persistent storage layout check failed:")
+            for problem in problems:
+                print(f"  - {problem}")
+            return 2
+        env_data_dir = os.getenv("APP_STORAGE_DIR")
+        if args.app == "crm" and env_data_dir and Path(env_data_dir).expanduser() != data_dir:
+            print(
+                f"[doctor] FAIL: APP_STORAGE_DIR={env_data_dir} does not match expected --data-dir={data_dir}"
+            )
+            return 2
+        if backup_path is None:
+            backup_path = _latest_backup_from_data_dir(data_dir, args.app)
+            if backup_path is None:
+                print("[doctor] FAIL: no backup archive found in persistent backup directory.")
+                return 2
+            print(f"[doctor] Using latest backup archive: {backup_path}")
+
+    if backup_path is not None:
         if not backup_path.exists():
             print(f"[doctor] FAIL: backup archive not found: {backup_path}")
             backup_result = 2

@@ -4,6 +4,7 @@ This checklist is meant to be run in DEBUG_DIAG mode so that diagnostics can be 
 
 ## Prerequisites
 - Set `DEBUG_DIAG=1` in the environment.
+- For Linode Docker deploy checks, ensure `APP_STORAGE_DIR=/data/ps-business-suites`.
 - Launch the app normally (e.g., `python render_bootstrap.py` or `streamlit run app.py`).
 - Navigate to **System Diagnostics** in the sidebar.
 
@@ -31,6 +32,8 @@ This checklist is meant to be run in DEBUG_DIAG mode so that diagnostics can be 
 - [ ] In **System Diagnostics**, click “Create diagnostic backup”.
 - [ ] Verify the archive contains database + uploads.
 - [ ] Run “Dry-run restore latest backup” and confirm the restore succeeds.
+- [ ] Run `python restore_from_backup.py --app crm --backup /data/ps-business-suites/backups/<latest>.zip --verify-format` and confirm format check passes.
+- [ ] Run `python deployment_doctor.py --url <public-crm-url> --app crm --data-dir /data/ps-business-suites --check-linode-flow` and confirm PASS.
 
 ### E) Dashboard counting
 - [ ] Compare dashboard counts vs. raw table totals in **System Diagnostics**.

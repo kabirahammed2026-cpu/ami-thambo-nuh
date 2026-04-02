@@ -115,6 +115,7 @@ def test_main_runs_validation_with_live_popen_process(monkeypatch):
     )
     monkeypatch.setattr(rb, "_log", lambda _msg: None)
     monkeypatch.delenv("PS_SKIP_ASSET_VALIDATION", raising=False)
+    monkeypatch.setenv("PS_ALLOW_EPHEMERAL_STORAGE", "1")
     monkeypatch.setenv("PORT", "8501")
 
     try:
@@ -145,6 +146,7 @@ def test_main_skips_validation_when_override_set(monkeypatch):
     monkeypatch.setattr(rb, "_validate_streamlit_assets", lambda *a, **k: calls.update(validated=calls["validated"] + 1))
     monkeypatch.setattr(rb, "_log", lambda _msg: None)
     monkeypatch.setenv("PS_SKIP_ASSET_VALIDATION", "1")
+    monkeypatch.setenv("PS_ALLOW_EPHEMERAL_STORAGE", "1")
     monkeypatch.setenv("PORT", "8501")
 
     try:
@@ -177,6 +179,7 @@ def test_main_continues_when_validation_raises(monkeypatch):
     monkeypatch.setattr(rb, "_log", lambda _msg: None)
     monkeypatch.setenv("PORT", "8501")
     monkeypatch.delenv("PS_SKIP_ASSET_VALIDATION", raising=False)
+    monkeypatch.setenv("PS_ALLOW_EPHEMERAL_STORAGE", "1")
 
     try:
         rb.main()
@@ -184,3 +187,16 @@ def test_main_continues_when_validation_raises(monkeypatch):
         assert exc.code == 0
     else:  # pragma: no cover - defensive assertion
         raise AssertionError("Expected main() to exit with process wait code")
+
+
+def test_main_fails_fast_when_persistent_storage_missing_in_container(monkeypatch):
+    monkeypatch.setattr(rb, "_is_container_runtime", lambda: True)
+    monkeypatch.setattr(rb, "_preferred_storage_dir", lambda: None)
+    monkeypatch.delenv("APP_STORAGE_DIR", raising=False)
+    monkeypatch.delenv("PS_ALLOW_EPHEMERAL_STORAGE", raising=False)
+    try:
+        rb.main()
+    except SystemExit as exc:
+        assert "No persistent storage path detected" in str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("Expected main() to fail without persistent storage")
