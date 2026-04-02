@@ -3375,8 +3375,10 @@ def _extract_text_from_quotation_upload(
 
     if upload is None:
         return "", []
-    suffix = Path(upload.name).suffix.lower()
-    file_bytes = upload.getvalue()
+    suffix = Path(_safe_uploaded_file_name(upload)).suffix.lower()
+    file_bytes = _read_uploaded_bytes(upload)
+    if not file_bytes:
+        return "", ["The uploaded quotation is no longer available. Please upload the file again."]
     file_hash = hashlib.sha256(file_bytes).hexdigest()
     if use_cache:
         return _cached_quotation_text_extraction(
@@ -3428,10 +3430,12 @@ def _run_upload_ocr(
 ) -> tuple[str, list[str]]:
     if upload is None or not _ocr_uploads_enabled():
         return "", []
-    suffix = Path(upload.name).suffix.lower() if getattr(upload, "name", None) else ""
+    suffix = Path(_safe_uploaded_file_name(upload)).suffix.lower()
     if suffix not in OCR_UPLOAD_SUFFIXES:
         return "", []
-    file_bytes = upload.getvalue()
+    file_bytes = _read_uploaded_bytes(upload)
+    if not file_bytes:
+        return "", ["The uploaded file is no longer available. Please upload it again."]
     file_hash = hashlib.sha256(file_bytes).hexdigest()
     token = f"{file_hash}:{ocr_all_pages}:{skip_ocr}:{strong_ocr}:{ocr_dpi}"
     token_key = f"{key_prefix}_ocr_token"
@@ -6143,6 +6147,60 @@ def _guess_upload_mime(filename: str) -> str:
     return mime or "application/octet-stream"
 
 
+def _is_stale_uploaded_file_error(exc: Exception) -> bool:
+    """Return True when an exception indicates Streamlit upload/media state is stale."""
+
+    message = clean_text(exc) or clean_text(getattr(exc, "args", [""])[0])
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "mediafilestorageerror",
+            "bad filename",
+            "no media file with id",
+            "keyerror",
+            "uploadedfilemanager",
+        )
+    )
+
+
+def _safe_uploaded_file_name(uploaded_file, *, default: str = "") -> str:
+    if uploaded_file is None:
+        return default
+    try:
+        return clean_text(getattr(uploaded_file, "name", "")) or default
+    except Exception:
+        return default
+
+
+def _safe_uploaded_file_size(uploaded_file) -> Optional[int]:
+    if uploaded_file is None:
+        return None
+    try:
+        size = getattr(uploaded_file, "size", None)
+    except Exception:
+        return None
+    if isinstance(size, (int, float)):
+        try:
+            return int(size)
+        except Exception:
+            return None
+    return None
+
+
+def _clear_stale_upload_state(
+    *,
+    widget_keys: Optional[list[str]] = None,
+    state_keys: Optional[list[str]] = None,
+) -> None:
+    keys_to_clear = set(widget_keys or [])
+    keys_to_clear.update(state_keys or [])
+    keys_to_clear.add("_upload_bytes_cache")
+    for key in keys_to_clear:
+        if key:
+            st.session_state.pop(key, None)
+
+
 def _validate_upload(
     uploaded_file,
     *,
@@ -6151,24 +6209,24 @@ def _validate_upload(
 ) -> Optional[str]:
     if uploaded_file is None:
         return "No file provided."
-    filename = getattr(uploaded_file, "name", "") or ""
+    filename = _safe_uploaded_file_name(uploaded_file)
     ext = Path(filename).suffix.lower()
     if allowed_extensions:
         normalized = {item.lower() for item in allowed_extensions}
         if ext not in normalized:
             return f"Unsupported file type {ext or '(unknown)'}."
     if max_bytes:
-        size = getattr(uploaded_file, "size", None)
-        if isinstance(size, (int, float)) and size > max_bytes:
+        size = _safe_uploaded_file_size(uploaded_file)
+        if isinstance(size, int) and size > max_bytes:
             if ext not in COMPRESSIBLE_UPLOAD_EXTENSIONS:
                 return f"File exceeds {_format_bytes(max_bytes)} size limit."
     return None
 
 
 def _extract_upload_metadata(uploaded_file, saved_path: Optional[Path]) -> dict[str, object]:
-    filename = getattr(uploaded_file, "name", "") or ""
+    filename = _safe_uploaded_file_name(uploaded_file)
     mime_type = _guess_upload_mime(filename)
-    size = getattr(uploaded_file, "size", None)
+    size = _safe_uploaded_file_size(uploaded_file)
     if size is None and saved_path and saved_path.exists():
         try:
             size = saved_path.stat().st_size
@@ -6191,7 +6249,9 @@ def _read_uploaded_bytes(uploaded_file) -> bytes:
     if hasattr(uploaded_file, "getvalue"):
         try:
             data = uploaded_file.getvalue()
-        except Exception:
+        except Exception as exc:
+            if _is_stale_uploaded_file_error(exc):
+                return b""
             data = b""
     if data:
         if cache_key:
@@ -6210,7 +6270,9 @@ def _read_uploaded_bytes(uploaded_file) -> bytes:
             pass
     try:
         data = uploaded_file.read()
-    except Exception:
+    except Exception as exc:
+        if _is_stale_uploaded_file_error(exc):
+            return b""
         data = b""
     if cache_key and isinstance(data, bytes):
         cache_bucket = st.session_state.setdefault("_upload_bytes_cache", {})
@@ -6230,9 +6292,9 @@ def _upload_signature(uploaded_file) -> str:
 
     if uploaded_file is None:
         return "missing"
-    name = clean_text(getattr(uploaded_file, "name", "")) or "upload"
-    size = getattr(uploaded_file, "size", None)
-    size_part = str(int(size)) if isinstance(size, (int, float)) else ""
+    name = _safe_uploaded_file_name(uploaded_file, default="upload")
+    size = _safe_uploaded_file_size(uploaded_file)
+    size_part = str(int(size)) if isinstance(size, int) else ""
     # ``UploadedFile.file_id`` can change across Streamlit reruns even when the
     # selected file has not changed. Keeping signatures stable avoids repeated
     # byte reads / OCR work for the same upload.
@@ -8658,9 +8720,9 @@ def _guard_double_submit(
 def _upload_submission_fingerprint(uploaded_file, *, fallback: Optional[str] = None) -> str:
     if uploaded_file is None:
         return clean_text(fallback) or ""
-    filename = clean_text(getattr(uploaded_file, "name", "")) or ""
-    file_size = getattr(uploaded_file, "size", None)
-    size_part = str(int(file_size)) if isinstance(file_size, (int, float)) else ""
+    filename = _safe_uploaded_file_name(uploaded_file)
+    file_size = _safe_uploaded_file_size(uploaded_file)
+    size_part = str(int(file_size)) if isinstance(file_size, int) else ""
     return f"{filename}:{size_part}".strip(":") or (clean_text(fallback) or "")
 
 
@@ -23058,63 +23120,79 @@ def _render_quotation_section(conn, *, render_id: Optional[int] = None):
     if prefill_upload:
         file_bytes = _read_uploaded_bytes(prefill_upload)
         if not file_bytes:
-            st.error("Could not read the uploaded quotation file. Please try uploading again.")
-            return
-        file_hash = hashlib.sha256(file_bytes).hexdigest()
-        suffix = Path(prefill_upload.name).suffix.lower()
-        prefill_token = f"{file_hash}:{ocr_all_pages}:{skip_ocr}:{strong_ocr}:{ocr_dpi}"
-        upload_signature = _upload_signature(prefill_upload)
-        signature_key = "quotation_prefill_upload_signature"
-        if st.session_state.get(signature_key) != upload_signature:
-            st.session_state.pop("quotation_prefill_token", None)
-            st.session_state[signature_key] = upload_signature
-        if st.session_state.get("quotation_prefill_token") != prefill_token:
-            progress = st.progress(0, text="Preparing quotation auto-fill...")
-            progress.progress(30, text="Extracting text from the upload...")
-            text, warnings = _cached_quotation_text_extraction(
-                file_hash,
-                suffix,
-                file_bytes,
-                ocr_all_pages=ocr_all_pages,
-                skip_ocr=skip_ocr,
-                strong_ocr=strong_ocr,
-                ocr_dpi=ocr_dpi,
+            _clear_stale_upload_state(
+                widget_keys=["quotation_prefill_upload"],
+                state_keys=[
+                    "quotation_prefill_upload_signature",
+                    "quotation_prefill_token",
+                    "quotation_prefill_skip_ocr",
+                    "quotation_prefill_ocr_all_pages",
+                    "quotation_prefill_strong_ocr",
+                ],
             )
-            progress.progress(90, text="Applying auto-fill details...")
-            progress.progress(100, text="Auto-fill ready.")
-            progress.empty()
-            for warning in warnings:
-                st.warning(warning)
-            saved_prefill = save_uploaded_file(
-                prefill_upload,
-                QUOTATION_DOCS_DIR,
-                filename=prefill_upload.name or "quotation_upload",
-                allowed_extensions={".pdf", ".docx", ".txt"},
-                default_extension=".pdf",
+            st.warning(
+                "Your previous upload is no longer available (for example after an app restart). "
+                "Please upload the quotation file again."
             )
-            if saved_prefill:
-                try:
-                    st.session_state["quotation_document_path"] = str(
-                        saved_prefill.relative_to(BASE_DIR)
-                    )
-                except ValueError:
-                    st.session_state["quotation_document_path"] = str(saved_prefill)
-            updates = _extract_quotation_metadata(text)
-            detected_items = updates.pop("_detected_items", None)
-            applied_updates = False
-            if updates:
-                for key, value in updates.items():
-                    if _is_blank_field(st.session_state.get(key)):
-                        st.session_state[key] = value
-                        applied_updates = True
-            if detected_items and not _has_quotation_items(
-                st.session_state.get("quotation_item_rows")
-            ):
-                st.session_state["quotation_item_rows"] = detected_items
-                applied_updates = True
-            if applied_updates:
-                st.success("Quotation fields auto-filled from the uploaded file.")
-            st.session_state["quotation_prefill_token"] = prefill_token
+            prefill_upload = None
+        if not prefill_upload:
+            st.session_state.pop("quotation_document_path", None)
+        else:
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            suffix = Path(_safe_uploaded_file_name(prefill_upload)).suffix.lower()
+            prefill_token = f"{file_hash}:{ocr_all_pages}:{skip_ocr}:{strong_ocr}:{ocr_dpi}"
+            upload_signature = _upload_signature(prefill_upload)
+            signature_key = "quotation_prefill_upload_signature"
+            if st.session_state.get(signature_key) != upload_signature:
+                st.session_state.pop("quotation_prefill_token", None)
+                st.session_state[signature_key] = upload_signature
+            if st.session_state.get("quotation_prefill_token") != prefill_token:
+                progress = st.progress(0, text="Preparing quotation auto-fill...")
+                progress.progress(30, text="Extracting text from the upload...")
+                text, warnings = _cached_quotation_text_extraction(
+                    file_hash,
+                    suffix,
+                    file_bytes,
+                    ocr_all_pages=ocr_all_pages,
+                    skip_ocr=skip_ocr,
+                    strong_ocr=strong_ocr,
+                    ocr_dpi=ocr_dpi,
+                )
+                progress.progress(90, text="Applying auto-fill details...")
+                progress.progress(100, text="Auto-fill ready.")
+                progress.empty()
+                for warning in warnings:
+                    st.warning(warning)
+                saved_prefill = save_uploaded_file(
+                    prefill_upload,
+                    QUOTATION_DOCS_DIR,
+                    filename=_safe_uploaded_file_name(prefill_upload, default="quotation_upload"),
+                    allowed_extensions={".pdf", ".docx", ".txt"},
+                    default_extension=".pdf",
+                )
+                if saved_prefill:
+                    try:
+                        st.session_state["quotation_document_path"] = str(
+                            saved_prefill.relative_to(BASE_DIR)
+                        )
+                    except ValueError:
+                        st.session_state["quotation_document_path"] = str(saved_prefill)
+                updates = _extract_quotation_metadata(text)
+                detected_items = updates.pop("_detected_items", None)
+                applied_updates = False
+                if updates:
+                    for key, value in updates.items():
+                        if _is_blank_field(st.session_state.get(key)):
+                            st.session_state[key] = value
+                            applied_updates = True
+                if detected_items and not _has_quotation_items(
+                    st.session_state.get("quotation_item_rows")
+                ):
+                    st.session_state["quotation_item_rows"] = detected_items
+                    applied_updates = True
+                if applied_updates:
+                    st.success("Quotation fields auto-filled from the uploaded file.")
+                st.session_state["quotation_prefill_token"] = prefill_token
 
     with st.form("quotation_form"):
         st.markdown("### Quotation details")
@@ -27249,12 +27327,16 @@ def refine_multiline(df: pd.DataFrame) -> pd.DataFrame:
 def _read_import_dataframe(uploaded_file) -> tuple[Optional[pd.DataFrame], list[str]]:
     """Load an uploaded import file with defensive parsing fallbacks."""
     parse_notes: list[str] = []
-    filename = clean_text(getattr(uploaded_file, "name", "")) or ""
+    filename = _safe_uploaded_file_name(uploaded_file)
     lower_name = filename.lower()
     if not lower_name:
         return None, ["Missing upload filename."]
+    file_bytes = _read_uploaded_bytes(uploaded_file)
+    if not file_bytes:
+        return None, [
+            "The uploaded file is no longer available. Please upload it again."
+        ]
 
-    uploaded_file.seek(0)
     try:
         if lower_name.endswith(".csv"):
             csv_attempts = [
@@ -27264,9 +27346,8 @@ def _read_import_dataframe(uploaded_file) -> tuple[Optional[pd.DataFrame], list[
             ]
             last_exc: Optional[Exception] = None
             for attempt in csv_attempts:
-                uploaded_file.seek(0)
                 try:
-                    dataframe = pd.read_csv(uploaded_file, **attempt)
+                    dataframe = pd.read_csv(io.BytesIO(file_bytes), **attempt)
                     parse_notes.append(
                         f"CSV parsed using {attempt.get('encoding', 'default')} encoding."
                     )
@@ -27277,8 +27358,7 @@ def _read_import_dataframe(uploaded_file) -> tuple[Optional[pd.DataFrame], list[
             return None, [f"Could not parse CSV file: {message}"]
 
         if lower_name.endswith((".xlsx", ".xls", ".xlsm")):
-            uploaded_file.seek(0)
-            return pd.read_excel(uploaded_file), parse_notes
+            return pd.read_excel(io.BytesIO(file_bytes)), parse_notes
 
         return None, [
             "Unsupported file type. Please upload .csv, .xlsx, .xls, or .xlsm files."
@@ -30625,22 +30705,32 @@ def reports_page(conn):
             st.rerun()
     uploaded_df: Optional[pd.DataFrame] = None
     if import_file is not None:
-        import_bytes = import_file.getvalue()
-        file_hash = hashlib.sha256(import_bytes).hexdigest()
-        previous_hash = st.session_state.get("report_grid_import_file_hash")
-        if previous_hash and previous_hash != file_hash:
-            _reset_report_import_state(clear_uploader=False)
-        import_payload_is_new = previous_hash != file_hash
-        import_payload = {
-            "name": import_file.name,
-            "data": import_bytes,
-            "hash": file_hash,
-        }
-        st.session_state["report_grid_import_payload"] = import_payload
-        st.session_state["report_grid_import_file_hash"] = file_hash
-        if import_payload_is_new:
-            st.session_state.pop("report_grid_mapping_choices", None)
-            st.session_state["report_grid_mapping_saved"] = False
+        import_bytes = _read_uploaded_bytes(import_file)
+        if not import_bytes:
+            _reset_report_import_state(clear_uploader=True)
+            st.warning(
+                "The selected import file is no longer available (possibly after restart). "
+                "Please upload it again."
+            )
+            import_file = None
+        if import_file is None:
+            import_payload = None
+        else:
+            file_hash = hashlib.sha256(import_bytes).hexdigest()
+            previous_hash = st.session_state.get("report_grid_import_file_hash")
+            if previous_hash and previous_hash != file_hash:
+                _reset_report_import_state(clear_uploader=False)
+            import_payload_is_new = previous_hash != file_hash
+            import_payload = {
+                "name": _safe_uploaded_file_name(import_file, default="report_import"),
+                "data": import_bytes,
+                "hash": file_hash,
+            }
+            st.session_state["report_grid_import_payload"] = import_payload
+            st.session_state["report_grid_import_file_hash"] = file_hash
+            if import_payload_is_new:
+                st.session_state.pop("report_grid_mapping_choices", None)
+                st.session_state["report_grid_mapping_saved"] = False
 
     if import_payload:
         file_hash = import_payload.get("hash") or st.session_state.get(
