@@ -22560,18 +22560,21 @@ def _upsert_customer_from_manual_quotation(
         return None
 
     cursor = conn.cursor()
+    scope_clause, scope_params = customer_scope_filter()
+    scope_sql = f" AND ({scope_clause})" if scope_clause else ""
 
     existing = None
     if phone_number:
         existing = cursor.execute(
-            """
+            f"""
             SELECT customer_id, name, company_name, phone, address, delivery_address, remarks
             FROM customers
             WHERE TRIM(COALESCE(phone, '')) = ?
+            {scope_sql}
             ORDER BY customer_id DESC
             LIMIT 1
             """,
-            (phone_number,),
+            (phone_number, *scope_params),
         ).fetchone()
     if existing is None and phone_key:
         phone_digits = re.sub(r"[^\d]", "", phone_key)
@@ -22581,10 +22584,11 @@ def _upsert_customer_from_manual_quotation(
                 SELECT customer_id, name, company_name, phone, address, delivery_address, remarks
                 FROM customers
                 WHERE {_phone_digits_sql_expr("COALESCE(phone, '')")} = ?
+                {scope_sql}
                 ORDER BY customer_id DESC
                 LIMIT 1
                 """,
-                (phone_digits,),
+                (phone_digits, *scope_params),
             ).fetchone()
 
     if existing:
@@ -27175,6 +27179,7 @@ def scraps_page(conn):
                 ),
             )
             conn.commit()
+            _mark_data_changed("customers")
             if new_name and new_phone and new_address:
                 st.success("Details saved. This record is now complete and will appear in other pages.")
             else:
@@ -27184,6 +27189,7 @@ def scraps_page(conn):
         if delete:
             conn.execute("DELETE FROM customers WHERE customer_id=?", (int(selected_id),))
             conn.commit()
+            _mark_data_changed("customers")
             st.warning("Scrap record deleted.")
             _safe_rerun()
 
