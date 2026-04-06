@@ -27175,6 +27175,7 @@ def scraps_page(conn):
                 ),
             )
             conn.commit()
+            _mark_data_changed("customers")
             if new_name and new_phone and new_address:
                 st.success("Details saved. This record is now complete and will appear in other pages.")
             else:
@@ -27184,6 +27185,7 @@ def scraps_page(conn):
         if delete:
             conn.execute("DELETE FROM customers WHERE customer_id=?", (int(selected_id),))
             conn.commit()
+            _mark_data_changed("customers")
             st.warning("Scrap record deleted.")
             _safe_rerun()
 
