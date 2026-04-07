@@ -19519,6 +19519,11 @@ def customers_page(conn):
                                 (created_by, cid),
                             )
                     conn.commit()
+                # Bump customer data versions immediately after the base customer save.
+                # Optional follow-up record creation (DO/service/maintenance) can return
+                # early for validation failures, but the customer row is already committed
+                # and should become visible across Operations/Summary views right away.
+                _mark_data_changed("customers")
                 if cleaned_products:
                     for prod in cleaned_products:
                         if not prod.get("name"):
