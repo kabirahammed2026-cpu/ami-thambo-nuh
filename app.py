@@ -141,7 +141,6 @@ OPERATIONS_CUSTOMER_PREVIEW_LIMIT = 500
 REQUIRED_CUSTOMER_FIELDS = {
     "name": "Name",
     "phone": "Phone",
-    "address": "Address",
 }
 
 
@@ -1233,7 +1232,6 @@ def customer_complete_clause(alias: str = "") -> str:
         [
             f"TRIM(COALESCE({prefix}name, '')) <> ''",
             f"TRIM(COALESCE({prefix}phone, '')) <> ''",
-            f"TRIM(COALESCE({prefix}address, '')) <> ''",
         ]
     )
 
@@ -2686,11 +2684,11 @@ def _refresh_customer_caches() -> None:
         pass
     st.session_state.pop("operations_customer_table_state", None)
     st.session_state.pop("operations_customer_table", None)
-    st.session_state["customers_updated_at"] = datetime.utcnow().isoformat()
+    st.session_state["customers_updated_at"] = datetime.now(timezone.utc).isoformat()
 
 
 def _mark_data_changed(*keys: str) -> None:
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
     for key in keys:
         if not key:
             continue
@@ -27037,7 +27035,7 @@ def customers_hub_page(conn):
 def scraps_page(conn):
     st.subheader("🗂️ Scraps (Incomplete Records)")
     st.caption(
-        "Rows listed here are missing key details (name, phone, or address). They stay hidden from summaries until completed."
+        "Rows listed here are missing key details (name or phone). They stay hidden from summaries until completed."
     )
     scope_clause, scope_params = customer_scope_filter()
     where_parts = [customer_incomplete_clause()]
@@ -27180,7 +27178,7 @@ def scraps_page(conn):
             )
             conn.commit()
             _mark_data_changed("customers")
-            if new_name and new_phone and new_address:
+            if new_name and new_phone:
                 st.success("Details saved. This record is now complete and will appear in other pages.")
             else:
                 st.info("Details saved, but the record is still incomplete and will remain in Scraps until all required fields are filled.")
