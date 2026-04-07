@@ -2432,7 +2432,7 @@ def customer_scope_filter(alias: str = "") -> tuple[str, tuple[object, ...]]:
 
 
 def accessible_customer_ids(conn) -> Optional[set[int]]:
-    if current_user_is_admin():
+    if current_user_is_admin() or current_user_is_service_staff():
         return None
     user_id = current_user_id()
     if user_id is None:
@@ -19950,8 +19950,9 @@ def customers_page(conn):
                             total_amount,
                             payment_status,
                             payment_receipt_path,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                            updated_at,
+                            created_by
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
                         """,
                         (
                             do_serial if create_delivery_order else None,
@@ -19966,6 +19967,7 @@ def customers_page(conn):
                             None,
                             maintenance_status_value,
                             maintenance_receipt_path,
+                            created_by,
                         ),
                     )
                     log_activity(
