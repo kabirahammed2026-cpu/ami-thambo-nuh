@@ -2472,6 +2472,12 @@ def accessible_customer_ids(conn) -> Optional[set[int]]:
     return ids
 
 
+def current_user_requires_owner_scope() -> bool:
+    """Return True when customer-linked records should be scoped to the actor's ownership."""
+
+    return not (current_user_is_admin() or current_user_is_service_staff())
+
+
 def render_focus_highlight(label: str, detail: Optional[str] = None) -> None:
     title = clean_text(label) or "Focused record"
     detail_text = clean_text(detail) or ""
@@ -10556,6 +10562,101 @@ def _purge_expired_sessions(conn) -> None:
         """
     )
     conn.commit()
+
+
+def save_customer_from_create_flow(
+    conn,
+    *,
+    name: Optional[str],
+    company_name: Optional[str],
+    phone: Optional[str],
+    address: Optional[str],
+    delivery_address: Optional[str],
+    remarks: Optional[str],
+    purchase_date: Optional[str],
+    product_info: Optional[str],
+    delivery_order_code: Optional[str],
+    sales_person: Optional[str],
+    amount_spent: Optional[float],
+    created_by: Optional[int],
+) -> tuple[int, bool]:
+    """Persist a customer using the same merge/insert rules as the Create Customer flow."""
+
+    existing_customer_id = merge_customers_by_phone(conn, phone)
+    if existing_customer_id is None and not clean_text(phone):
+        existing_customer_id = _lookup_customer_id_for_merge(
+            conn,
+            name=name,
+            company=company_name,
+            phone=phone,
+        )
+
+    if existing_customer_id is None:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (
+                name,
+                company_name,
+                phone,
+                address,
+                delivery_address,
+                remarks,
+                purchase_date,
+                product_info,
+                delivery_order_code,
+                sales_person,
+                amount_spent,
+                created_by,
+            ),
+        )
+        customer_id = int(cursor.lastrowid)
+        conn.commit()
+        _mark_data_changed("customers")
+        return customer_id, False
+
+    customer_id = int(existing_customer_id)
+    apply_customer_merge_updates(
+        conn,
+        customer_id,
+        name=name,
+        company_name=company_name,
+        address=address,
+        delivery_address=delivery_address,
+        remarks=remarks,
+        purchase_date=purchase_date,
+        product_info=product_info,
+        delivery_order_code=delivery_order_code,
+        amount_spent=amount_spent,
+        sales_person=sales_person,
+    )
+    if phone:
+        existing_phone_row = conn.execute(
+            "SELECT phone FROM customers WHERE customer_id=?",
+            (customer_id,),
+        ).fetchone()
+        existing_phone = clean_text(existing_phone_row[0]) if existing_phone_row else ""
+        if not existing_phone or (
+            _normalize_phone_key(existing_phone) == _normalize_phone_key(phone)
+        ):
+            conn.execute(
+                "UPDATE customers SET phone=? WHERE customer_id=?",
+                (phone, customer_id),
+            )
+    if created_by is not None:
+        existing_owner_row = conn.execute(
+            "SELECT created_by FROM customers WHERE customer_id=?",
+            (customer_id,),
+        ).fetchone()
+        existing_owner = int_or_none(existing_owner_row[0]) if existing_owner_row else None
+        if existing_owner != created_by:
+            conn.execute(
+                "UPDATE customers SET created_by=? WHERE customer_id=?",
+                (created_by, customer_id),
+            )
+    conn.commit()
+    _mark_data_changed("customers")
+    return customer_id, True
 
 
 def _load_user_from_session(conn, token: str) -> Optional[dict[str, object]]:
@@ -19449,85 +19550,21 @@ def customers_page(conn):
                 if amount_value == 0.0 and (amount_spent_input is None or amount_spent_input == 0.0):
                     amount_value = None
                 created_by = current_user_id()
-                existing_customer_id = merge_customers_by_phone(conn, phone_val)
-                if existing_customer_id is None and not phone_val:
-                    # Only fall back to name/company merge when no phone is provided.
-                    # If a phone number exists and does not match, keep the new entry
-                    # as a distinct customer so it appears in scoped selectors.
-                    existing_customer_id = _lookup_customer_id_for_merge(
-                        conn,
-                        name=name_val,
-                        company=company_val,
-                        phone=phone_val,
-                    )
-                was_merged_customer = existing_customer_id is not None
-                if existing_customer_id is None:
-                    cur.execute(
-                        "INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                        (
-                            name_val,
-                            company_val,
-                            phone_val,
-                            address_val,
-                            delivery_address_val,
-                            remarks_val,
-                            purchase_str,
-                            product_label,
-                            do_serial,
-                            sales_person_value,
-                            amount_value,
-                            created_by,
-                        ),
-                    )
-                    cid = cur.lastrowid
-                    conn.commit()
-                else:
-                    cid = existing_customer_id
-                    apply_customer_merge_updates(
-                        conn,
-                        cid,
-                        name=name_val,
-                        company_name=company_val,
-                        address=address_val,
-                        delivery_address=delivery_address_val,
-                        remarks=remarks_val,
-                        purchase_date=purchase_str,
-                        product_info=product_label,
-                        delivery_order_code=do_serial,
-                        amount_spent=amount_value,
-                        sales_person=sales_person_value,
-                    )
-                    if phone_val:
-                        existing_phone_row = conn.execute(
-                            "SELECT phone FROM customers WHERE customer_id=?",
-                            (cid,),
-                        ).fetchone()
-                        existing_phone = clean_text(existing_phone_row[0]) if existing_phone_row else ""
-                        if not existing_phone or (
-                            _normalize_phone_key(existing_phone)
-                            == _normalize_phone_key(phone_val)
-                        ):
-                            conn.execute(
-                                "UPDATE customers SET phone=? WHERE customer_id=?",
-                                (phone_val, cid),
-                            )
-                    if created_by is not None:
-                        existing_owner_row = conn.execute(
-                            "SELECT created_by FROM customers WHERE customer_id=?",
-                            (cid,),
-                        ).fetchone()
-                        existing_owner = int_or_none(existing_owner_row[0]) if existing_owner_row else None
-                        if existing_owner != created_by:
-                            conn.execute(
-                                "UPDATE customers SET created_by=? WHERE customer_id=?",
-                                (created_by, cid),
-                            )
-                    conn.commit()
-                # Bump customer data versions immediately after the base customer save.
-                # Optional follow-up record creation (DO/service/maintenance) can return
-                # early for validation failures, but the customer row is already committed
-                # and should become visible across Operations/Summary views right away.
-                _mark_data_changed("customers")
+                cid, was_merged_customer = save_customer_from_create_flow(
+                    conn,
+                    name=name_val,
+                    company_name=company_val,
+                    phone=phone_val,
+                    address=address_val,
+                    delivery_address=delivery_address_val,
+                    remarks=remarks_val,
+                    purchase_date=purchase_str,
+                    product_info=product_label,
+                    delivery_order_code=do_serial,
+                    sales_person=sales_person_value,
+                    amount_spent=amount_value,
+                    created_by=created_by,
+                )
                 if cleaned_products:
                     for prod in cleaned_products:
                         if not prod.get("name"):
@@ -26244,7 +26281,7 @@ def customer_summary_page(conn):
         """,
         ids,
     )
-    if not is_admin:
+    if current_user_requires_owner_scope():
         if viewer_id is None:
             service_df = service_df.iloc[0:0]
         elif "created_by" in service_df.columns:
@@ -26288,7 +26325,7 @@ def customer_summary_page(conn):
         """,
         ids,
     )
-    if not is_admin:
+    if current_user_requires_owner_scope():
         if viewer_id is None:
             maintenance_df = maintenance_df.iloc[0:0]
         elif "created_by" in maintenance_df.columns:
@@ -26328,7 +26365,7 @@ def customer_summary_page(conn):
         """,
         ids,
     )
-    if not is_admin:
+    if current_user_requires_owner_scope():
         if viewer_id is None:
             do_df = do_df.iloc[0:0]
         elif "created_by" in do_df.columns:
@@ -26372,7 +26409,7 @@ def customer_summary_page(conn):
             missing_dos,
         )
         if not extra_df.empty:
-            if not is_admin:
+            if current_user_requires_owner_scope():
                 if viewer_id is None:
                     extra_df = extra_df.iloc[0:0]
                 elif "created_by" in extra_df.columns:
