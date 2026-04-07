@@ -1885,6 +1885,20 @@ def ensure_schema_upgrades(conn):
     conn.execute(
         "UPDATE users SET staff_classification='service' WHERE staff_classification IS NULL OR TRIM(staff_classification) = ''"
     )
+    conn.execute(
+        """
+        UPDATE users
+           SET staff_classification='service'
+         WHERE LOWER(REPLACE(TRIM(COALESCE(staff_classification, '')), '_', ' ')) LIKE 'service%'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE users
+           SET staff_classification='sales'
+         WHERE LOWER(REPLACE(TRIM(COALESCE(staff_classification, '')), '_', ' ')) LIKE 'sales%'
+        """
+    )
     _normalize_customers_text_fields(conn)
     add_column("services", "status", "TEXT DEFAULT 'In progress'")
     add_column("quotations", "follow_up_history", "TEXT")
@@ -2350,8 +2364,17 @@ def current_user_is_admin() -> bool:
     return get_current_user().get("role") == "admin"
 
 
+def normalize_staff_classification(value: object) -> str:
+    compact = (clean_text(value) or "service").lower().replace("_", " ").strip()
+    if compact.startswith("service"):
+        return "service"
+    if compact.startswith("sales"):
+        return "sales"
+    return compact or "service"
+
+
 def current_user_staff_classification() -> str:
-    return (clean_text(get_current_user().get("staff_classification")) or "service").lower()
+    return normalize_staff_classification(get_current_user().get("staff_classification"))
 
 
 def current_user_is_service_staff() -> bool:
