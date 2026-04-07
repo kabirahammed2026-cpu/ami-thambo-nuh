@@ -19450,13 +19450,17 @@ def customers_page(conn):
                     amount_value = None
                 created_by = current_user_id()
                 existing_customer_id = merge_customers_by_phone(conn, phone_val)
-                if existing_customer_id is None:
+                if existing_customer_id is None and not phone_val:
+                    # Only fall back to name/company merge when no phone is provided.
+                    # If a phone number exists and does not match, keep the new entry
+                    # as a distinct customer so it appears in scoped selectors.
                     existing_customer_id = _lookup_customer_id_for_merge(
                         conn,
                         name=name_val,
                         company=company_val,
                         phone=phone_val,
                     )
+                was_merged_customer = existing_customer_id is not None
                 if existing_customer_id is None:
                     cur.execute(
                         "INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
@@ -20039,10 +20043,20 @@ def customers_page(conn):
                 )
                 _mark_data_changed("customers")
                 _reset_new_customer_form_state()
-                st.session_state["new_customer_feedback"] = (
-                    "success",
-                    f"Customer {name_val or 'record'} saved successfully.",
-                )
+                st.session_state["customers_detail_select"] = int(cid)
+                if was_merged_customer:
+                    st.session_state["new_customer_feedback"] = (
+                        "info",
+                        (
+                            f"Matched existing customer record (ID {int(cid)}) and updated it. "
+                            "If you expected a brand-new customer, use a different phone number."
+                        ),
+                    )
+                else:
+                    st.session_state["new_customer_feedback"] = (
+                        "success",
+                        f"Customer {name_val or 'record'} saved successfully.",
+                    )
                 _safe_rerun()
                 return
     df_raw = render_customer_quick_edit_section(
