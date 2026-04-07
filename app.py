@@ -2420,6 +2420,10 @@ def customer_scope_filter(alias: str = "") -> tuple[str, tuple[object, ...]]:
     user = get_current_user()
     if not user or user.get("role") == "admin":
         return "", ()
+    if current_user_is_service_staff():
+        # Service staff needs cross-team visibility in operations/customer summaries,
+        # so keep customer listing unscoped for this classification.
+        return "", ()
     user_id = current_user_id()
     if user_id is None:
         return "1=0", ()
@@ -19480,6 +19484,17 @@ def customers_page(conn):
                                 "UPDATE customers SET phone=? WHERE customer_id=?",
                                 (phone_val, cid),
                             )
+                    if created_by is not None:
+                        existing_owner_row = conn.execute(
+                            "SELECT created_by FROM customers WHERE customer_id=?",
+                            (cid,),
+                        ).fetchone()
+                        existing_owner = int_or_none(existing_owner_row[0]) if existing_owner_row else None
+                        if existing_owner != created_by:
+                            conn.execute(
+                                "UPDATE customers SET created_by=? WHERE customer_id=?",
+                                (created_by, cid),
+                            )
                     conn.commit()
                 if cleaned_products:
                     for prod in cleaned_products:
@@ -24314,11 +24329,18 @@ def advanced_search_page(conn):
                 }
             )
 
+    def _date_range_sql(expression: str, include_where: bool = False) -> tuple[str, tuple[object, ...]]:
+        if not start_iso or not end_iso:
+            return ("", ())
+        connector = "WHERE" if include_where else "AND"
+        return (f" {connector} date({expression}) BETWEEN date(?) AND date(?)", (start_iso, end_iso))
+
     if "Quotations" in selected_types:
+        quote_date_clause, quote_date_params = _date_range_sql("COALESCE(q.quote_date, q.created_at)")
         quotes_df = df_query(
             conn,
             dedent(
-                """
+                f"""
                 SELECT q.quotation_id,
                        q.reference,
                        q.customer_company,
@@ -24332,10 +24354,12 @@ def advanced_search_page(conn):
                 FROM quotations q
                 LEFT JOIN users u ON u.user_id = q.created_by
                 WHERE q.deleted_at IS NULL
+                {quote_date_clause}
                 ORDER BY datetime(q.quote_date) DESC, q.quotation_id DESC
-                LIMIT 200
+                LIMIT 5000
                 """
             ),
+            quote_date_params,
         )
         if not quotes_df.empty:
             if min_amount > 0:
@@ -24355,15 +24379,20 @@ def advanced_search_page(conn):
             )
 
     if "Services" in selected_types:
+        service_date_clause, service_date_params = _date_range_sql(
+            "COALESCE(service_start_date, service_end_date)"
+        )
         service_df = df_query(
             conn,
-            """
-            SELECT service_id, description, service_start_date, service_end_date, service_product_info, status
+            f"""
+            SELECT service_id, description, service_start_date, service_end_date, service_product_info, status, created_by
             FROM services
             WHERE deleted_at IS NULL
+            {service_date_clause}
             ORDER BY datetime(COALESCE(service_start_date, service_end_date)) DESC, service_id DESC
-            LIMIT 200
+            LIMIT 5000
             """,
+            service_date_params,
         )
         _append_results(
             service_df,
@@ -24380,15 +24409,20 @@ def advanced_search_page(conn):
         )
 
     if "Maintenance" in selected_types:
+        maintenance_date_clause, maintenance_date_params = _date_range_sql(
+            "COALESCE(maintenance_start_date, maintenance_end_date)"
+        )
         maintenance_df = df_query(
             conn,
-            """
-            SELECT maintenance_id, description, maintenance_start_date, maintenance_end_date, maintenance_product_info, status
+            f"""
+            SELECT maintenance_id, description, maintenance_start_date, maintenance_end_date, maintenance_product_info, status, created_by
             FROM maintenance_records
             WHERE deleted_at IS NULL
+            {maintenance_date_clause}
             ORDER BY datetime(COALESCE(maintenance_start_date, maintenance_end_date)) DESC, maintenance_id DESC
-            LIMIT 200
+            LIMIT 5000
             """,
+            maintenance_date_params,
         )
         _append_results(
             maintenance_df,
@@ -24405,16 +24439,19 @@ def advanced_search_page(conn):
         )
 
     if "Delivery orders" in selected_types:
+        do_date_clause, do_date_params = _date_range_sql("created_at")
         do_df = df_query(
             conn,
-            """
+            f"""
             SELECT do_number, description, sales_person, remarks, created_at, created_by, total_amount
             FROM delivery_orders
             WHERE COALESCE(record_type, 'delivery_order') = 'delivery_order'
               AND deleted_at IS NULL
+              {do_date_clause}
             ORDER BY datetime(created_at) DESC
-            LIMIT 200
+            LIMIT 5000
             """,
+            do_date_params,
         )
         _append_results(
             do_df,
@@ -24431,14 +24468,17 @@ def advanced_search_page(conn):
         )
 
     if "Customers" in selected_types:
+        customer_date_clause, customer_date_params = _date_range_sql("created_at", include_where=True)
         customer_df = df_query(
             conn,
-            """
+            f"""
             SELECT name, company_name, phone, address, created_at, created_by
             FROM customers
+            {customer_date_clause}
             ORDER BY datetime(created_at) DESC
-            LIMIT 200
+            LIMIT 5000
             """,
+            customer_date_params,
         )
         _append_results(
             customer_df,
