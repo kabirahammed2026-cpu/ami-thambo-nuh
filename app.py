@@ -6278,6 +6278,17 @@ def _upload_signature(uploaded_file) -> str:
     return f"{name}:{size_part}"
 
 
+def _upload_signature(uploaded_file) -> str:
+    """Return a lightweight signature for a Streamlit UploadedFile."""
+
+    if uploaded_file is None:
+        return "missing"
+    name = clean_text(getattr(uploaded_file, "name", "")) or "upload"
+    size = getattr(uploaded_file, "size", None)
+    file_id = clean_text(getattr(uploaded_file, "file_id", "")) or ""
+    return f"{name}:{size}:{file_id}"
+
+
 def _safe_read_bytes(path: Optional[Path]) -> Optional[bytes]:
     if not path:
         return None
